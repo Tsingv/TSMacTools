@@ -19,9 +19,14 @@ public protocol SystemEventObserving: AnyObject {
 @MainActor
 public final class AutomationRuntime {
     private let windowManager: WindowManaging
+    private let permissionChecker: (any SystemPermissionChecking)?
 
-    public init(windowManager: WindowManaging) {
+    public init(
+        windowManager: WindowManaging,
+        permissionChecker: (any SystemPermissionChecking)? = nil
+    ) {
         self.windowManager = windowManager
+        self.permissionChecker = permissionChecker
     }
 
     public func handle(_ command: AutomationCommand) {
@@ -33,5 +38,14 @@ public final class AutomationRuntime {
         case .reloadConfiguration:
             break
         }
+    }
+
+    public func permissionSnapshot() -> SystemPermissionSnapshot {
+        permissionChecker?.snapshot() ?? SystemPermissionSnapshot(accessibility: .unknown)
+    }
+
+    @discardableResult
+    public func requestAccessibilityPermissionPrompt() -> Bool {
+        permissionChecker?.requestAccessibilityPrompt() ?? false
     }
 }

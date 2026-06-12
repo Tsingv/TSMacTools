@@ -36,3 +36,35 @@ final class PythonScriptBridgeTests: XCTestCase {
         )
     }
 }
+
+private struct FakePermissionChecker: SystemPermissionChecking {
+    var snapshotValue: SystemPermissionSnapshot
+
+    func snapshot() -> SystemPermissionSnapshot {
+        snapshotValue
+    }
+
+    func requestAccessibilityPrompt() -> Bool {
+        false
+    }
+}
+
+final class AutomationRuntimePermissionTests: XCTestCase {
+    @MainActor
+    func testPermissionSnapshotUsesInjectedChecker() {
+        let runtime = AutomationRuntime(
+            windowManager: RecordingWindowManager(),
+            permissionChecker: FakePermissionChecker(
+                snapshotValue: SystemPermissionSnapshot(accessibility: .missing)
+            )
+        )
+
+        XCTAssertEqual(runtime.permissionSnapshot().accessibility, .missing)
+    }
+}
+
+@MainActor
+private final class RecordingWindowManager: WindowManaging {
+    func showWindow(id: NativeWindowID, content: NativeWindowContent) {}
+    func closeWindow(id: NativeWindowID) {}
+}

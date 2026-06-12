@@ -56,13 +56,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let manager = NativeWindowManager()
-        runtime = AutomationRuntime(windowManager: manager)
-        runtime?.handle(.showWindow(
-            id: NativeWindowID("welcome"),
-            content: NativeWindowContent(
-                title: "MacTools",
-                body: .plainText("MacTools runtime started. Python script commands will drive native windows here.")
-            )
-        ))
+        let permissionClient = AccessibilityPermissionClient()
+        runtime = AutomationRuntime(
+            windowManager: manager,
+            permissionChecker: permissionClient
+        )
+
+        let permissions = runtime?.permissionSnapshot()
+        if permissions?.accessibility == .granted {
+            runtime?.handle(.showWindow(
+                id: NativeWindowID("welcome"),
+                content: NativeWindowContent(
+                    title: "MacTools",
+                    body: .plainText("MacTools runtime started. Python script commands will drive native windows here.")
+                )
+            ))
+        } else {
+            runtime?.requestAccessibilityPermissionPrompt()
+            runtime?.handle(.showWindow(
+                id: NativeWindowID("permissions"),
+                content: NativeWindowContent(
+                    title: "MacTools Permissions",
+                    body: .plainText("Accessibility permission is required for window management, hotkeys, and event capture. Grant MacTools access in System Settings > Privacy & Security > Accessibility, then restart the app.")
+                )
+            ))
+        }
     }
 }

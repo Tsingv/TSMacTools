@@ -17,6 +17,8 @@
 		1A0001080000000000000001 /* libMacToolsScripting.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002020000000000000001 /* libMacToolsScripting.a */; };
 		1A0001090000000000000001 /* PythonScriptBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000050000000000000001 /* PythonScriptBridgeTests.swift */; };
 		1A00010C0000000000000001 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002050000000000000001 /* AppKit.framework */; };
+		1A00010D0000000000000001 /* SystemPermissions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000070000000000000001 /* SystemPermissions.swift */; };
+		1A00010E0000000000000001 /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002060000000000000001 /* ApplicationServices.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -84,11 +86,13 @@
 		1A0000040000000000000001 /* PythonScriptBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonScriptBridge.swift; sourceTree = "<group>"; };
 		1A0000050000000000000001 /* PythonScriptBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonScriptBridgeTests.swift; sourceTree = "<group>"; };
 		1A0000060000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		1A0000070000000000000001 /* SystemPermissions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemPermissions.swift; sourceTree = "<group>"; };
 		1A0002010000000000000001 /* libMacToolsCore.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libMacToolsCore.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002020000000000000001 /* libMacToolsScripting.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libMacToolsScripting.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002030000000000000001 /* MacTools.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacTools.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002040000000000000001 /* MacToolsTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MacToolsTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002050000000000000001 /* AppKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = System/Library/Frameworks/AppKit.framework; sourceTree = SDKROOT; };
+		1A0002060000000000000001 /* ApplicationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ApplicationServices.framework; path = System/Library/Frameworks/ApplicationServices.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -97,6 +101,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				1A00010C0000000000000001 /* AppKit.framework in Frameworks */,
+				1A00010E0000000000000001 /* ApplicationServices.framework in Frameworks */,
 				1A0001050000000000000001 /* libMacToolsCore.a in Frameworks */,
 				1A0001060000000000000001 /* libMacToolsScripting.a in Frameworks */,
 			);
@@ -162,6 +167,7 @@
 			children = (
 				1A0000020000000000000001 /* AutomationModels.swift */,
 				1A0000030000000000000001 /* CoreServices.swift */,
+				1A0000070000000000000001 /* SystemPermissions.swift */,
 			);
 			path = MacToolsCore;
 			sourceTree = "<group>";
@@ -205,6 +211,7 @@
 			isa = PBXGroup;
 			children = (
 				1A0002050000000000000001 /* AppKit.framework */,
+				1A0002060000000000000001 /* ApplicationServices.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -345,6 +352,7 @@
 			files = (
 				1A0001020000000000000001 /* AutomationModels.swift in Sources */,
 				1A0001030000000000000001 /* CoreServices.swift in Sources */,
+				1A00010D0000000000000001 /* SystemPermissions.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

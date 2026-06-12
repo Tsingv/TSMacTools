@@ -75,6 +75,19 @@ Create a future `MacToolsMacOS` module for concrete implementations:
 
 The wrappers should normalize system errors into typed Swift errors. Any permission-sensitive call should have a dry-run/status path so tests and UI can explain what is missing.
 
+Initial permission handling lives in `MacToolsCore.SystemPermissions`:
+
+- `AccessibilityPermissionClient.snapshot()` checks `AXIsProcessTrusted()`.
+- `AccessibilityPermissionClient.requestAccessibilityPrompt()` calls `AXIsProcessTrustedWithOptions` with the system prompt option.
+- App startup shows a native permission window when Accessibility is missing.
+- Unit tests must inject fake permission checkers and must not require real macOS permissions.
+
+Next permission stages:
+
+- Input Monitoring: required for global keyboard event capture where Accessibility alone is insufficient.
+- Screen Recording: required for screen/window image capture or OCR-like workflows.
+- Automation: required when sending Apple Events to other applications.
+
 ### 4. Native Script-Driven Windows
 
 Hammerspoon's `hs.webview` is the behavior reference, but MacTools should expose a native window system instead of a browser-first API.
@@ -146,6 +159,7 @@ python3 scripts/emit_window_command.py
 Future test layers:
 
 - Unit tests for command decoding, key mapping, geometry transforms, and runtime routing.
+- Unit tests for permission state handling with fake permission clients.
 - Snapshot tests for native window content models.
 - Permission-independent macOS wrapper tests with fake adapters.
 - Permission-gated integration tests for Accessibility and event taps.
