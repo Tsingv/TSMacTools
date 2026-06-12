@@ -1,6 +1,6 @@
-# MacTools
+# TSMacTools
 
-MacTools is a Swift-first macOS automation app inspired by Hammerspoon. The project starts with typed core automation models, a Python command bridge, and native AppKit windows that external scripts can drive.
+TSMacTools is a Swift-first macOS automation app inspired by Hammerspoon. The project starts with typed core automation models, a Python command bridge, user configuration under `~/.config/tsmactool`, and native AppKit windows that external scripts can drive.
 
 The current Xcode app target links `MacToolsCore` and `MacToolsScripting` as static libraries, and explicitly links `AppKit.framework` plus `ApplicationServices.framework`. This keeps the debug `.app` launchable while the architecture remains split into Swift modules.
 
@@ -10,6 +10,7 @@ The current Xcode app target links `MacToolsCore` and `MacToolsScripting` as sta
 swift test
 swift run MacTools
 python3 scripts/emit_window_command.py
+python3 scripts/translate_selection.py < sample.txt
 ```
 
 Open the full Xcode project with:
@@ -21,20 +22,22 @@ open MacTools.xcodeproj
 Build and test from the command line:
 
 ```sh
-xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData build CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO
-xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData test CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO
-open DerivedData/Build/Products/Debug/MacTools.app
+xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData build
+xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData test
+open DerivedData/Build/Products/Debug/TSMacTools.app
 ```
 
 Check whether the built app itself has Accessibility permission:
 
 ```sh
-DerivedData/Build/Products/Debug/MacTools.app/Contents/MacOS/MacTools --check-accessibility
+DerivedData/Build/Products/Debug/TSMacTools.app/Contents/MacOS/TSMacTools --check-accessibility
 ```
 
-On first launch, MacTools checks Accessibility permission. If it is missing, macOS will show a prompt and the app will open a native permissions window. Grant access in System Settings > Privacy & Security > Accessibility, then restart the app.
+On first launch, TSMacTools creates `~/.config/tsmactool/config.json` and `~/.config/tsmactool/scripts`. The default config is a typed migration of the current Hammerspoon setup: app focus hotkeys, Finder/terminal toggles, command-tab style window switching preferences, and the LLM translation settings. The translation path now targets `window.show` native windows instead of Hammerspoon `hs.webview`.
 
-Debug builds are currently ad-hoc signed. If `--check-accessibility` still prints `accessibility=missing` after granting access, remove the old MacTools entry from System Settings and add the current app at `DerivedData/Build/Products/Debug/MacTools.app`. A separate `swift` script cannot verify MacTools' permission state because TCC checks the calling process.
+TSMacTools also checks Accessibility permission. If it is missing, macOS will show a prompt and the app will open a native permissions window. Grant access in System Settings > Privacy & Security > Accessibility, then restart the app.
+
+Debug builds are configured to match Xcode's local run signing: Automatically manage signing enabled, Team set to None, and Signing Certificate set to `Sign to Run Locally`. Do not override the project with a different command-line signing identity; doing so changes the app identity and can force macOS TCC to ask for Accessibility permission again. If `--check-accessibility` still prints `accessibility=missing` after granting access, remove the old TSMacTools entry from System Settings and add the current app at `DerivedData/Build/Products/Debug/TSMacTools.app`. A separate `swift` script cannot verify TSMacTools' permission state because TCC checks the calling process.
 
 ## Development Rule
 

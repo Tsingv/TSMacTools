@@ -1,8 +1,8 @@
-# MacTools Architecture Guide
+# TSMacTools Architecture Guide
 
 ## Goal
 
-MacTools is a Swift rewrite of the core automation ideas from Hammerspoon. It keeps the useful macOS automation surface, including window management, hotkey capture, event taps, application/screen inspection, and script-driven UI, but replaces the Lua/Objective-C extension architecture with a Swift-first runtime and a Python-capable external scripting layer.
+TSMacTools is a Swift rewrite of the core automation ideas from Hammerspoon. It keeps the useful macOS automation surface, including window management, hotkey capture, event taps, application/screen inspection, and script-driven UI, but replaces the Lua/Objective-C extension architecture with a Swift-first runtime and a Python-capable external scripting layer.
 
 The local Hammerspoon reference checkout lives at `references/hammerspoon`. Treat it as read-only source material for behavior, API coverage, and parity tests.
 
@@ -48,10 +48,12 @@ The app shell owns process lifecycle, menu bar/dock behavior, settings, permissi
 Initial target:
 
 - `Sources/MacToolsApp`
-- `MacTools.xcodeproj` app target named `MacTools`.
+- `MacTools.xcodeproj` app target currently named `MacTools`, with the built app product and display name set to `TSMacTools`.
 - AppKit `@main` entry point in `Sources/MacToolsApp/AppDelegate.swift`.
 - Explicit Xcode links to `AppKit.framework` and `ApplicationServices.framework`.
 - Xcode uses static library targets for `MacToolsCore` and `MacToolsScripting` so the debug app bundle runs without embedded local framework signing issues.
+- App startup bootstraps the user configuration directory at `~/.config/tsmactool`, creates `config.json` when missing, and leaves existing user configuration untouched.
+- The app icon lives in `Sources/MacToolsApp/Resources/Assets.xcassets/AppIcon.appiconset`.
 - Later: entitlements, launch-at-login, menu bar UI, settings window, and a stable development signing identity.
 
 ### 2. Core Automation Domain
@@ -62,7 +64,7 @@ Initial target:
 - `HotkeyCapturing`
 - `SystemEventObserving`
 - `AutomationRuntime`
-- typed command models such as `AutomationCommand`, `NativeWindowContent`, and window identifiers.
+- typed command models such as `AutomationCommand`, `NativeWindowContent`, `UserConfiguration`, hotkey bindings, window switcher settings, translation settings, and window identifiers.
 
 This module should not import AppKit-specific UI code unless the model requires macOS value types. Prefer plain Swift structs, protocols, and testable reducers.
 
@@ -83,8 +85,8 @@ Initial permission handling lives in `MacToolsCore.SystemPermissions`:
 - `AccessibilityPermissionClient.snapshot()` checks `AXIsProcessTrusted()`.
 - `AccessibilityPermissionClient.requestAccessibilityPrompt()` calls `AXIsProcessTrustedWithOptions` with the system prompt option.
 - App startup shows a native permission window when Accessibility is missing.
-- `MacTools --check-accessibility` prints the built app's own Accessibility status and exits without opening the UI.
-- Current Debug builds are ad-hoc signed. Rebuilding can change the signing identity enough for macOS TCC to treat the app as a new client, so stale Accessibility entries may need to be removed and the current `DerivedData/Build/Products/Debug/MacTools.app` re-added.
+- `TSMacTools --check-accessibility` prints the built app's own Accessibility status and exits without opening the UI.
+- Debug builds are configured to match Xcode's local run signing: Automatically manage signing enabled, Team set to None, and Signing Certificate set to `Sign to Run Locally`. Do not override the project with a different command-line signing identity, because changing the signing identity can make macOS TCC ask for Accessibility permission again.
 - Unit tests must inject fake permission checkers and must not require real macOS permissions.
 
 Next permission stages:
@@ -141,6 +143,13 @@ The current prototype has `PythonScriptBridge.decodeCommand(from:)` for the firs
 7. Add parity tests using Hammerspoon tests and module docs as behavior references.
 8. Add permission-gated integration tests that can be skipped until the user grants macOS permissions.
 
+Current migrated user configuration:
+
+- `~/.config/tsmactool/config.json` stores the Hammerspoon-derived bundle IDs, app focus hotkeys, Finder/terminal toggles, reload binding, window switcher preferences, and LLM translation settings.
+- `Sources/MacToolsApp/GlobalHotkeyController.swift` currently registers configured hotkeys with Carbon `RegisterEventHotKey` and dispatches app focus, app toggle, config reload, focused app info, and selected-text translation actions.
+- `~/.config/tsmactool/scripts/translate_selection.py` is the user-facing translation script. It reads the config, calls a chat-completions-compatible endpoint, and emits a `window.show` command for a native Markdown window instead of using `hs.webview`.
+- The repository copy at `scripts/translate_selection.py` is a template/example and should not contain a real API key.
+
 ## Testing Strategy
 
 Run fast checks:
@@ -158,15 +167,15 @@ swift run MacTools
 Build, test, and run the Xcode app target:
 
 ```sh
-xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData build CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO
-xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData test CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO
-open DerivedData/Build/Products/Debug/MacTools.app
+xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData build
+xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData test
+open DerivedData/Build/Products/Debug/TSMacTools.app
 ```
 
 Check the built app's own Accessibility state:
 
 ```sh
-DerivedData/Build/Products/Debug/MacTools.app/Contents/MacOS/MacTools --check-accessibility
+DerivedData/Build/Products/Debug/TSMacTools.app/Contents/MacOS/TSMacTools --check-accessibility
 ```
 
 This check is path/signature sensitive because macOS TCC tracks the app identity. Do not use a separate `swift` script to infer the app's permission state; that only checks the `swift` process.
@@ -175,6 +184,7 @@ Generate a sample Python command:
 
 ```sh
 python3 scripts/emit_window_command.py
+python3 scripts/translate_selection.py < sample.txt
 ```
 
 Future test layers:

@@ -9,7 +9,18 @@ final class NativeWindowManager: WindowManaging {
     func showWindow(id: NativeWindowID, content: NativeWindowContent) {
         let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 420))
         textView.isEditable = false
+        textView.isRichText = true
+        textView.textContainerInset = NSSize(width: 18, height: 18)
+        textView.font = .systemFont(ofSize: 14)
         textView.string = render(content.body)
+        if case let .markdown(markdown) = content.body,
+           let data = markdown.data(using: .utf8),
+           let attributed = try? NSAttributedString(
+            markdown: data,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+           ) {
+            textView.textStorage?.setAttributedString(attributed)
+        }
 
         let scrollView = NSScrollView(frame: textView.frame)
         scrollView.hasVerticalScroller = true
@@ -44,6 +55,8 @@ final class NativeWindowManager: WindowManaging {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var runtime: AutomationRuntime?
+    private var configurationBootstrap: UserConfigurationBootstrapResult?
+    private var hotkeyController: GlobalHotkeyController?
 
     static func main() {
         if CommandLine.arguments.contains("--check-accessibility") {
@@ -63,18 +76,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let manager = NativeWindowManager()
         let permissionClient = AccessibilityPermissionClient()
+        configurationBootstrap = try? UserConfigurationStore().bootstrap()
         runtime = AutomationRuntime(
             windowManager: manager,
             permissionChecker: permissionClient
         )
+        if let runtime, let configuration = configurationBootstrap?.configuration {
+            hotkeyController = GlobalHotkeyController(runtime: runtime, configuration: configuration)
+            hotkeyController?.start()
+        }
 
+        let configPath = configurationBootstrap?.configURL.path ?? "~/.config/tsmactool/config.json"
+        let scriptsPath = configurationBootstrap?.scriptsDirectoryURL.path ?? "~/.config/tsmactool/scripts"
         let permissions = runtime?.permissionSnapshot()
         if permissions?.accessibility == .granted {
             runtime?.handle(.showWindow(
                 id: NativeWindowID("welcome"),
                 content: NativeWindowContent(
-                    title: "MacTools",
-                    body: .plainText("MacTools runtime started. Python script commands will drive native windows here.")
+                    title: "TSMacTools",
+                    body: .markdown("""
+                    # TSMacTools
+
+                    Runtime started.
+
+                    Configuration: `\(configPath)`
+
+                    Scripts: `\(scriptsPath)`
+
+                    Python script commands can drive native windows through the typed command protocol.
+                    """)
                 )
             ))
         } else {
@@ -82,10 +112,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             runtime?.handle(.showWindow(
                 id: NativeWindowID("permissions"),
                 content: NativeWindowContent(
-                    title: "MacTools Permissions",
-                    body: .plainText("Accessibility permission is required for window management, hotkeys, and event capture. Grant MacTools access in System Settings > Privacy & Security > Accessibility, then restart the app.")
+                    title: "TSMacTools Permissions",
+                    body: .markdown("""
+                    # Accessibility Required
+
+                    Accessibility permission is required for window management, hotkeys, and event capture.
+
+                    Grant TSMacTools access in System Settings > Privacy & Security > Accessibility, then restart the app.
+
+                    Configuration: `\(configPath)`
+                    """)
                 )
             ))
         }
+    }
+
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
+        true
     }
 }

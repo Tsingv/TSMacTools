@@ -16,7 +16,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "1A0005000000000000000001"
-               BuildableName = "MacTools.app"
+               BuildableName = "TSMacTools.app"
                BlueprintName = "MacTools"
                ReferencedContainer = "container:MacTools.xcodeproj">
             </BuildableReference>
@@ -58,7 +58,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "1A0005000000000000000001"
-            BuildableName = "MacTools.app"
+            BuildableName = "TSMacTools.app"
             BlueprintName = "MacTools"
             ReferencedContainer = "container:MacTools.xcodeproj">
          </BuildableReference>
@@ -75,7 +75,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "1A0005000000000000000001"
-            BuildableName = "MacTools.app"
+            BuildableName = "TSMacTools.app"
             BlueprintName = "MacTools"
             ReferencedContainer = "container:MacTools.xcodeproj">
          </BuildableReference>

@@ -16,7 +16,8 @@ let package = Package(
         .executableTarget(
             name: "MacToolsApp",
             dependencies: ["MacToolsCore", "MacToolsScripting"],
-            exclude: ["Info.plist"]
+            exclude: ["Info.plist", "Resources"],
+            linkerSettings: [.linkedFramework("Carbon")]
         ),
         .target(name: "MacToolsCore"),
         .target(
