@@ -48,8 +48,11 @@ The app shell owns process lifecycle, menu bar/dock behavior, settings, permissi
 Initial target:
 
 - `Sources/MacToolsApp`
-- AppKit entry point.
-- Later: Xcode app target, entitlements, launch-at-login, menu bar UI, settings window.
+- `MacTools.xcodeproj` app target named `MacTools`.
+- AppKit `@main` entry point in `Sources/MacToolsApp/AppDelegate.swift`.
+- Explicit Xcode links to `AppKit.framework` and `ApplicationServices.framework`.
+- Xcode uses static library targets for `MacToolsCore` and `MacToolsScripting` so the debug app bundle runs without embedded local framework signing issues.
+- Later: entitlements, launch-at-login, menu bar UI, settings window, and a stable development signing identity.
 
 ### 2. Core Automation Domain
 
@@ -80,6 +83,8 @@ Initial permission handling lives in `MacToolsCore.SystemPermissions`:
 - `AccessibilityPermissionClient.snapshot()` checks `AXIsProcessTrusted()`.
 - `AccessibilityPermissionClient.requestAccessibilityPrompt()` calls `AXIsProcessTrustedWithOptions` with the system prompt option.
 - App startup shows a native permission window when Accessibility is missing.
+- `MacTools --check-accessibility` prints the built app's own Accessibility status and exits without opening the UI.
+- Current Debug builds are ad-hoc signed. Rebuilding can change the signing identity enough for macOS TCC to treat the app as a new client, so stale Accessibility entries may need to be removed and the current `DerivedData/Build/Products/Debug/MacTools.app` re-added.
 - Unit tests must inject fake permission checkers and must not require real macOS permissions.
 
 Next permission stages:
@@ -149,6 +154,22 @@ Run the app locally:
 ```sh
 swift run MacTools
 ```
+
+Build, test, and run the Xcode app target:
+
+```sh
+xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData build CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO
+xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -derivedDataPath DerivedData test CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO
+open DerivedData/Build/Products/Debug/MacTools.app
+```
+
+Check the built app's own Accessibility state:
+
+```sh
+DerivedData/Build/Products/Debug/MacTools.app/Contents/MacOS/MacTools --check-accessibility
+```
+
+This check is path/signature sensitive because macOS TCC tracks the app identity. Do not use a separate `swift` script to infer the app's permission state; that only checks the `swift` process.
 
 Generate a sample Python command:
 
