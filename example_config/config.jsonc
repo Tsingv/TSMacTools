@@ -1,0 +1,212 @@
+// Example TSMacTools configuration.
+// Copy this directory to my_config for local use, then keep my_config untracked.
+// The app reads ~/.config/tsmactool/config.jsonc; in this repo that symlink points to my_config.
+{
+  // macOS application identifiers and window filtering defaults.
+  "application": {
+    "finderBundleIdentifier": "com.apple.finder", // Used by the Finder toggle action.
+    "ignoredWindowApplicationNames": [ // Apps ignored by the native window switcher.
+      "Dock",
+      "SystemUIServer",
+      "Window Server"
+    ],
+    "terminalBundleIdentifier": "net.kovidgoyal.kitty" // Used by the terminal toggle action.
+  },
+
+  // Python executable used to run configured script functions.
+  "scripting": {
+    "pythonPath": "/Users/clearain/.venv/bin/python"
+  },
+
+  // Global hotkeys. runScript loads path, injects config/input_text/nativewindow/window, then calls function.
+  "hotkeys": [
+    {
+      "action": {
+        "interfaceName": "focusedWindowInfo",
+        "kind": "callInterface"
+      },
+      "key": ".",
+      "modifiers": [
+        "ctrl",
+        "cmd"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/WeChat.app"
+      },
+      "key": "W",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/Discord.app"
+      },
+      "key": "O",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/Lark.app"
+      },
+      "key": "F",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/Google Chrome.app"
+      },
+      "key": "C",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/SiYuan.app"
+      },
+      "key": "R",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/Microsoft Outlook.app"
+      },
+      "key": "M",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/QQ.app"
+      },
+      "key": "Q",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/Visual Studio Code.app"
+      },
+      "key": "V",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/Zotero.app"
+      },
+      "key": "Z",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "focusApplication",
+        "path": "/Applications/Cherry Studio.app"
+      },
+      "key": "X",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "function": "main",
+        "input": "selectedText",
+        "kind": "runScript",
+        "nativeWindowID": "translate",
+        "path": "scripts/translate_selection.py"
+      },
+      "key": "S",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "bundleIdentifier": "com.apple.finder",
+        "kind": "toggleFinder"
+      },
+      "key": "E",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "bundleIdentifier": "net.kovidgoyal.kitty",
+        "kind": "toggleTerminal"
+      },
+      "key": "D",
+      "modifiers": [
+        "cmd"
+      ]
+    },
+    {
+      "action": {
+        "interfaceName": "reloadConfiguration",
+        "kind": "callInterface"
+      },
+      "key": "R",
+      "modifiers": [
+        "cmd",
+        "alt",
+        "ctrl"
+      ]
+    }
+  ],
+
+  // Native Command+Tab style window switcher settings.
+  "windowSwitcher": {
+    "commandTabBehavior": "most-recent-window",
+    "debug": true,
+    "enabled": true,
+    "followFocusedScreen": true,
+    "height": 420,
+    "maxVisibleRows": 9,
+    "sameApplicationBehavior": "cycle-same-application-windows",
+    "width": 760
+  },
+
+  // LLM translation settings consumed by scripts/translate_selection.py.
+  "translation": {
+    "apiKey": "", // API key for the chat-completions-compatible endpoint. Leave blank in examples.
+    "copyKeystrokeDelay": 0.18, // Delay after Command+C before reading selected text from the pasteboard.
+    "enabled": true, // Reserved switch for translation-related features.
+    "endpoint": "http://127.0.0.1:8787/v1/chat/completions", // Chat completions endpoint URL.
+    "model": "llama-3.3-70b-versatile", // Model name sent to the endpoint.
+    "nativeWindow": {
+      "format": "markdown",
+      "height": 620,
+      "id": "translate",
+      "pinByDefault": false,
+      "title": "LLM Translate",
+      "width": 720
+    },
+    "promptTemplate": "你是一个专业的英语翻译人员，尤其是知晓计算机领域的各种术语，接下来我会提供你一段文本，你需要如下操作：\n- 识别提供的文本，如果中文，翻译为地道的英文；如果是英文或其他语言，翻译为中文\n- 直接简短提示我是什么原始语言，翻译成了什么语言，随后换2行并跟上翻译后的文本，不要其他的多余内容\n- 不得增删任何内容，不得压缩内容，不要遗漏翻译任何内容\n---\n\n{{sourceText}}", // {{sourceText}} is replaced by selected text.
+    "systemPrompt": "", // Optional system message.
+    "temperature": 0.2 // Sampling temperature.
+  }
+}

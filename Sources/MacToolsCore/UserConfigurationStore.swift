@@ -61,10 +61,10 @@ public final class UserConfigurationStore {
         let configuration: UserConfiguration
         if fileManager.fileExists(atPath: configURL.path) {
             let data = try Data(contentsOf: configURL)
-            configuration = try decoder.decode(UserConfiguration.self, from: data)
+            configuration = try decodeConfiguration(from: data)
             createdConfig = false
         } else {
-            let data = try encoder.encode(defaultConfiguration)
+            let data = try encodeConfigurationAsJSONC(defaultConfiguration)
             try data.write(to: configURL, options: [.atomic])
             configuration = defaultConfiguration
             createdConfig = true
@@ -97,21 +97,85 @@ public final class UserConfigurationStore {
         )
     }
 
+    public func decodeConfiguration(from data: Data) throws -> UserConfiguration {
+        let jsoncData = Data(stripJSONComments(from: String(decoding: data, as: UTF8.self)).utf8)
+        return try decoder.decode(UserConfiguration.self, from: jsoncData)
+    }
+
+    public func encodeConfigurationAsJSONC(_ configuration: UserConfiguration) throws -> Data {
+        let data = try encoder.encode(configuration)
+        let json = String(decoding: data, as: UTF8.self)
+        let text = """
+        // TSMacTools user configuration.
+        // This file is JSONC: regular JSON with // and /* */ comments.
+        // The default path is ~/.config/tsmactool/config.jsonc.
+        \(json)
+        """
+        return Data(text.utf8)
+    }
+
+    private func stripJSONComments(from text: String) -> String {
+        var result = ""
+        var iterator = text.makeIterator()
+        var inString = false
+        var escaping = false
+
+        while let character = iterator.next() {
+            if inString {
+                result.append(character)
+                if escaping {
+                    escaping = false
+                } else if character == "\\" {
+                    escaping = true
+                } else if character == "\"" {
+                    inString = false
+                }
+                continue
+            }
+
+            if character == "\"" {
+                inString = true
+                result.append(character)
+                continue
+            }
+
+            if character == "/" {
+                guard let next = iterator.next() else {
+                    result.append(character)
+                    break
+                }
+                if next == "/" {
+                    while let skipped = iterator.next(), skipped != "\n" {}
+                    result.append("\n")
+                } else if next == "*" {
+                    var previous: Character?
+                    while let skipped = iterator.next() {
+                        if previous == "*" && skipped == "/" {
+                            break
+                        }
+                        if skipped == "\n" {
+                            result.append("\n")
+                        }
+                        previous = skipped
+                    }
+                } else {
+                    result.append(character)
+                    result.append(next)
+                }
+                continue
+            }
+
+            result.append(character)
+        }
+
+        return result
+    }
+
     private static let defaultTranslationScript = """
     #!/usr/bin/env python3
-    import json
-    import sys
     import urllib.error
     import urllib.request
-    from pathlib import Path
-
-
-    CONFIG_PATH = Path.home() / ".config" / "tsmactool" / "config.json"
-
-
-    def load_config():
-        with CONFIG_PATH.open("r", encoding="utf-8") as file:
-            return json.load(file)
+    import json
 
 
     def extract_text(response):
@@ -130,7 +194,7 @@ public final class UserConfigurationStore {
         return ""
 
 
-    def request_translation(config, source_text):
+    def request_translation(source_text):
         translation = config["translation"]
         prompt = translation["promptTemplate"].replace("{{sourceText}}", source_text)
         messages = []
@@ -157,7 +221,7 @@ public final class UserConfigurationStore {
             return extract_text(json.loads(response.read().decode("utf-8")))
 
 
-    def emit_window_command(config, source_text, translated_text, status_text="Ready"):
+    def emit_window_command(source_text, translated_text, status_text="Ready"):
         window = config["translation"]["nativeWindow"]
         body = f\"\"\"# Translation
 
@@ -171,33 +235,22 @@ public final class UserConfigurationStore {
 
     {translated_text}
     \"\"\"
-        print(json.dumps({
-            "command": "window.show",
-            "id": window["id"],
-            "title": window["title"],
-            "format": window["format"],
-            "body": body,
-        }, ensure_ascii=False))
+        nativewindow.show(window["id"], window["title"], body, window["format"])
 
 
     def main():
-        config = load_config()
-        source_text = sys.stdin.read().strip()
+        source_text = input_text.strip()
         if not source_text:
-            emit_window_command(config, "", "No selected text was provided.", "Missing source")
+            emit_window_command("", "No selected text was provided.", "Missing source")
             return 1
 
         try:
-            translated_text = request_translation(config, source_text)
+            translated_text = request_translation(source_text)
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as error:
-            emit_window_command(config, source_text, str(error), "Request failed")
+            emit_window_command(source_text, str(error), "Request failed")
             return 1
 
-        emit_window_command(config, source_text, translated_text)
+        emit_window_command(source_text, translated_text)
         return 0
-
-
-    if __name__ == "__main__":
-        raise SystemExit(main())
     """
 }

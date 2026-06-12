@@ -99,7 +99,7 @@ final class GlobalHotkeyController {
 
     private func register(_ binding: HotkeyBinding) {
         guard let keyCode = keyCode(for: binding.key) else {
-            showStatusWindow(title: "Hotkey Error", body: "Unsupported key in \(binding.id): \(binding.key)")
+            showStatusWindow(title: "Hotkey Error", body: "Unsupported key in \(binding.label): \(binding.key)")
             return
         }
 
@@ -124,7 +124,7 @@ final class GlobalHotkeyController {
         } else {
             handlers[signature] = nil
             Self.controllers[signature] = nil
-            showStatusWindow(title: "Hotkey Error", body: "Unable to register \(binding.id): \(status)")
+            showStatusWindow(title: "Hotkey Error", body: "Unable to register \(binding.label): \(status)")
         }
     }
 
@@ -151,6 +151,10 @@ final class GlobalHotkeyController {
             toggleTerminal(bundleIdentifier: binding.action.bundleIdentifier ?? configuration.application.terminalBundleIdentifier)
         case .reloadConfiguration:
             reloadConfiguration()
+        case .runScript:
+            runScriptAction(binding.action)
+        case .callInterface:
+            callInterface(binding.action.interfaceName)
         }
     }
 
@@ -247,8 +251,34 @@ final class GlobalHotkeyController {
                 return
             }
 
-            self.showTranslationLoadingWindow()
-            self.runTranslationScript(sourceText: sourceText)
+            self.showTranslationLoadingWindow(id: self.configuration.translation.nativeWindow.id)
+            self.runScript(path: "scripts/translate_selection.py", function: "main", inputText: sourceText, title: "LLM Translate")
+        }
+    }
+
+    private func runScriptAction(_ action: HotkeyAction) {
+        let run: (String) -> Void = { [weak self] inputText in
+            guard let self else {
+                return
+            }
+            if let nativeWindowID = action.nativeWindowID {
+                self.showTranslationLoadingWindow(id: nativeWindowID)
+            }
+            self.runScript(path: action.path, function: action.function, inputText: inputText, title: "Script")
+        }
+
+        switch action.input {
+        case "selectedText":
+            copySelectionToPasteboard { [weak self] selectedText in
+                let sourceText = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !sourceText.isEmpty else {
+                    self?.showStatusWindow(title: "Script", body: "没有读取到选中文本")
+                    return
+                }
+                run(sourceText)
+            }
+        default:
+            run("")
         }
     }
 
@@ -275,14 +305,19 @@ final class GlobalHotkeyController {
         }
     }
 
-    private func runTranslationScript(sourceText: String) {
-        let scriptURL = configurationStore.defaultDirectoryURL()
-            .appendingPathComponent("scripts", isDirectory: true)
-            .appendingPathComponent("translate_selection.py")
+    private func runScript(path: String?, function: String?, inputText: String, title: String) {
+        guard let path, !path.isEmpty else {
+            showStatusWindow(title: title, body: "Missing script path")
+            return
+        }
+
+        let scriptURL = scriptURL(for: path)
+        let functionName = function?.isEmpty == false ? function! : "main"
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = [scriptURL.path]
+        process.executableURL = URL(fileURLWithPath: configuration.scripting.pythonPath)
+        process.arguments = ["-c", Self.scriptRunner, scriptURL.path, functionName]
+        process.currentDirectoryURL = scriptURL.deletingLastPathComponent()
 
         let input = Pipe()
         let output = Pipe()
@@ -292,10 +327,12 @@ final class GlobalHotkeyController {
 
         do {
             try process.run()
-            input.fileHandleForWriting.write(Data(sourceText.utf8))
+            let context = ScriptExecutionContext(configuration: configuration, inputText: inputText)
+            let payload = try JSONEncoder().encode(context)
+            input.fileHandleForWriting.write(payload)
             try input.fileHandleForWriting.close()
         } catch {
-            showStatusWindow(title: "LLM Translate", body: error.localizedDescription)
+            showStatusWindow(title: title, body: error.localizedDescription)
             return
         }
 
@@ -309,16 +346,23 @@ final class GlobalHotkeyController {
                     let command = try PythonScriptBridge().decodeCommand(from: data)
                     self.runtime.handle(command)
                 } catch {
-                    self.showStatusWindow(title: "LLM Translate", body: error.localizedDescription)
+                    self.showStatusWindow(title: title, body: error.localizedDescription)
                 }
             }
         }
     }
 
-    private func showTranslationLoadingWindow() {
+    private func scriptURL(for path: String) -> URL {
+        if path.hasPrefix("/") {
+            return URL(fileURLWithPath: path)
+        }
+        return configurationStore.defaultDirectoryURL().appendingPathComponent(path)
+    }
+
+    private func showTranslationLoadingWindow(id: String) {
         let window = configuration.translation.nativeWindow
         runtime.handle(.showWindow(
-            id: NativeWindowID(window.id),
+            id: NativeWindowID(id),
             content: NativeWindowContent(
                 title: window.title,
                 body: .plainText(NativeWindowManager.translationLoadingBody)
@@ -334,6 +378,19 @@ final class GlobalHotkeyController {
             showStatusWindow(title: "TSMacTools", body: "Configuration reloaded from \(result.configURL.path)")
         } catch {
             showStatusWindow(title: "Reload Error", body: error.localizedDescription)
+        }
+    }
+
+    private func callInterface(_ name: String?) {
+        switch name {
+        case "focusedWindowInfo":
+            showFocusedApplicationInfo()
+        case "reloadConfiguration":
+            reloadConfiguration()
+        case "translateSelection":
+            translateSelection()
+        default:
+            showStatusWindow(title: "TSMacTools", body: "Unknown interface: \(name ?? "<missing>")")
         }
     }
 
@@ -392,5 +449,73 @@ final class GlobalHotkeyController {
         case ".": return kVK_ANSI_Period
         default: return nil
         }
+    }
+}
+
+private struct ScriptExecutionContext: Encodable {
+    var configuration: UserConfiguration
+    var inputText: String
+}
+
+private extension GlobalHotkeyController {
+    static let scriptRunner = #"""
+import importlib.util
+import json
+import sys
+
+
+class NativeWindow:
+    def show(self, id, title, body, format="plainText"):
+        print(json.dumps({
+            "command": "window.show",
+            "id": id,
+            "title": title,
+            "format": format,
+            "body": body,
+        }, ensure_ascii=False), flush=True)
+
+    def close(self, id):
+        print(json.dumps({
+            "command": "window.close",
+            "id": id,
+        }, ensure_ascii=False), flush=True)
+
+
+def main():
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: SCRIPT FUNCTION")
+
+    script_path = sys.argv[1]
+    function_name = sys.argv[2]
+    context = json.loads(sys.stdin.read() or "{}")
+
+    spec = importlib.util.spec_from_file_location("tsmactools_user_script", script_path)
+    module = importlib.util.module_from_spec(spec)
+    module.config = context.get("configuration", {})
+    module.input_text = context.get("inputText", "")
+    module.nativewindow = NativeWindow()
+    module.window = module.nativewindow
+
+    if spec.loader is None:
+        raise SystemExit(f"unable to load script: {script_path}")
+    spec.loader.exec_module(module)
+
+    function = getattr(module, function_name)
+    result = function()
+    if isinstance(result, dict):
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+    elif isinstance(result, str) and result.strip():
+        print(result, flush=True)
+    return 0 if result is None else int(result) if isinstance(result, int) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""#
+}
+
+private extension HotkeyBinding {
+    var label: String {
+        id ?? "\(modifiers.joined(separator: "+"))+\(key)"
     }
 }

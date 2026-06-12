@@ -52,7 +52,8 @@ Initial target:
 - AppKit `@main` entry point in `Sources/MacToolsApp/AppDelegate.swift`.
 - Explicit Xcode links to `AppKit.framework` and `ApplicationServices.framework`.
 - Xcode uses static library targets for `MacToolsCore` and `MacToolsScripting` so the debug app bundle runs without embedded local framework signing issues.
-- App startup bootstraps the user configuration directory at `~/.config/tsmactool`, creates `config.json` when missing, and leaves existing user configuration untouched.
+- App startup bootstraps the user configuration directory at `~/.config/tsmactool`, creates `config.jsonc` when missing, and leaves existing user configuration untouched.
+- The repository tracks `example_config/config.jsonc` and `example_config/scripts` as safe templates. Local development uses untracked `my_config`, with `~/.config/tsmactool` symlinked to that folder when needed.
 - The app runs as a menu bar accessory via `LSUIElement`, does not occupy Dock space, and exposes minimal status-menu actions for permission prompting, opening configuration, and quitting.
 - The app icon lives in `Sources/MacToolsApp/Resources/Assets.xcassets/AppIcon.appiconset`.
 - Later: entitlements, launch-at-login, menu bar UI, settings window, and a stable development signing identity.
@@ -125,13 +126,13 @@ Python is the first external scripting language. The app should communicate with
 
 Recommended stages:
 
-1. JSON lines over stdin/stdout for local scripts.
+1. One JSON command per stdout line for local scripts.
 2. Request/response IDs and async events.
 3. Capability discovery so scripts can ask which native APIs are available.
 4. Optional local socket transport for long-running script modules.
 5. Sandboxing and trust policy for user-installed scripts.
 
-The current prototype has `PythonScriptBridge.decodeCommand(from:)` for the first JSON command contract.
+The current prototype has `PythonScriptBridge.decodeCommand(from:)` for the first JSON command contract. User scripts are launched with the configured `scripting.pythonPath`; the app injects `config`, `input_text`, `nativewindow`, and `window` globals into the script module, then calls the function named by the hotkey action.
 
 ## Migration Plan From Hammerspoon
 
@@ -146,12 +147,13 @@ The current prototype has `PythonScriptBridge.decodeCommand(from:)` for the firs
 
 Current migrated user configuration:
 
-- `~/.config/tsmactool/config.json` stores the Hammerspoon-derived bundle IDs, app focus hotkeys, Finder/terminal toggles, reload binding, window switcher preferences, and LLM translation settings.
-- `Sources/MacToolsApp/GlobalHotkeyController.swift` currently registers configured hotkeys with Carbon `RegisterEventHotKey` and dispatches app focus, app toggle, config reload, focused app info, and selected-text translation actions.
+- `~/.config/tsmactool/config.jsonc` stores the Hammerspoon-derived bundle IDs, Python executable path, app focus hotkeys, Finder/terminal toggles, reload binding, window switcher preferences, and LLM translation settings as one JSONC object with `//` and `/* */` comments allowed. Derived fields such as `version`, hotkey `id`, `application.name`, and `application.configDirectoryName` are intentionally omitted from defaults.
+- `example_config/config.jsonc` mirrors the supported config shape with comments and no real secrets. `my_config/config.jsonc` is the local, untracked runtime copy and may contain real API keys.
+- `Sources/MacToolsApp/GlobalHotkeyController.swift` currently registers configured hotkeys with Carbon `RegisterEventHotKey` and dispatches app focus, app toggle, config reload, focused app info, and selected-text translation actions. Actions can either call built-in Swift interfaces via `callInterface` and `interfaceName`, or run a configured Python file via `runScript`, `path`, `function`, optional `input`, and optional `nativeWindowID`.
 - `Sources/MacToolsApp/WindowSwitcherController.swift` installs a CGEvent tap when `windowSwitcher.enabled` is true, suppresses `Command+Tab` and `Command+\``, displays a native AppKit overlay, de-duplicates candidates by Accessibility window identity, filters fake windows by CG/AX properties instead of title text, observes AX lifecycle notifications, removes destroyed windows, moves hidden or minimized windows behind active windows, and focuses the selected Accessibility window when Command is released. Focus mirrors Hammerspoon by making the AX window main, bringing the app frontmost via the Carbon process API, and raising the AX window. `windowSwitcher.debug` logs CG/AX attributes, lifecycle notifications, and focus retries.
 - `Sources/MacToolsApp/AppDelegate.swift` shows translation `window.show` commands as floating native windows that appear immediately with a spinning `Translating...` state while the script is running, use dynamic system colors for light/dark mode, close when focus is lost by default, and include a title-bar pin button so the same window can stay visible and receive later translation updates.
-- `~/.config/tsmactool/scripts/translate_selection.py` is the user-facing translation script. It reads the config, calls a chat-completions-compatible endpoint, and emits a `window.show` command for a native Markdown window instead of using `hs.webview`.
-- The repository copy at `scripts/translate_selection.py` is a template/example and should not contain a real API key.
+- `~/.config/tsmactool/scripts/translate_selection.py` is the user-facing translation script. It receives `config`, `input_text`, and `nativewindow` as injected globals, calls a chat-completions-compatible endpoint, and shows a native Markdown window instead of using `hs.webview`.
+- The repository template at `example_config/scripts/translate_selection.py` should not contain a real API key.
 
 ## Testing Strategy
 
@@ -183,12 +185,7 @@ DerivedData/Build/Products/Debug/TSMacTools.app/Contents/MacOS/TSMacTools --chec
 
 This check is path/signature sensitive because macOS TCC tracks the app identity. Do not use a separate `swift` script to infer the app's permission state; that only checks the `swift` process.
 
-Generate a sample Python command:
-
-```sh
-python3 scripts/emit_window_command.py
-python3 scripts/translate_selection.py < sample.txt
-```
+Script examples live under `example_config/scripts`; they are designed to run through the app's injected globals rather than as standalone commands.
 
 Future test layers:
 
@@ -202,6 +199,7 @@ Future test layers:
 ## Engineering Rules
 
 - Any code, build configuration, permission behavior, scripting protocol, or test workflow change must update both `AGENTS.md` and `README.md` in the same commit. Pure documentation-only edits are the only exception.
+- Any config field, script entrypoint, or user-facing automation behavior change must also update tracked `example_config/config.jsonc` and relevant files under `example_config/scripts`.
 - Keep `references/hammerspoon` read-only.
 - Prefer Swift typed models and protocols over dynamic dictionaries inside the app.
 - Keep Python at the boundary. It can provide powerful processing, but it should talk to the app through explicit commands/events.

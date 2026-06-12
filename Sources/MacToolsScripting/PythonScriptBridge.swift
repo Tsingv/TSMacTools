@@ -10,6 +10,25 @@ public struct PythonScriptBridge {
     public init() {}
 
     public func decodeCommand(from data: Data) throws -> AutomationCommand {
+        if let command = try? decodeSingleCommand(from: data) {
+            return command
+        }
+
+        let commandData: Data
+        let lines = String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if let lastLine = lines.last {
+            commandData = Data(lastLine.utf8)
+        } else {
+            commandData = data
+        }
+
+        return try decodeSingleCommand(from: commandData)
+    }
+
+    private func decodeSingleCommand(from data: Data) throws -> AutomationCommand {
         let object = try JSONSerialization.jsonObject(with: data)
         guard let dictionary = object as? [String: Any],
               let command = dictionary["command"] as? String else {

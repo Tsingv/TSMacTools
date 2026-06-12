@@ -1,56 +1,76 @@
 import Foundation
 
 public struct UserConfiguration: Equatable, Codable, Sendable {
-    public var version: Int
     public var application: ApplicationSettings
+    public var scripting: ScriptingSettings
     public var hotkeys: [HotkeyBinding]
     public var windowSwitcher: WindowSwitcherSettings
     public var translation: TranslationSettings
 
     public init(
-        version: Int,
         application: ApplicationSettings,
+        scripting: ScriptingSettings,
         hotkeys: [HotkeyBinding],
         windowSwitcher: WindowSwitcherSettings,
         translation: TranslationSettings
     ) {
-        self.version = version
         self.application = application
+        self.scripting = scripting
         self.hotkeys = hotkeys
         self.windowSwitcher = windowSwitcher
         self.translation = translation
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case application
+        case scripting
+        case hotkeys
+        case windowSwitcher
+        case translation
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.application = try container.decode(ApplicationSettings.self, forKey: .application)
+        self.scripting = try container.decodeIfPresent(ScriptingSettings.self, forKey: .scripting)
+            ?? ScriptingSettings(pythonPath: "/usr/bin/python3")
+        self.hotkeys = try container.decode([HotkeyBinding].self, forKey: .hotkeys)
+        self.windowSwitcher = try container.decode(WindowSwitcherSettings.self, forKey: .windowSwitcher)
+        self.translation = try container.decode(TranslationSettings.self, forKey: .translation)
+    }
 }
 
 public struct ApplicationSettings: Equatable, Codable, Sendable {
-    public var name: String
-    public var configDirectoryName: String
     public var terminalBundleIdentifier: String
     public var finderBundleIdentifier: String
     public var ignoredWindowApplicationNames: [String]
 
     public init(
-        name: String,
-        configDirectoryName: String,
         terminalBundleIdentifier: String,
         finderBundleIdentifier: String,
         ignoredWindowApplicationNames: [String]
     ) {
-        self.name = name
-        self.configDirectoryName = configDirectoryName
         self.terminalBundleIdentifier = terminalBundleIdentifier
         self.finderBundleIdentifier = finderBundleIdentifier
         self.ignoredWindowApplicationNames = ignoredWindowApplicationNames
     }
 }
 
+public struct ScriptingSettings: Equatable, Codable, Sendable {
+    public var pythonPath: String
+
+    public init(pythonPath: String) {
+        self.pythonPath = pythonPath
+    }
+}
+
 public struct HotkeyBinding: Equatable, Codable, Sendable {
-    public var id: String
+    public var id: String?
     public var modifiers: [String]
     public var key: String
     public var action: HotkeyAction
 
-    public init(id: String, modifiers: [String], key: String, action: HotkeyAction) {
+    public init(id: String? = nil, modifiers: [String], key: String, action: HotkeyAction) {
         self.id = id
         self.modifiers = modifiers
         self.key = key
@@ -66,23 +86,34 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
         case toggleFinder
         case toggleTerminal
         case reloadConfiguration
+        case runScript
+        case callInterface
     }
 
     public var kind: Kind
     public var path: String?
     public var bundleIdentifier: String?
     public var nativeWindowID: String?
+    public var interfaceName: String?
+    public var function: String?
+    public var input: String?
 
     public init(
         kind: Kind,
         path: String? = nil,
         bundleIdentifier: String? = nil,
-        nativeWindowID: String? = nil
+        nativeWindowID: String? = nil,
+        interfaceName: String? = nil,
+        function: String? = nil,
+        input: String? = nil
     ) {
         self.kind = kind
         self.path = path
         self.bundleIdentifier = bundleIdentifier
         self.nativeWindowID = nativeWindowID
+        self.interfaceName = interfaceName
+        self.function = function
+        self.input = input
     }
 }
 
@@ -142,7 +173,6 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
 
 public struct TranslationSettings: Equatable, Codable, Sendable {
     public var enabled: Bool
-    public var triggerHotkeyID: String
     public var endpoint: String
     public var apiKey: String
     public var model: String
@@ -154,7 +184,6 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
 
     public init(
         enabled: Bool,
-        triggerHotkeyID: String,
         endpoint: String,
         apiKey: String,
         model: String,
@@ -165,7 +194,6 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         nativeWindow: TranslationWindowSettings
     ) {
         self.enabled = enabled
-        self.triggerHotkeyID = triggerHotkeyID
         self.endpoint = endpoint
         self.apiKey = apiKey
         self.model = model
@@ -204,14 +232,11 @@ public struct TranslationWindowSettings: Equatable, Codable, Sendable {
 
 public extension UserConfiguration {
     static let defaultDirectoryName = "tsmactool"
-    static let defaultFileName = "config.json"
+    static let defaultFileName = "config.jsonc"
 
     static func migratedHammerspoonDefault(apiKey: String = "") -> UserConfiguration {
         UserConfiguration(
-            version: 1,
             application: ApplicationSettings(
-                name: "TSMacTools",
-                configDirectoryName: defaultDirectoryName,
                 terminalBundleIdentifier: "net.kovidgoyal.kitty",
                 finderBundleIdentifier: "com.apple.finder",
                 ignoredWindowApplicationNames: [
@@ -220,22 +245,23 @@ public extension UserConfiguration {
                     "Window Server"
                 ]
             ),
+            scripting: ScriptingSettings(pythonPath: "/usr/bin/python3"),
             hotkeys: [
-                HotkeyBinding(id: "focused-window-info", modifiers: ["ctrl", "cmd"], key: ".", action: HotkeyAction(kind: .showFocusedWindowInfo)),
-                HotkeyBinding(id: "wechat", modifiers: ["alt"], key: "W", action: HotkeyAction(kind: .focusApplication, path: "/Applications/WeChat.app")),
-                HotkeyBinding(id: "discord", modifiers: ["alt"], key: "O", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Discord.app")),
-                HotkeyBinding(id: "lark", modifiers: ["alt"], key: "F", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Lark.app")),
-                HotkeyBinding(id: "chrome", modifiers: ["alt"], key: "C", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Google Chrome.app")),
-                HotkeyBinding(id: "siyuan", modifiers: ["alt"], key: "R", action: HotkeyAction(kind: .focusApplication, path: "/Applications/SiYuan.app")),
-                HotkeyBinding(id: "outlook", modifiers: ["alt"], key: "M", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Microsoft Outlook.app")),
-                HotkeyBinding(id: "qq", modifiers: ["alt"], key: "Q", action: HotkeyAction(kind: .focusApplication, path: "/Applications/QQ.app")),
-                HotkeyBinding(id: "vscode", modifiers: ["alt"], key: "V", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Visual Studio Code.app")),
-                HotkeyBinding(id: "zotero", modifiers: ["alt"], key: "Z", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Zotero.app")),
-                HotkeyBinding(id: "cherry-studio", modifiers: ["alt"], key: "X", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Cherry Studio.app")),
-                HotkeyBinding(id: "translate-selection", modifiers: ["alt"], key: "S", action: HotkeyAction(kind: .translateSelection, nativeWindowID: "translate")),
-                HotkeyBinding(id: "finder-toggle", modifiers: ["alt"], key: "E", action: HotkeyAction(kind: .toggleFinder, bundleIdentifier: "com.apple.finder")),
-                HotkeyBinding(id: "terminal-toggle", modifiers: ["cmd"], key: "D", action: HotkeyAction(kind: .toggleTerminal, bundleIdentifier: "net.kovidgoyal.kitty")),
-                HotkeyBinding(id: "reload", modifiers: ["cmd", "alt", "ctrl"], key: "R", action: HotkeyAction(kind: .reloadConfiguration))
+                HotkeyBinding(modifiers: ["ctrl", "cmd"], key: ".", action: HotkeyAction(kind: .callInterface, interfaceName: "focusedWindowInfo")),
+                HotkeyBinding(modifiers: ["alt"], key: "W", action: HotkeyAction(kind: .focusApplication, path: "/Applications/WeChat.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "O", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Discord.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "F", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Lark.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "C", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Google Chrome.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "R", action: HotkeyAction(kind: .focusApplication, path: "/Applications/SiYuan.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "M", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Microsoft Outlook.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "Q", action: HotkeyAction(kind: .focusApplication, path: "/Applications/QQ.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "V", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Visual Studio Code.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "Z", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Zotero.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "X", action: HotkeyAction(kind: .focusApplication, path: "/Applications/Cherry Studio.app")),
+                HotkeyBinding(modifiers: ["alt"], key: "S", action: HotkeyAction(kind: .runScript, path: "scripts/translate_selection.py", nativeWindowID: "translate", function: "main", input: "selectedText")),
+                HotkeyBinding(modifiers: ["alt"], key: "E", action: HotkeyAction(kind: .toggleFinder, bundleIdentifier: "com.apple.finder")),
+                HotkeyBinding(modifiers: ["cmd"], key: "D", action: HotkeyAction(kind: .toggleTerminal, bundleIdentifier: "net.kovidgoyal.kitty")),
+                HotkeyBinding(modifiers: ["cmd", "alt", "ctrl"], key: "R", action: HotkeyAction(kind: .callInterface, interfaceName: "reloadConfiguration"))
             ],
             windowSwitcher: WindowSwitcherSettings(
                 enabled: true,
@@ -249,7 +275,6 @@ public extension UserConfiguration {
             ),
             translation: TranslationSettings(
                 enabled: true,
-                triggerHotkeyID: "translate-selection",
                 endpoint: "http://127.0.0.1:8787/v1/chat/completions",
                 apiKey: apiKey,
                 model: "llama-3.3-70b-versatile",

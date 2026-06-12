@@ -35,6 +35,19 @@ final class PythonScriptBridgeTests: XCTestCase {
             .closeWindow(id: NativeWindowID("status"))
         )
     }
+
+    func testDecodeUsesLastJSONCommandAfterLogOutput() throws {
+        let bridge = PythonScriptBridge()
+        let data = """
+        debug: script started
+        {"command":"window.close","id":"status"}
+        """.data(using: .utf8)!
+
+        XCTAssertEqual(
+            try bridge.decodeCommand(from: data),
+            .closeWindow(id: NativeWindowID("status"))
+        )
+    }
 }
 
 private struct FakePermissionChecker: SystemPermissionChecking {
