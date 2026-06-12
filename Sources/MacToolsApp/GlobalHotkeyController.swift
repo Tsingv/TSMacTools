@@ -40,6 +40,7 @@ final class GlobalHotkeyController {
 
     private let runtime: AutomationRuntime
     private let configurationStore: UserConfigurationStore
+    private weak var windowSwitcherController: WindowSwitcherController?
     private var configuration: UserConfiguration
     private var eventHandler: EventHandlerRef?
     private var registeredHotkeys: [EventHotKeyRef?] = []
@@ -48,11 +49,13 @@ final class GlobalHotkeyController {
     init(
         runtime: AutomationRuntime,
         configuration: UserConfiguration,
-        configurationStore: UserConfigurationStore = UserConfigurationStore()
+        configurationStore: UserConfigurationStore = UserConfigurationStore(),
+        windowSwitcherController: WindowSwitcherController? = nil
     ) {
         self.runtime = runtime
         self.configuration = configuration
         self.configurationStore = configurationStore
+        self.windowSwitcherController = windowSwitcherController
     }
 
     func start() {
@@ -143,9 +146,9 @@ final class GlobalHotkeyController {
         case .translateSelection:
             translateSelection()
         case .toggleFinder:
-            toggleApplication(bundleIdentifier: binding.action.bundleIdentifier ?? configuration.application.finderBundleIdentifier)
+            toggleFinder(bundleIdentifier: binding.action.bundleIdentifier ?? configuration.application.finderBundleIdentifier)
         case .toggleTerminal:
-            toggleApplication(bundleIdentifier: binding.action.bundleIdentifier ?? configuration.application.terminalBundleIdentifier)
+            toggleTerminal(bundleIdentifier: binding.action.bundleIdentifier ?? configuration.application.terminalBundleIdentifier)
         case .reloadConfiguration:
             reloadConfiguration()
         }
@@ -170,6 +173,42 @@ final class GlobalHotkeyController {
             return
         }
         focusApplication(path: nil, bundleIdentifier: bundleIdentifier)
+    }
+
+    private func toggleTerminal(bundleIdentifier: String) {
+        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleIdentifier {
+            if windowSwitcherController?.focusMostRecentWindow(excluding: bundleIdentifier) != true {
+                showStatusWindow(title: "TSMacTools", body: "没有上一个活跃窗口")
+            }
+            return
+        }
+
+        if windowSwitcherController?.focusMostRecentWindow(matching: bundleIdentifier) == true {
+            return
+        }
+        focusApplication(path: nil, bundleIdentifier: bundleIdentifier)
+    }
+
+    private func toggleFinder(bundleIdentifier: String) {
+        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleIdentifier {
+            sendCommandN()
+            return
+        }
+
+        if windowSwitcherController?.focusMostRecentWindow(matching: bundleIdentifier) == true {
+            return
+        }
+        focusApplication(path: nil, bundleIdentifier: bundleIdentifier)
+    }
+
+    private func sendCommandN() {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_N), keyDown: true)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_N), keyDown: false)
+        keyDown?.flags = .maskCommand
+        keyUp?.flags = .maskCommand
+        keyDown?.post(tap: .cghidEventTap)
+        keyUp?.post(tap: .cghidEventTap)
     }
 
     private func openApplication(at url: URL) {

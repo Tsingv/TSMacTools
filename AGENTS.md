@@ -147,6 +147,7 @@ Current migrated user configuration:
 
 - `~/.config/tsmactool/config.json` stores the Hammerspoon-derived bundle IDs, app focus hotkeys, Finder/terminal toggles, reload binding, window switcher preferences, and LLM translation settings.
 - `Sources/MacToolsApp/GlobalHotkeyController.swift` currently registers configured hotkeys with Carbon `RegisterEventHotKey` and dispatches app focus, app toggle, config reload, focused app info, and selected-text translation actions.
+- `Sources/MacToolsApp/WindowSwitcherController.swift` installs a CGEvent tap when `windowSwitcher.enabled` is true, suppresses `Command+Tab` and `Command+\``, displays a native AppKit overlay, de-duplicates candidates by Accessibility window identity, filters fake windows by CG/AX properties instead of title text, and focuses the selected Accessibility window when Command is released. Focus mirrors Hammerspoon by making the AX window main, bringing the app frontmost via the Carbon process API, and raising the AX window. `windowSwitcher.debug` logs CG/AX attributes and focus retries.
 - `~/.config/tsmactool/scripts/translate_selection.py` is the user-facing translation script. It reads the config, calls a chat-completions-compatible endpoint, and emits a `window.show` command for a native Markdown window instead of using `hs.webview`.
 - The repository copy at `scripts/translate_selection.py` is a template/example and should not contain a real API key.
 

@@ -94,6 +94,7 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
     public var width: Int
     public var height: Int
     public var maxVisibleRows: Int
+    public var debug: Bool
 
     public init(
         enabled: Bool,
@@ -102,7 +103,8 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
         followFocusedScreen: Bool,
         width: Int,
         height: Int,
-        maxVisibleRows: Int
+        maxVisibleRows: Int,
+        debug: Bool = false
     ) {
         self.enabled = enabled
         self.commandTabBehavior = commandTabBehavior
@@ -111,6 +113,30 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
         self.width = width
         self.height = height
         self.maxVisibleRows = maxVisibleRows
+        self.debug = debug
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case commandTabBehavior
+        case sameApplicationBehavior
+        case followFocusedScreen
+        case width
+        case height
+        case maxVisibleRows
+        case debug
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.enabled = try container.decode(Bool.self, forKey: .enabled)
+        self.commandTabBehavior = try container.decode(String.self, forKey: .commandTabBehavior)
+        self.sameApplicationBehavior = try container.decode(String.self, forKey: .sameApplicationBehavior)
+        self.followFocusedScreen = try container.decode(Bool.self, forKey: .followFocusedScreen)
+        self.width = try container.decode(Int.self, forKey: .width)
+        self.height = try container.decode(Int.self, forKey: .height)
+        self.maxVisibleRows = try container.decode(Int.self, forKey: .maxVisibleRows)
+        self.debug = try container.decodeIfPresent(Bool.self, forKey: .debug) ?? false
     }
 }
 
@@ -218,7 +244,8 @@ public extension UserConfiguration {
                 followFocusedScreen: true,
                 width: 760,
                 height: 420,
-                maxVisibleRows: 9
+                maxVisibleRows: 9,
+                debug: false
             ),
             translation: TranslationSettings(
                 enabled: true,

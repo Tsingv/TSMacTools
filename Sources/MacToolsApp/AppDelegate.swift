@@ -57,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var runtime: AutomationRuntime?
     private var configurationBootstrap: UserConfigurationBootstrapResult?
     private var hotkeyController: GlobalHotkeyController?
+    private var windowSwitcherController: WindowSwitcherController?
 
     static func main() {
         if CommandLine.arguments.contains("--check-accessibility") {
@@ -82,7 +83,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             permissionChecker: permissionClient
         )
         if let runtime, let configuration = configurationBootstrap?.configuration {
-            hotkeyController = GlobalHotkeyController(runtime: runtime, configuration: configuration)
+            windowSwitcherController = WindowSwitcherController(runtime: runtime, configuration: configuration)
+            windowSwitcherController?.start()
+            hotkeyController = GlobalHotkeyController(
+                runtime: runtime,
+                configuration: configuration,
+                windowSwitcherController: windowSwitcherController
+            )
             hotkeyController?.start()
         }
 
