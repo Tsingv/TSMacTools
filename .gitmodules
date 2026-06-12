@@ -1,0 +1,3 @@
+[submodule "references/hammerspoon"]
+	path = references/hammerspoon
+	url = https://github.com/Hammerspoon/hammerspoon.git
