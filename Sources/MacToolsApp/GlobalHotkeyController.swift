@@ -247,6 +247,7 @@ final class GlobalHotkeyController {
                 return
             }
 
+            self.showTranslationLoadingWindow()
             self.runTranslationScript(sourceText: sourceText)
         }
     }
@@ -312,6 +313,17 @@ final class GlobalHotkeyController {
                 }
             }
         }
+    }
+
+    private func showTranslationLoadingWindow() {
+        let window = configuration.translation.nativeWindow
+        runtime.handle(.showWindow(
+            id: NativeWindowID(window.id),
+            content: NativeWindowContent(
+                title: window.title,
+                body: .plainText(NativeWindowManager.translationLoadingBody)
+            )
+        ))
     }
 
     private func reloadConfiguration() {

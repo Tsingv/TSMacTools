@@ -53,6 +53,7 @@ Initial target:
 - Explicit Xcode links to `AppKit.framework` and `ApplicationServices.framework`.
 - Xcode uses static library targets for `MacToolsCore` and `MacToolsScripting` so the debug app bundle runs without embedded local framework signing issues.
 - App startup bootstraps the user configuration directory at `~/.config/tsmactool`, creates `config.json` when missing, and leaves existing user configuration untouched.
+- The app runs as a menu bar accessory via `LSUIElement`, does not occupy Dock space, and exposes minimal status-menu actions for permission prompting, opening configuration, and quitting.
 - The app icon lives in `Sources/MacToolsApp/Resources/Assets.xcassets/AppIcon.appiconset`.
 - Later: entitlements, launch-at-login, menu bar UI, settings window, and a stable development signing identity.
 
@@ -84,7 +85,7 @@ Initial permission handling lives in `MacToolsCore.SystemPermissions`:
 
 - `AccessibilityPermissionClient.snapshot()` checks `AXIsProcessTrusted()`.
 - `AccessibilityPermissionClient.requestAccessibilityPrompt()` calls `AXIsProcessTrustedWithOptions` with the system prompt option.
-- App startup shows a native permission window when Accessibility is missing.
+- App startup requests the standard macOS Accessibility prompt when permission is missing and does not show an additional native permissions window.
 - `TSMacTools --check-accessibility` prints the built app's own Accessibility status and exits without opening the UI.
 - Debug builds are configured to match Xcode's local run signing: Automatically manage signing enabled, Team set to None, and Signing Certificate set to `Sign to Run Locally`. Do not override the project with a different command-line signing identity, because changing the signing identity can make macOS TCC ask for Accessibility permission again.
 - Unit tests must inject fake permission checkers and must not require real macOS permissions.
@@ -148,6 +149,7 @@ Current migrated user configuration:
 - `~/.config/tsmactool/config.json` stores the Hammerspoon-derived bundle IDs, app focus hotkeys, Finder/terminal toggles, reload binding, window switcher preferences, and LLM translation settings.
 - `Sources/MacToolsApp/GlobalHotkeyController.swift` currently registers configured hotkeys with Carbon `RegisterEventHotKey` and dispatches app focus, app toggle, config reload, focused app info, and selected-text translation actions.
 - `Sources/MacToolsApp/WindowSwitcherController.swift` installs a CGEvent tap when `windowSwitcher.enabled` is true, suppresses `Command+Tab` and `Command+\``, displays a native AppKit overlay, de-duplicates candidates by Accessibility window identity, filters fake windows by CG/AX properties instead of title text, observes AX lifecycle notifications, removes destroyed windows, moves hidden or minimized windows behind active windows, and focuses the selected Accessibility window when Command is released. Focus mirrors Hammerspoon by making the AX window main, bringing the app frontmost via the Carbon process API, and raising the AX window. `windowSwitcher.debug` logs CG/AX attributes, lifecycle notifications, and focus retries.
+- `Sources/MacToolsApp/AppDelegate.swift` shows translation `window.show` commands as floating native windows that appear immediately with a spinning `Translating...` state while the script is running, use dynamic system colors for light/dark mode, close when focus is lost by default, and include a title-bar pin button so the same window can stay visible and receive later translation updates.
 - `~/.config/tsmactool/scripts/translate_selection.py` is the user-facing translation script. It reads the config, calls a chat-completions-compatible endpoint, and emits a `window.show` command for a native Markdown window instead of using `hs.webview`.
 - The repository copy at `scripts/translate_selection.py` is a template/example and should not contain a real API key.
 
