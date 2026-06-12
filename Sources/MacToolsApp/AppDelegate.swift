@@ -40,9 +40,19 @@ final class NativeWindowManager: WindowManaging {
     }
 }
 
+@main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var runtime: AutomationRuntime?
+
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.regular)
+        app.activate(ignoringOtherApps: true)
+        app.run()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let manager = NativeWindowManager()
@@ -55,13 +65,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         ))
     }
-}
-
-MainActor.assumeIsolated {
-    let app = NSApplication.shared
-    let delegate = AppDelegate()
-    app.delegate = delegate
-    app.setActivationPolicy(.regular)
-    app.activate(ignoringOtherApps: true)
-    app.run()
 }
