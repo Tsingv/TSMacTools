@@ -24,6 +24,12 @@ xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -de
 open DerivedData/Build/Products/Debug/MacTools.app
 ```
 
+Check whether the built app itself has Accessibility permission:
+
+```sh
+DerivedData/Build/Products/Debug/MacTools.app/Contents/MacOS/MacTools --check-accessibility
+```
+
 On first launch, MacTools checks Accessibility permission. If it is missing, macOS will show a prompt and the app will open a native permissions window. Grant access in System Settings > Privacy & Security > Accessibility, then restart the app.
 
 Architecture notes and migration rules live in `AGENTS.md`. The local Hammerspoon reference checkout is in `references/hammerspoon`.

@@ -46,6 +46,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var runtime: AutomationRuntime?
 
     static func main() {
+        if CommandLine.arguments.contains("--check-accessibility") {
+            let status = AccessibilityPermissionClient().snapshot().accessibility
+            print("accessibility=\(status == .granted ? "granted" : "missing")")
+            return
+        }
+
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
