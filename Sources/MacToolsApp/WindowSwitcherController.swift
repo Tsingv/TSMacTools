@@ -46,8 +46,40 @@ private func windowSwitcherEventTapCallback(
     return shouldSuppress ? nil : Unmanaged.passUnretained(event)
 }
 
+private func windowSwitcherAXObserverCallback(
+    observer: AXObserver,
+    element: AXUIElement,
+    notification: CFString,
+    userInfo: UnsafeMutableRawPointer?
+) {
+    guard let userInfo else {
+        return
+    }
+
+    let controller = Unmanaged<WindowSwitcherController>
+        .fromOpaque(userInfo)
+        .takeUnretainedValue()
+    let notificationName = notification as String
+    var processIdentifier: pid_t = 0
+    AXUIElementGetPid(element, &processIdentifier)
+    let elementHash = CFHash(element)
+    DispatchQueue.main.async {
+        controller.handleAXNotification(
+            notificationName,
+            processIdentifier: processIdentifier,
+            elementHash: elementHash
+        )
+    }
+}
+
 @MainActor
 final class WindowSwitcherController {
+    private enum WindowLifecycleState {
+        case active
+        case dormant
+        case destroyed
+    }
+
     private struct WindowChoice {
         var key: String
         var title: String
@@ -56,6 +88,16 @@ final class WindowSwitcherController {
         var processIdentifier: pid_t
         var icon: NSImage?
         var axWindow: AXUIElement
+    }
+
+    private struct AXApplicationObservation {
+        var observer: AXObserver
+        var appElement: AXUIElement
+    }
+
+    private struct AXWindowObservation {
+        var observer: AXObserver
+        var window: AXUIElement
     }
 
     private let runtime: AutomationRuntime
@@ -73,6 +115,8 @@ final class WindowSwitcherController {
     private var overlayWindow: NSWindow?
     private let overlayStack = NSStackView()
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var axApplicationObservers: [pid_t: AXApplicationObservation] = [:]
+    private var axWindowObservers: [String: AXWindowObservation] = [:]
 
     init(runtime: AutomationRuntime, configuration: UserConfiguration) {
         self.runtime = runtime
@@ -129,6 +173,7 @@ final class WindowSwitcherController {
         runLoopSource = nil
         eventTap = nil
         retainedSelf = nil
+        removeAXObservers()
         choices.removeAll()
         recentChoices.removeAll()
         recentKeys.removeAll()
@@ -245,9 +290,12 @@ final class WindowSwitcherController {
     }
 
     private func buildChoices(sameApplication: Bool) -> [WindowChoice] {
+        pruneRecentWindows()
         let frontmostBundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let ignoredNames = Set(configuration.application.ignoredWindowApplicationNames)
+
+        installAXObserversForRunningApplications()
 
         guard let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] else {
@@ -285,7 +333,7 @@ final class WindowSwitcherController {
                 log("skip AX owner=\(ownerName) pid=\(pid) cgTitle=\(cgTitle) reason=no-ax-window attrs=\(debugWindowInfo(info))")
                 return nil
             }
-            guard isRealAXWindow(axWindow) else {
+            guard isSwitchableAXWindow(axWindow) else {
                 log("skip AX owner=\(ownerName) pid=\(pid) cgTitle=\(cgTitle) reason=not-real-ax cg=\(debugWindowInfo(info)) ax=\(debugAXWindow(axWindow))")
                 return nil
             }
@@ -310,7 +358,7 @@ final class WindowSwitcherController {
         }
 
         let byKey = Dictionary(uniqueKeysWithValues: enumerated.map { ($0.key, $0) })
-        let recent = recentKeys.compactMap { key -> WindowChoice? in
+        let recent = recentKeys.compactMap { key -> (WindowChoice, WindowLifecycleState)? in
             guard let choice = byKey[key] ?? recentChoices[key] else {
                 return nil
             }
@@ -319,10 +367,16 @@ final class WindowSwitcherController {
                choice.bundleIdentifier != frontmostBundleIdentifier {
                 return nil
             }
-            return choice
+            let state = lifecycleState(for: choice)
+            guard state != .destroyed else {
+                return nil
+            }
+            return (choice, state)
         }
-        let recentSet = Set(recent.map(\.key))
-        let result = recent + enumerated.filter { !recentSet.contains($0.key) }
+        let recentSet = Set(recent.map { $0.0.key })
+        let activeRecent = recent.filter { $0.1 == .active }.map(\.0)
+        let dormantRecent = recent.filter { $0.1 == .dormant }.map(\.0)
+        let result = activeRecent + enumerated.filter { !recentSet.contains($0.key) } + dormantRecent
         let orderedDescription = result.enumerated()
             .map { "#\($0.offset):\(describe($0.element))" }
             .joined(separator: " | ")
@@ -338,7 +392,7 @@ final class WindowSwitcherController {
             return nil
         }
 
-        let realWindows = windows.filter { isRealAXWindow($0) }
+        let realWindows = windows.filter { isSwitchableAXWindow($0) }
         if !title.isEmpty, let exact = realWindows.first(where: { axTitle(for: $0) == title }) {
             return exact
         }
@@ -365,7 +419,7 @@ final class WindowSwitcherController {
         return true
     }
 
-    private func isRealAXWindow(_ window: AXUIElement) -> Bool {
+    private func isSwitchableAXWindow(_ window: AXUIElement) -> Bool {
         let role = axStringAttribute(kAXRoleAttribute, for: window)
         let subrole = axStringAttribute(kAXSubroleAttribute, for: window)
         guard role == kAXWindowRole as String else {
@@ -375,15 +429,26 @@ final class WindowSwitcherController {
             return false
         }
 
-        if axBoolAttribute(kAXMinimizedAttribute, for: window) == true {
-            return false
-        }
         guard let size = axSize(for: window),
               size.width >= 80,
               size.height >= 60 else {
             return false
         }
         return true
+    }
+
+    private func lifecycleState(for choice: WindowChoice) -> WindowLifecycleState {
+        guard NSRunningApplication(processIdentifier: choice.processIdentifier) != nil,
+              isSwitchableAXWindow(choice.axWindow) else {
+            return .destroyed
+        }
+
+        if NSRunningApplication(processIdentifier: choice.processIdentifier)?.isHidden == true
+            || axBoolAttribute(kAXMinimizedAttribute, for: choice.axWindow) == true {
+            return .dormant
+        }
+
+        return .active
     }
 
     private func axStringAttribute(_ attribute: String, for element: AXUIElement) -> String? {
@@ -705,6 +770,7 @@ final class WindowSwitcherController {
     }
 
     func recordFocusedWindow() {
+        installAXObserversForRunningApplications()
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier != Bundle.main.bundleIdentifier else {
             return
@@ -719,11 +785,11 @@ final class WindowSwitcherController {
 
         let window = value as! AXUIElement
         let rawTitle = axTitle(for: window)
-        guard isRealAXWindow(window) else {
+        guard isSwitchableAXWindow(window) else {
             return
         }
         let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        remember(WindowChoice(
+        let choice = WindowChoice(
             key: windowKey(processIdentifier: app.processIdentifier, axWindow: window),
             title: title.isEmpty ? "\(app.localizedName ?? "Application") Window" : title,
             appName: app.localizedName ?? app.bundleIdentifier ?? "Application",
@@ -731,7 +797,9 @@ final class WindowSwitcherController {
             processIdentifier: app.processIdentifier,
             icon: app.icon,
             axWindow: window
-        ))
+        )
+        remember(choice)
+        installAXObserver(for: choice)
     }
 
     private func remember(_ choice: WindowChoice) {
@@ -763,6 +831,33 @@ final class WindowSwitcherController {
             }
         })
         workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.didHideApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.moveDormantWindowsToEnd()
+            }
+        })
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.didUnhideApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.moveDormantWindowsToEnd()
+            }
+        })
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.installAXObserversForRunningApplications()
+            }
+        })
+        workspaceObservers.append(center.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
             object: nil,
             queue: .main
@@ -786,10 +881,154 @@ final class WindowSwitcherController {
                 return true
             }
             let keep = runningPIDs.contains(choice.processIdentifier)
+                && lifecycleState(for: choice) != .destroyed
             if !keep {
                 recentChoices[key] = nil
+                removeAXObserver(forWindowKey: key)
             }
             return !keep
+        }
+    }
+
+    private func moveDormantWindowsToEnd() {
+        pruneRecentWindows()
+        recentKeys.sort { lhs, rhs in
+            let lhsDormant = recentChoices[lhs].map { lifecycleState(for: $0) == .dormant } ?? true
+            let rhsDormant = recentChoices[rhs].map { lifecycleState(for: $0) == .dormant } ?? true
+            if lhsDormant != rhsDormant {
+                return !lhsDormant && rhsDormant
+            }
+            return false
+        }
+        if overlayWindow?.isVisible == true {
+            choices = buildChoices(sameApplication: sameApplicationMode)
+            selectedIndex = min(selectedIndex, max(choices.count - 1, 0))
+            renderOverlay()
+        }
+    }
+
+    private func installAXObserversForRunningApplications() {
+        let runningApplications = NSWorkspace.shared.runningApplications
+            .filter { $0.bundleIdentifier != Bundle.main.bundleIdentifier }
+        let runningPIDs = Set(runningApplications.map(\.processIdentifier))
+        for pid in runningPIDs where axApplicationObservers[pid] == nil {
+            installAXObserver(processIdentifier: pid)
+        }
+
+        let removedPIDs = axApplicationObservers.keys.filter { !runningPIDs.contains($0) }
+        for pid in removedPIDs {
+            if let observation = axApplicationObservers.removeValue(forKey: pid) {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observation.observer), .commonModes)
+            }
+        }
+    }
+
+    private func installAXObserver(processIdentifier: pid_t) {
+        var observer: AXObserver?
+        let result = AXObserverCreate(processIdentifier, windowSwitcherAXObserverCallback, &observer)
+        guard result == .success, let observer else {
+            log("AX app observer failed pid=\(processIdentifier) result=\(result.rawValue)")
+            return
+        }
+
+        let appElement = AXUIElementCreateApplication(processIdentifier)
+        let notifications = [
+            kAXFocusedWindowChangedNotification,
+            kAXWindowCreatedNotification,
+            kAXApplicationHiddenNotification,
+            kAXApplicationShownNotification
+        ]
+        for notification in notifications {
+            let addResult = AXObserverAddNotification(
+                observer,
+                appElement,
+                notification as CFString,
+                retainedSelf
+            )
+            log("AX app observe pid=\(processIdentifier) notification=\(notification) result=\(addResult.rawValue)")
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        axApplicationObservers[processIdentifier] = AXApplicationObservation(observer: observer, appElement: appElement)
+    }
+
+    private func installAXObserver(for choice: WindowChoice) {
+        guard axWindowObservers[choice.key] == nil else {
+            return
+        }
+
+        var observer: AXObserver?
+        let result = AXObserverCreate(choice.processIdentifier, windowSwitcherAXObserverCallback, &observer)
+        guard result == .success, let observer else {
+            log("AX window observer failed \(describe(choice)) result=\(result.rawValue)")
+            return
+        }
+
+        let notifications = [
+            kAXUIElementDestroyedNotification,
+            kAXWindowMiniaturizedNotification,
+            kAXWindowDeminiaturizedNotification
+        ]
+        for notification in notifications {
+            let addResult = AXObserverAddNotification(
+                observer,
+                choice.axWindow,
+                notification as CFString,
+                retainedSelf
+            )
+            log("AX window observe key=\(choice.key) notification=\(notification) result=\(addResult.rawValue)")
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        axWindowObservers[choice.key] = AXWindowObservation(observer: observer, window: choice.axWindow)
+    }
+
+    private func removeAXObserver(forWindowKey key: String) {
+        guard let observation = axWindowObservers.removeValue(forKey: key) else {
+            return
+        }
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observation.observer), .commonModes)
+    }
+
+    private func removeAXObservers() {
+        for observation in axApplicationObservers.values {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observation.observer), .commonModes)
+        }
+        for observation in axWindowObservers.values {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observation.observer), .commonModes)
+        }
+        axApplicationObservers.removeAll()
+        axWindowObservers.removeAll()
+    }
+
+    func handleAXNotification(_ notification: String, processIdentifier: pid_t, elementHash: CFHashCode) {
+        log("AX notification=\(notification) pid=\(processIdentifier) elementHash=\(elementHash)")
+        switch notification {
+        case kAXUIElementDestroyedNotification:
+            let keys = recentKeys.filter { key in
+                recentChoices[key].map {
+                    $0.processIdentifier == processIdentifier && CFHash($0.axWindow) == elementHash
+                } ?? false
+            }
+            for key in keys {
+                recentChoices[key] = nil
+                recentKeys.removeAll { $0 == key }
+                removeAXObserver(forWindowKey: key)
+            }
+        case kAXWindowMiniaturizedNotification,
+             kAXWindowDeminiaturizedNotification,
+             kAXApplicationHiddenNotification,
+             kAXApplicationShownNotification:
+            moveDormantWindowsToEnd()
+        case kAXWindowCreatedNotification,
+             kAXFocusedWindowChangedNotification:
+            recordFocusedWindow()
+        default:
+            pruneRecentWindows()
+        }
+
+        if overlayWindow?.isVisible == true {
+            choices = buildChoices(sameApplication: sameApplicationMode)
+            selectedIndex = min(selectedIndex, max(choices.count - 1, 0))
+            renderOverlay()
         }
     }
 
@@ -824,11 +1063,18 @@ final class WindowSwitcherController {
         let subrole = axStringAttribute(kAXSubroleAttribute, for: window) ?? "<nil>"
         let title = axTitle(for: window)
         let minimized = axBoolAttribute(kAXMinimizedAttribute, for: window).map(String.init(describing:)) ?? "<nil>"
+        let hidden = NSRunningApplication(processIdentifier: processIdentifier(for: window))?.isHidden.description ?? "<nil>"
         let size = axSize(for: window).map { "\($0.width)x\($0.height)" } ?? "<nil>"
         let position = axPosition(for: window).map { "\($0.x),\($0.y)" } ?? "<nil>"
         let main = axBoolAttribute(kAXMainAttribute, for: window).map(String.init(describing:)) ?? "<nil>"
         let focused = axBoolAttribute(kAXFocusedAttribute, for: window).map(String.init(describing:)) ?? "<nil>"
-        return "role=\(role) subrole=\(subrole) title=\(title) minimized=\(minimized) main=\(main) focused=\(focused) position=\(position) size=\(size)"
+        return "role=\(role) subrole=\(subrole) title=\(title) minimized=\(minimized) hidden=\(hidden) main=\(main) focused=\(focused) position=\(position) size=\(size)"
+    }
+
+    private func processIdentifier(for element: AXUIElement) -> pid_t {
+        var pid: pid_t = 0
+        AXUIElementGetPid(element, &pid)
+        return pid
     }
 
     private func frontmostDescription() -> String {
