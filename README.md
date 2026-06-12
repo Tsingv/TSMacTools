@@ -32,4 +32,8 @@ DerivedData/Build/Products/Debug/MacTools.app/Contents/MacOS/MacTools --check-ac
 
 On first launch, MacTools checks Accessibility permission. If it is missing, macOS will show a prompt and the app will open a native permissions window. Grant access in System Settings > Privacy & Security > Accessibility, then restart the app.
 
+## Development Rule
+
+When code changes, update both `AGENTS.md` and `README.md` in the same commit. This includes changes to architecture, build settings, permissions, scripting commands, tests, and runtime behavior.
+
 Architecture notes and migration rules live in `AGENTS.md`. The local Hammerspoon reference checkout is in `references/hammerspoon`.

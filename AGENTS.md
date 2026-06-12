@@ -167,6 +167,7 @@ Future test layers:
 
 ## Engineering Rules
 
+- Any code, build configuration, permission behavior, scripting protocol, or test workflow change must update both `AGENTS.md` and `README.md` in the same commit. Pure documentation-only edits are the only exception.
 - Keep `references/hammerspoon` read-only.
 - Prefer Swift typed models and protocols over dynamic dictionaries inside the app.
 - Keep Python at the boundary. It can provide powerful processing, but it should talk to the app through explicit commands/events.
