@@ -113,6 +113,8 @@ final class WindowSwitcherController {
     private var commandPressed = false
     private var shiftPressed = false
     private var overlayWindow: NSWindow?
+    private let overlayDisplayDelay: TimeInterval = 0.15
+    private var overlayDisplayWorkItem: DispatchWorkItem?
     private let overlayStack = NSStackView()
     private var workspaceObservers: [NSObjectProtocol] = []
     private var axApplicationObservers: [pid_t: AXApplicationObservation] = [:]
@@ -204,7 +206,7 @@ final class WindowSwitcherController {
         if type == .keyDown, commandPressed, isTab {
             DispatchQueue.main.async {
                 self.log("event keyDown cmd+tab")
-                self.step(sameApplication: false, reverse: false)
+                self.step(sameApplication: false, reverse: shiftPressed)
             }
             return true
         }
@@ -212,7 +214,7 @@ final class WindowSwitcherController {
         if type == .keyDown, commandPressed, isBacktick {
             DispatchQueue.main.async {
                 self.log("event keyDown cmd+`")
-                self.step(sameApplication: true, reverse: false)
+                self.step(sameApplication: true, reverse: shiftPressed)
             }
             return true
         }
@@ -249,7 +251,7 @@ final class WindowSwitcherController {
             return
         }
 
-        renderOverlay()
+        showOrScheduleOverlay()
     }
 
     private func handleFlagsChanged(commandPressed: Bool, shiftPressed: Bool) {
@@ -276,6 +278,7 @@ final class WindowSwitcherController {
     }
 
     private func commitSelectionIfNeeded() {
+        cancelScheduledOverlay()
         guard !choices.isEmpty, choices.indices.contains(selectedIndex) else {
             hideOverlay()
             return
@@ -287,6 +290,35 @@ final class WindowSwitcherController {
         choices.removeAll()
         focus(choice)
         remember(choice)
+    }
+
+    private func showOrScheduleOverlay() {
+        guard !choices.isEmpty else {
+            return
+        }
+        if overlayWindow?.isVisible == true {
+            renderOverlay()
+            return
+        }
+        guard overlayDisplayWorkItem == nil else {
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.commandPressed,
+                  !self.choices.isEmpty else {
+                return
+            }
+            self.renderOverlay()
+        }
+        overlayDisplayWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + overlayDisplayDelay, execute: workItem)
+    }
+
+    private func cancelScheduledOverlay() {
+        overlayDisplayWorkItem?.cancel()
+        overlayDisplayWorkItem = nil
     }
 
     private func buildChoices(sameApplication: Bool) -> [WindowChoice] {
@@ -634,6 +666,7 @@ final class WindowSwitcherController {
     }
 
     private func renderOverlay() {
+        overlayDisplayWorkItem = nil
         let window = overlayWindow ?? makeOverlayWindow()
         overlayStack.arrangedSubviews.forEach { view in
             overlayStack.removeArrangedSubview(view)
@@ -766,6 +799,7 @@ final class WindowSwitcherController {
     }
 
     private func hideOverlay() {
+        cancelScheduledOverlay()
         overlayWindow?.orderOut(nil)
     }
 
@@ -1013,6 +1047,7 @@ final class WindowSwitcherController {
                 recentKeys.removeAll { $0 == key }
                 removeAXObserver(forWindowKey: key)
             }
+            restorePreviousApplicationIfFrontmostHasNoWindows(processIdentifier: processIdentifier)
         case kAXWindowMiniaturizedNotification,
              kAXWindowDeminiaturizedNotification,
              kAXApplicationHiddenNotification,
@@ -1030,6 +1065,27 @@ final class WindowSwitcherController {
             selectedIndex = min(selectedIndex, max(choices.count - 1, 0))
             renderOverlay()
         }
+    }
+
+    private func restorePreviousApplicationIfFrontmostHasNoWindows(processIdentifier: pid_t) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier,
+                  !self.hasSwitchableWindows(processIdentifier: processIdentifier) else {
+                return
+            }
+            self.log("frontmost app pid=\(processIdentifier) has no switchable windows after destroy; restoring previous app")
+            _ = self.focusMostRecentWindow(excluding: NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+        }
+    }
+
+    private func hasSwitchableWindows(processIdentifier: pid_t) -> Bool {
+        let appElement = AXUIElementCreateApplication(processIdentifier)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else {
+            return false
+        }
+        return windows.contains { isSwitchableAXWindow($0) }
     }
 
     private func showStatus(_ message: String) {
