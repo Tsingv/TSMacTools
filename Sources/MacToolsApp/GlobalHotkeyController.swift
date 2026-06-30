@@ -40,6 +40,7 @@ final class GlobalHotkeyController {
 
     private let runtime: AutomationRuntime
     private let configurationStore: UserConfigurationStore
+    private let reloadConfigurationHandler: (() -> Void)?
     private weak var windowSwitcherController: WindowSwitcherController?
     private var configuration: UserConfiguration
     private var eventHandler: EventHandlerRef?
@@ -50,12 +51,14 @@ final class GlobalHotkeyController {
         runtime: AutomationRuntime,
         configuration: UserConfiguration,
         configurationStore: UserConfigurationStore = UserConfigurationStore(),
-        windowSwitcherController: WindowSwitcherController? = nil
+        windowSwitcherController: WindowSwitcherController? = nil,
+        reloadConfigurationHandler: (() -> Void)? = nil
     ) {
         self.runtime = runtime
         self.configuration = configuration
         self.configurationStore = configurationStore
         self.windowSwitcherController = windowSwitcherController
+        self.reloadConfigurationHandler = reloadConfigurationHandler
     }
 
     func start() {
@@ -72,6 +75,9 @@ final class GlobalHotkeyController {
             if let hotkey {
                 UnregisterEventHotKey(hotkey)
             }
+        }
+        for signature in handlers.keys {
+            Self.controllers[signature] = nil
         }
         registeredHotkeys.removeAll()
         handlers.removeAll()
@@ -371,6 +377,11 @@ final class GlobalHotkeyController {
     }
 
     private func reloadConfiguration() {
+        if let reloadConfigurationHandler {
+            reloadConfigurationHandler()
+            return
+        }
+
         do {
             let result = try configurationStore.bootstrap()
             configuration = result.configuration

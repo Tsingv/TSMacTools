@@ -54,7 +54,7 @@ Initial target:
 - Xcode uses static library targets for `MacToolsCore` and `MacToolsScripting` so the debug app bundle runs without embedded local framework signing issues.
 - App startup bootstraps the user configuration directory at `~/.config/tsmactool`, creates `config.jsonc` when missing, and leaves existing user configuration untouched.
 - The repository tracks `example_config/config.jsonc` and `example_config/scripts` as safe templates. Local development uses untracked `my_config`, with `~/.config/tsmactool` symlinked to that folder when needed.
-- The app runs as a menu bar accessory via `LSUIElement`, does not occupy Dock space, automatically requests the standard Accessibility prompt on startup when needed, and exposes minimal status-menu actions for opening configuration and quitting.
+- The app runs as a menu bar accessory via `LSUIElement`, does not occupy Dock space, automatically requests the standard Accessibility prompt on startup when needed, and exposes minimal status-menu actions for reloading configuration, opening configuration, and quitting.
 - The app icon lives in `Sources/MacToolsApp/Resources/Assets.xcassets/AppIcon.appiconset`.
 - Later: entitlements, launch-at-login, menu bar UI, settings window, and a stable development signing identity.
 

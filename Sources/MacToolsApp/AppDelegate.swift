@@ -228,6 +228,7 @@ private final class PinButton: NSButton {
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let configurationStore = UserConfigurationStore()
     private var runtime: AutomationRuntime?
     private var configurationBootstrap: UserConfigurationBootstrapResult?
     private var hotkeyController: GlobalHotkeyController?
@@ -253,20 +254,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let manager = NativeWindowManager()
         let permissionClient = AccessibilityPermissionClient()
-        configurationBootstrap = try? UserConfigurationStore().bootstrap()
+        configurationBootstrap = try? configurationStore.bootstrap()
         runtime = AutomationRuntime(
             windowManager: manager,
             permissionChecker: permissionClient
         )
         if let runtime, let configuration = configurationBootstrap?.configuration {
-            windowSwitcherController = WindowSwitcherController(runtime: runtime, configuration: configuration)
-            windowSwitcherController?.start()
-            hotkeyController = GlobalHotkeyController(
-                runtime: runtime,
-                configuration: configuration,
-                windowSwitcherController: windowSwitcherController
-            )
-            hotkeyController?.start()
+            startAutomation(runtime: runtime, configuration: configuration)
         }
 
         let permissions = runtime?.permissionSnapshot()
@@ -290,6 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "TSMacTools", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Open Configuration Folder", action: #selector(openConfigurationFolder), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
@@ -297,11 +292,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
+    private func startAutomation(runtime: AutomationRuntime, configuration: UserConfiguration) {
+        windowSwitcherController?.stop()
+        hotkeyController?.stop()
+
+        let windowSwitcherController = WindowSwitcherController(runtime: runtime, configuration: configuration)
+        windowSwitcherController.start()
+        self.windowSwitcherController = windowSwitcherController
+
+        hotkeyController = GlobalHotkeyController(
+            runtime: runtime,
+            configuration: configuration,
+            windowSwitcherController: windowSwitcherController,
+            reloadConfigurationHandler: { [weak self] in
+                self?.reloadConfiguration()
+            }
+        )
+        hotkeyController?.start()
+    }
+
     @objc private func openConfigurationFolder() {
         guard let url = configurationBootstrap?.directoryURL else {
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc private func reloadConfiguration() {
+        do {
+            let result = try configurationStore.bootstrap()
+            configurationBootstrap = result
+            if let runtime {
+                startAutomation(runtime: runtime, configuration: result.configuration)
+            }
+            showStatusWindow(title: "TSMacTools", body: "Configuration reloaded from \(result.configURL.path)")
+        } catch {
+            showStatusWindow(title: "Reload Error", body: error.localizedDescription)
+        }
+    }
+
+    private func showStatusWindow(title: String, body: String) {
+        runtime?.handle(.showWindow(
+            id: NativeWindowID("status"),
+            content: NativeWindowContent(title: title, body: .plainText(body))
+        ))
     }
 
     @objc private func quit() {

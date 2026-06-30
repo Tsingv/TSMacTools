@@ -31,7 +31,7 @@ Check whether the built app itself has Accessibility permission:
 DerivedData/Build/Products/Debug/TSMacTools.app/Contents/MacOS/TSMacTools --check-accessibility
 ```
 
-On first launch, TSMacTools creates `~/.config/tsmactool/config.jsonc` and `~/.config/tsmactool/scripts`, then stays in the macOS menu bar without occupying Dock space. The status menu keeps only configuration-folder and quit actions; Accessibility prompting happens automatically at startup when needed. `config.jsonc` is one normal JSON object with `//` and `/* */` comments allowed. The default config omits derived development-only fields such as `version`, hotkey `id`, `application.name`, and `application.configDirectoryName`.
+On first launch, TSMacTools creates `~/.config/tsmactool/config.jsonc` and `~/.config/tsmactool/scripts`, then stays in the macOS menu bar without occupying Dock space. The status menu can reload configuration, open the configuration folder, and quit the app; Accessibility prompting happens automatically at startup when needed. `config.jsonc` is one normal JSON object with `//` and `/* */` comments allowed. The default config omits derived development-only fields such as `version`, hotkey `id`, `application.name`, and `application.configDirectoryName`.
 
 The repository keeps a tracked example at `example_config/config.jsonc` plus `example_config/scripts`. Local development uses untracked `my_config`, and `~/.config/tsmactool` can be a symlink to that folder. Keep real API keys and personal edits in `my_config`; keep `example_config` complete, commented, and safe to commit.
 
