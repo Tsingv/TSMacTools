@@ -13,6 +13,9 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertTrue(result.createdConfig)
         XCTAssertEqual(result.configuration.application.terminalBundleIdentifier, "net.kovidgoyal.kitty")
         XCTAssertEqual(result.configuration.translation.nativeWindow.id, "translate")
+        XCTAssertEqual(result.configuration.translation.model, "qwen/qwen3.6-27b")
+        XCTAssertFalse(result.configuration.translation.thinkingEnabled)
+        XCTAssertEqual(result.configuration.translation.thinkingParameter, "include_reasoning")
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.configURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.scriptsDirectoryURL.path))
         XCTAssertTrue(result.createdTranslationScript)
@@ -23,8 +26,17 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertTrue(configText.contains("// TSMacTools user configuration."))
         XCTAssertTrue(configText.contains(#""hotkeys" : ["#))
         XCTAssertTrue(configText.contains(#""scripting" : {"#))
+        XCTAssertTrue(configText.contains(#""thinkingEnabled" : false"#))
+        XCTAssertTrue(configText.contains(#""thinkingParameter" : "include_reasoning""#))
         XCTAssertFalse(configText.contains(#""version":"#))
         XCTAssertFalse(configText.contains(#""configDirectoryName":"#))
+
+        let scriptText = try String(contentsOf: result.translationScriptURL, encoding: .utf8)
+        XCTAssertTrue(scriptText.contains(#"translation.get("thinkingParameter") == "enable_thinking""#))
+        XCTAssertTrue(scriptText.contains(#"translation.get("thinkingParameter") == "include_reasoning""#))
+        XCTAssertTrue(scriptText.contains(#"body["include_reasoning"]"#))
+        XCTAssertFalse(scriptText.contains(#"/no_think"#))
+        XCTAssertFalse(scriptText.contains(#"strip_thinking_blocks"#))
     }
 
     func testBootstrapReadsExistingConfigurationWithoutOverwriting() throws {
@@ -69,6 +81,18 @@ final class UserConfigurationStoreTests: XCTestCase {
 
         XCTAssertFalse(result.createdConfig)
         XCTAssertFalse(result.configuration.windowSwitcher.enabled)
+    }
+
+    func testDecodeLegacyTranslationConfigurationDefaultsThinkingOff() throws {
+        let store = UserConfigurationStore()
+        let data = try store.encodeConfigurationAsJSONC(.migratedHammerspoonDefault())
+        let legacyText = String(decoding: data, as: UTF8.self)
+            .replacingOccurrences(of: #"    "thinkingEnabled" : false,"# + "\n", with: "")
+
+        let configuration = try store.decodeConfiguration(from: Data(legacyText.utf8))
+
+        XCTAssertFalse(configuration.translation.thinkingEnabled)
+        XCTAssertEqual(configuration.translation.thinkingParameter, "include_reasoning")
     }
 
     func testBootstrapDoesNotOverwriteExistingTranslationScript() throws {

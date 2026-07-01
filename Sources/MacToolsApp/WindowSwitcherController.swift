@@ -119,6 +119,7 @@ final class WindowSwitcherController {
     private var workspaceObservers: [NSObjectProtocol] = []
     private var axApplicationObservers: [pid_t: AXApplicationObservation] = [:]
     private var axWindowObservers: [String: AXWindowObservation] = [:]
+    private let axMessagingTimeout: Float = 0.08
 
     init(runtime: AutomationRuntime, configuration: UserConfiguration) {
         self.runtime = runtime
@@ -227,13 +228,18 @@ final class WindowSwitcherController {
             DispatchQueue.main.async {
                 self.handleFlagsChanged(commandPressed: commandPressed, shiftPressed: shiftPressed)
             }
-            return commandPressed
+            return false
         }
 
         return false
     }
 
     private func step(sameApplication: Bool, reverse: Bool) {
+        let started = CFAbsoluteTimeGetCurrent()
+        defer {
+            log("step total elapsed=\(elapsedMilliseconds(since: started)) sameApplication=\(sameApplication) reverse=\(reverse) choices=\(choices.count)")
+        }
+
         if choices.isEmpty || sameApplicationMode != sameApplication {
             sameApplicationMode = sameApplication
             choices = buildChoices(sameApplication: sameApplication)
@@ -322,6 +328,13 @@ final class WindowSwitcherController {
     }
 
     private func buildChoices(sameApplication: Bool) -> [WindowChoice] {
+        let started = CFAbsoluteTimeGetCurrent()
+        var cgCount = 0
+        var enumeratedCount = 0
+        defer {
+            log("buildChoices elapsed=\(elapsedMilliseconds(since: started)) sameApplication=\(sameApplication) cgWindows=\(cgCount) enumerated=\(enumeratedCount)")
+        }
+
         pruneRecentWindows()
         let frontmostBundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -333,6 +346,7 @@ final class WindowSwitcherController {
             as? [[String: Any]] else {
             return []
         }
+        cgCount = windowInfo.count
 
         var seen = Set<String>()
         let enumerated = windowInfo.compactMap { info -> WindowChoice? in
@@ -388,6 +402,7 @@ final class WindowSwitcherController {
                 axWindow: axWindow
             )
         }
+        enumeratedCount = enumerated.count
 
         let byKey = Dictionary(uniqueKeysWithValues: enumerated.map { ($0.key, $0) })
         let recent = recentKeys.compactMap { key -> (WindowChoice, WindowLifecycleState)? in
@@ -417,22 +432,28 @@ final class WindowSwitcherController {
     }
 
     private func findAXWindow(processIdentifier: pid_t, title: String, bounds: CGRect?) -> AXUIElement? {
-        let app = AXUIElementCreateApplication(processIdentifier)
+        let started = CFAbsoluteTimeGetCurrent()
+        let app = axApplication(processIdentifier: processIdentifier)
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
         guard result == .success, let windows = value as? [AXUIElement] else {
+            logSlowAX("AX windows failed pid=\(processIdentifier) result=\(result.rawValue)", since: started)
             return nil
         }
 
+        windows.forEach(configureAXTimeout)
         let realWindows = windows.filter { isSwitchableAXWindow($0) }
         if !title.isEmpty, let exact = realWindows.first(where: { axTitle(for: $0) == title }) {
+            logSlowAX("findAXWindow exact pid=\(processIdentifier) windows=\(windows.count)", since: started)
             return exact
         }
 
         if let bounds, let matchingBounds = realWindows.first(where: { axBounds(for: $0).map { approximatelyEqual($0, bounds) } == true }) {
+            logSlowAX("findAXWindow bounds pid=\(processIdentifier) windows=\(windows.count)", since: started)
             return matchingBounds
         }
 
+        logSlowAX("findAXWindow fallback pid=\(processIdentifier) windows=\(windows.count)", since: started)
         return realWindows.first
     }
 
@@ -578,7 +599,9 @@ final class WindowSwitcherController {
     }
 
     private func focus(_ choice: WindowChoice) {
-        let appElement = AXUIElementCreateApplication(choice.processIdentifier)
+        let started = CFAbsoluteTimeGetCurrent()
+        let appElement = axApplication(processIdentifier: choice.processIdentifier)
+        configureAXTimeout(choice.axWindow)
         let app = NSRunningApplication(processIdentifier: choice.processIdentifier)
         log("focus begin \(describe(choice)) ax=\(debugAXWindow(choice.axWindow)) frontmostBefore=\(frontmostDescription())")
 
@@ -587,7 +610,7 @@ final class WindowSwitcherController {
         let carbonFrontmost = setFrontProcess(processIdentifier: choice.processIdentifier, allWindows: false)
         let activateResult = app?.activate(options: [.activateIgnoringOtherApps]) ?? false
         let raiseResult = AXUIElementPerformAction(choice.axWindow, kAXRaiseAction as CFString)
-        log("focus hammerspoon-style unhide=\(unhideResult) ax=\(initialAX) setFrontmost=\(carbonFrontmost) activate=\(activateResult) raise=\(raiseResult.rawValue) frontmostNow=\(frontmostDescription())")
+        log("focus hammerspoon-style elapsed=\(elapsedMilliseconds(since: started)) unhide=\(unhideResult) ax=\(initialAX) setFrontmost=\(carbonFrontmost) activate=\(activateResult) raise=\(raiseResult.rawValue) frontmostNow=\(frontmostDescription())")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             let retryAX = self.applyFocus(to: choice.axWindow, appElement: appElement, raise: true)
@@ -804,13 +827,18 @@ final class WindowSwitcherController {
     }
 
     func recordFocusedWindow() {
+        let started = CFAbsoluteTimeGetCurrent()
+        defer {
+            logSlowAX("recordFocusedWindow", since: started)
+        }
+
         installAXObserversForRunningApplications()
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier != Bundle.main.bundleIdentifier else {
             return
         }
 
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        let appElement = axApplication(processIdentifier: app.processIdentifier)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &value) == .success,
               let value else {
@@ -818,6 +846,7 @@ final class WindowSwitcherController {
         }
 
         let window = value as! AXUIElement
+        configureAXTimeout(window)
         let rawTitle = axTitle(for: window)
         guard isSwitchableAXWindow(window) else {
             return
@@ -1079,12 +1108,13 @@ final class WindowSwitcherController {
     }
 
     private func hasSwitchableWindows(processIdentifier: pid_t) -> Bool {
-        let appElement = AXUIElementCreateApplication(processIdentifier)
+        let appElement = axApplication(processIdentifier: processIdentifier)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
               let windows = value as? [AXUIElement] else {
             return false
         }
+        windows.forEach(configureAXTimeout)
         return windows.contains { isSwitchableAXWindow($0) }
     }
 
@@ -1100,6 +1130,28 @@ final class WindowSwitcherController {
             return
         }
         NSLog("[window-switcher] %@", message)
+    }
+
+    private func logSlowAX(_ message: String, since started: CFAbsoluteTime) {
+        let elapsed = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        guard elapsed >= 25 else {
+            return
+        }
+        log("\(message) elapsed=\(String(format: "%.1fms", elapsed))")
+    }
+
+    private func elapsedMilliseconds(since started: CFAbsoluteTime) -> String {
+        String(format: "%.1fms", (CFAbsoluteTimeGetCurrent() - started) * 1000)
+    }
+
+    private func axApplication(processIdentifier: pid_t) -> AXUIElement {
+        let app = AXUIElementCreateApplication(processIdentifier)
+        configureAXTimeout(app)
+        return app
+    }
+
+    private func configureAXTimeout(_ element: AXUIElement) {
+        AXUIElementSetMessagingTimeout(element, axMessagingTimeout)
     }
 
     private func describe(_ choice: WindowChoice) -> String {

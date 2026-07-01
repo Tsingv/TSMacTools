@@ -176,6 +176,8 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
     public var endpoint: String
     public var apiKey: String
     public var model: String
+    public var thinkingEnabled: Bool
+    public var thinkingParameter: String
     public var temperature: Double
     public var promptTemplate: String
     public var systemPrompt: String
@@ -187,6 +189,8 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         endpoint: String,
         apiKey: String,
         model: String,
+        thinkingEnabled: Bool = false,
+        thinkingParameter: String = "include_reasoning",
         temperature: Double,
         promptTemplate: String,
         systemPrompt: String,
@@ -197,11 +201,42 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         self.endpoint = endpoint
         self.apiKey = apiKey
         self.model = model
+        self.thinkingEnabled = thinkingEnabled
+        self.thinkingParameter = thinkingParameter
         self.temperature = temperature
         self.promptTemplate = promptTemplate
         self.systemPrompt = systemPrompt
         self.copyKeystrokeDelay = copyKeystrokeDelay
         self.nativeWindow = nativeWindow
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case endpoint
+        case apiKey
+        case model
+        case thinkingEnabled
+        case thinkingParameter
+        case temperature
+        case promptTemplate
+        case systemPrompt
+        case copyKeystrokeDelay
+        case nativeWindow
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.enabled = try container.decode(Bool.self, forKey: .enabled)
+        self.endpoint = try container.decode(String.self, forKey: .endpoint)
+        self.apiKey = try container.decode(String.self, forKey: .apiKey)
+        self.model = try container.decode(String.self, forKey: .model)
+        self.thinkingEnabled = try container.decodeIfPresent(Bool.self, forKey: .thinkingEnabled) ?? false
+        self.thinkingParameter = try container.decodeIfPresent(String.self, forKey: .thinkingParameter) ?? "include_reasoning"
+        self.temperature = try container.decode(Double.self, forKey: .temperature)
+        self.promptTemplate = try container.decode(String.self, forKey: .promptTemplate)
+        self.systemPrompt = try container.decode(String.self, forKey: .systemPrompt)
+        self.copyKeystrokeDelay = try container.decode(Double.self, forKey: .copyKeystrokeDelay)
+        self.nativeWindow = try container.decode(TranslationWindowSettings.self, forKey: .nativeWindow)
     }
 }
 
@@ -277,7 +312,9 @@ public extension UserConfiguration {
                 enabled: true,
                 endpoint: "http://127.0.0.1:8787/v1/chat/completions",
                 apiKey: apiKey,
-                model: "llama-3.3-70b-versatile",
+                model: "qwen/qwen3.6-27b",
+                thinkingEnabled: false,
+                thinkingParameter: "include_reasoning",
                 temperature: 0.2,
                 promptTemplate: """
                 You are a professional English translator with strong knowledge of computing terms.

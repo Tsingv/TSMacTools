@@ -202,11 +202,18 @@ public final class UserConfigurationStore {
             messages.append({"role": "system", "content": translation["systemPrompt"]})
         messages.append({"role": "user", "content": prompt})
 
-        body = json.dumps({
+        body = {
             "model": translation["model"],
             "temperature": translation["temperature"],
             "messages": messages,
-        }).encode("utf-8")
+        }
+        if translation.get("thinkingParameter") == "enable_thinking":
+            body["enable_thinking"] = bool(translation.get("thinkingEnabled", False))
+        elif translation.get("thinkingParameter") == "include_reasoning":
+            body["include_reasoning"] = bool(translation.get("thinkingEnabled", False))
+        elif translation.get("thinkingParameter") == "reasoning_format":
+            body["reasoning_format"] = "raw" if translation.get("thinkingEnabled", False) else "hidden"
+        body = json.dumps(body).encode("utf-8")
 
         request = urllib.request.Request(
             translation["endpoint"],

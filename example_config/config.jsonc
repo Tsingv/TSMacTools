@@ -196,7 +196,9 @@
     "copyKeystrokeDelay": 0.18, // Delay after Command+C before reading selected text from the pasteboard.
     "enabled": true, // Reserved switch for translation-related features.
     "endpoint": "http://127.0.0.1:8787/v1/chat/completions", // Chat completions endpoint URL.
-    "model": "llama-3.3-70b-versatile", // Model name sent to the endpoint.
+    "model": "qwen/qwen3.6-27b", // Model name sent to the endpoint.
+    "thinkingEnabled": false, // Sends enable_thinking to disable or enable model reasoning when supported.
+    "thinkingParameter": "include_reasoning", // For Groq/CLIProxyAPI, false hides reasoning output; use "enable_thinking" for Qwen-compatible endpoints.
     "nativeWindow": {
       "format": "markdown",
       "height": 620,

@@ -144,6 +144,12 @@ final class GlobalHotkeyController {
     }
 
     private func handle(_ binding: HotkeyBinding) {
+        let started = CFAbsoluteTimeGetCurrent()
+        logHotkey("begin \(binding.label) action=\(binding.action.kind.rawValue)")
+        defer {
+            logHotkey("end \(binding.label) elapsed=\(elapsedMilliseconds(since: started))")
+        }
+
         switch binding.action.kind {
         case .focusApplication:
             focusApplication(path: binding.action.path, bundleIdentifier: binding.action.bundleIdentifier)
@@ -289,6 +295,8 @@ final class GlobalHotkeyController {
     }
 
     private func copySelectionToPasteboard(completion: @escaping @MainActor (String) -> Void) {
+        let started = CFAbsoluteTimeGetCurrent()
+        logHotkey("copySelection begin configuredDelay=\(configuration.translation.copyKeystrokeDelay)s")
         let pasteboard = NSPasteboard.general
         let previous = pasteboard.string(forType: .string)
         pasteboard.clearContents()
@@ -307,6 +315,7 @@ final class GlobalHotkeyController {
                 pasteboard.clearContents()
                 pasteboard.setString(previous, forType: .string)
             }
+            self.logHotkey("copySelection end elapsed=\(self.elapsedMilliseconds(since: started)) bytes=\(copied.utf8.count)")
             completion(copied)
         }
     }
@@ -319,6 +328,8 @@ final class GlobalHotkeyController {
 
         let scriptURL = scriptURL(for: path)
         let functionName = function?.isEmpty == false ? function! : "main"
+        let started = CFAbsoluteTimeGetCurrent()
+        logHotkey("runScript begin path=\(scriptURL.path) function=\(functionName) inputBytes=\(inputText.utf8.count)")
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: configuration.scripting.pythonPath)
@@ -327,12 +338,28 @@ final class GlobalHotkeyController {
 
         let input = Pipe()
         let output = Pipe()
+        let error = Pipe()
+        let outputBuffer = ScriptOutputBuffer()
         process.standardInput = input
         process.standardOutput = output
-        process.standardError = Pipe()
+        process.standardError = error
+
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty {
+                outputBuffer.appendOutput(data)
+            }
+        }
+        error.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty {
+                outputBuffer.appendError(data)
+            }
+        }
 
         do {
             try process.run()
+            logHotkey("runScript process started elapsed=\(elapsedMilliseconds(since: started)) pid=\(process.processIdentifier)")
             let context = ScriptExecutionContext(configuration: configuration, inputText: inputText)
             let payload = try JSONEncoder().encode(context)
             input.fileHandleForWriting.write(payload)
@@ -343,10 +370,21 @@ final class GlobalHotkeyController {
         }
 
         process.terminationHandler = { [weak self] _ in
-            let data = output.fileHandleForReading.readDataToEndOfFile()
+            output.fileHandleForReading.readabilityHandler = nil
+            error.fileHandleForReading.readabilityHandler = nil
+            outputBuffer.appendOutput(output.fileHandleForReading.readDataToEndOfFile())
+            outputBuffer.appendError(error.fileHandleForReading.readDataToEndOfFile())
+            let data = outputBuffer.outputData()
+            let errorText = outputBuffer.errorText()
             Task { @MainActor in
                 guard let self else {
                     return
+                }
+                self.logHotkey(
+                    "runScript terminated elapsed=\(self.elapsedMilliseconds(since: started)) status=\(process.terminationStatus) stdoutBytes=\(data.count) stderrBytes=\(errorText.utf8.count)"
+                )
+                if !errorText.isEmpty {
+                    self.logHotkey("runScript stderr=\(errorText.prefix(1000))")
                 }
                 do {
                     let command = try PythonScriptBridge().decodeCommand(from: data)
@@ -406,10 +444,18 @@ final class GlobalHotkeyController {
     }
 
     private func showStatusWindow(title: String, body: String) {
-        runtime.handle(.showWindow(
-            id: NativeWindowID("status"),
-            content: NativeWindowContent(title: title, body: .plainText(body))
-        ))
+        TransientAlertPresenter.shared.show(title: title, body: body)
+    }
+
+    private func logHotkey(_ message: String) {
+        guard configuration.windowSwitcher.debug else {
+            return
+        }
+        NSLog("[hotkey] %@", message)
+    }
+
+    private func elapsedMilliseconds(since started: CFAbsoluteTime) -> String {
+        String(format: "%.1fms", (CFAbsoluteTimeGetCurrent() - started) * 1000)
     }
 
     private func carbonModifiers(for modifiers: [String]) -> UInt32 {
@@ -466,6 +512,42 @@ final class GlobalHotkeyController {
 private struct ScriptExecutionContext: Encodable {
     var configuration: UserConfiguration
     var inputText: String
+}
+
+private final class ScriptOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var output = Data()
+    private var error = Data()
+
+    func appendOutput(_ data: Data) {
+        guard !data.isEmpty else {
+            return
+        }
+        lock.lock()
+        output.append(data)
+        lock.unlock()
+    }
+
+    func appendError(_ data: Data) {
+        guard !data.isEmpty else {
+            return
+        }
+        lock.lock()
+        error.append(data)
+        lock.unlock()
+    }
+
+    func outputData() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return output
+    }
+
+    func errorText() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(data: error, encoding: .utf8) ?? ""
+    }
 }
 
 private extension GlobalHotkeyController {
