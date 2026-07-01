@@ -147,7 +147,7 @@
     {
       "action": {
         "bundleIdentifier": "com.apple.finder",
-        "kind": "toggleFinder"
+        "kind": "toggleFinder" // From other apps: focus recent Finder. In Finder: raise Home, or create a new Home window when already on Home.
       },
       "key": "E",
       "modifiers": [

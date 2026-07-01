@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Carbon
 import MacToolsCore
 import MacToolsScripting
@@ -207,14 +208,94 @@ final class GlobalHotkeyController {
 
     private func toggleFinder(bundleIdentifier: String) {
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleIdentifier {
-            sendCommandN()
+            focusOrCreateFinderHomeWindow()
             return
         }
 
         if windowSwitcherController?.focusMostRecentWindow(matching: bundleIdentifier) == true {
             return
         }
+
         focusApplication(path: nil, bundleIdentifier: bundleIdentifier)
+    }
+
+    private func focusOrCreateFinderHomeWindow() {
+        guard let finder = NSWorkspace.shared.frontmostApplication else {
+            return
+        }
+
+        let homeURL = normalizedFileURL(FileManager.default.homeDirectoryForCurrentUser)
+        let homePath = normalizedFilePath(homeURL)
+        let appElement = AXUIElementCreateApplication(finder.processIdentifier)
+        AXUIElementSetMessagingTimeout(appElement, 0.2)
+
+        if let focusedWindow = focusedWindow(in: appElement),
+           finderWindowURL(focusedWindow).map(normalizedFilePath) == homePath {
+            sendCommandN()
+            return
+        }
+
+        if let homeWindow = finderWindows(in: appElement).first(where: { finderWindowURL($0).map(normalizedFilePath) == homePath }) {
+            focusFinderWindow(homeWindow, appElement: appElement)
+            return
+        }
+
+        _ = NSWorkspace.shared.open(homeURL)
+    }
+
+    private func focusedWindow(in appElement: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &value) == .success,
+              let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return (value as! AXUIElement)
+    }
+
+    private func finderWindows(in appElement: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else {
+            return []
+        }
+        windows.forEach { AXUIElementSetMessagingTimeout($0, 0.2) }
+        return windows
+    }
+
+    private func finderWindowURL(_ window: AXUIElement) -> URL? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXDocumentAttribute as CFString, &value) == .success,
+              let value else {
+            return nil
+        }
+
+        if let url = value as? URL {
+            return url
+        }
+
+        guard let string = value as? String, !string.isEmpty else {
+            return nil
+        }
+        if let url = URL(string: string), url.isFileURL {
+            return url
+        }
+        return URL(fileURLWithPath: string)
+    }
+
+    private func normalizedFileURL(_ url: URL) -> URL {
+        url.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    private func normalizedFilePath(_ url: URL) -> String {
+        normalizedFileURL(url).path
+    }
+
+    private func focusFinderWindow(_ window: AXUIElement, appElement: AXUIElement) {
+        _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
+        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
     }
 
     private func sendCommandN() {

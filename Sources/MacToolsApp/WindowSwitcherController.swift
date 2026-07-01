@@ -1,7 +1,6 @@
 import AppKit
 import ApplicationServices
 import Carbon
-import Darwin
 import MacToolsCore
 
 private func windowSwitcherEventTapCallback(
@@ -90,6 +89,14 @@ final class WindowSwitcherController {
         var axWindow: AXUIElement
     }
 
+    private struct PendingFocusVerification {
+        var key: String
+        var title: String
+        var processIdentifier: pid_t
+        var window: AXUIElement
+        var startedAt: CFAbsoluteTime
+    }
+
     private struct AXApplicationObservation {
         var observer: AXObserver
         var appElement: AXUIElement
@@ -119,6 +126,7 @@ final class WindowSwitcherController {
     private var workspaceObservers: [NSObjectProtocol] = []
     private var axApplicationObservers: [pid_t: AXApplicationObservation] = [:]
     private var axWindowObservers: [String: AXWindowObservation] = [:]
+    private var pendingFocusVerification: PendingFocusVerification?
     private let axMessagingTimeout: Float = 0.08
 
     init(runtime: AutomationRuntime, configuration: UserConfiguration) {
@@ -177,6 +185,7 @@ final class WindowSwitcherController {
         eventTap = nil
         retainedSelf = nil
         removeAXObservers()
+        pendingFocusVerification = nil
         choices.removeAll()
         recentChoices.removeAll()
         recentKeys.removeAll()
@@ -602,63 +611,54 @@ final class WindowSwitcherController {
         let started = CFAbsoluteTimeGetCurrent()
         let appElement = axApplication(processIdentifier: choice.processIdentifier)
         configureAXTimeout(choice.axWindow)
-        let app = NSRunningApplication(processIdentifier: choice.processIdentifier)
         log("focus begin \(describe(choice)) ax=\(debugAXWindow(choice.axWindow)) frontmostBefore=\(frontmostDescription())")
 
-        let unhideResult = app?.unhide() ?? false
-        let initialAX = applyFocus(to: choice.axWindow, appElement: appElement, raise: false)
-        let carbonFrontmost = setFrontProcess(processIdentifier: choice.processIdentifier, allWindows: false)
-        let activateResult = app?.activate(options: [.activateIgnoringOtherApps]) ?? false
-        let raiseResult = AXUIElementPerformAction(choice.axWindow, kAXRaiseAction as CFString)
-        log("focus hammerspoon-style elapsed=\(elapsedMilliseconds(since: started)) unhide=\(unhideResult) ax=\(initialAX) setFrontmost=\(carbonFrontmost) activate=\(activateResult) raise=\(raiseResult.rawValue) frontmostNow=\(frontmostDescription())")
+        expectFocusedWindowChange(to: choice)
+        let unminimizeResult = AXUIElementSetAttributeValue(choice.axWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        let initialAX = applyFocus(to: choice.axWindow, appElement: appElement, raise: true)
+        log("focus ax-only elapsed=\(elapsedMilliseconds(since: started)) unminimize=\(unminimizeResult.rawValue) ax=\(initialAX) focusedAX=\(focusedAXDescription(processIdentifier: choice.processIdentifier)) frontmostNow=\(frontmostDescription())")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             let retryAX = self.applyFocus(to: choice.axWindow, appElement: appElement, raise: true)
-            let frontmostRetry = self.setFrontProcess(processIdentifier: choice.processIdentifier, allWindows: false)
-            self.log("focus retry1 setFrontmost=\(frontmostRetry) ax=\(retryAX) frontmostAfter=\(self.frontmostDescription()) focusedAX=\(self.focusedAXDescription(processIdentifier: choice.processIdentifier))")
+            self.verifyFocusedWindowChangeIfNeeded(processIdentifier: choice.processIdentifier, source: "retry1")
+            self.log("focus retry1 ax=\(retryAX) frontmostAfter=\(self.frontmostDescription()) focusedAX=\(self.focusedAXDescription(processIdentifier: choice.processIdentifier))")
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier != choice.processIdentifier else {
-                self.recordFocusedWindow()
-                return
-            }
-            let frontmostRetry = self.setFrontProcess(processIdentifier: choice.processIdentifier, allWindows: false)
-            let activateRetry = app?.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) ?? false
             let retryAX = self.applyFocus(to: choice.axWindow, appElement: appElement, raise: true)
-            self.log("focus retry2 setFrontmost=\(frontmostRetry) activate=\(activateRetry) ax=\(retryAX) frontmostAfter=\(self.frontmostDescription()) focusedAX=\(self.focusedAXDescription(processIdentifier: choice.processIdentifier))")
+            self.verifyFocusedWindowChangeIfNeeded(processIdentifier: choice.processIdentifier, source: "retry2")
+            self.log("focus retry2 ax=\(retryAX) frontmostAfter=\(self.frontmostDescription()) focusedAX=\(self.focusedAXDescription(processIdentifier: choice.processIdentifier))")
             self.recordFocusedWindow()
+        }
+
+        if choice.bundleIdentifier == "com.apple.finder" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                let retryAX = self.applyFocus(to: choice.axWindow, appElement: appElement, raise: true)
+                self.verifyFocusedWindowChangeIfNeeded(processIdentifier: choice.processIdentifier, source: "finder-workaround")
+                self.log("focus finder-workaround ax=\(retryAX) frontmostAfter=\(self.frontmostDescription()) focusedAX=\(self.focusedAXDescription(processIdentifier: choice.processIdentifier))")
+            }
         }
     }
 
     private func applyFocus(to window: AXUIElement, appElement: AXUIElement, raise: Bool) -> String {
+        let systemWideElement = AXUIElementCreateSystemWide()
+        configureAXTimeout(systemWideElement)
+        let systemFocusResult = AXUIElementSetAttributeValue(
+            systemWideElement,
+            kAXFocusedApplicationAttribute as CFString,
+            appElement
+        )
+        let appFrontmostResult = AXUIElementSetAttributeValue(
+            appElement,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
         let raiseBefore = raise ? AXUIElementPerformAction(window, kAXRaiseAction as CFString) : .success
         let mainResult = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
         let windowFocusResult = AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
         let appFocusResult = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
         let raiseAfter = raise ? AXUIElementPerformAction(window, kAXRaiseAction as CFString) : .success
-        return "raiseBefore=\(raiseBefore.rawValue) main=\(mainResult.rawValue) windowFocused=\(windowFocusResult.rawValue) appFocused=\(appFocusResult.rawValue) raiseAfter=\(raiseAfter.rawValue)"
-    }
-
-    private func setFrontProcess(processIdentifier: pid_t, allWindows: Bool) -> String {
-        typealias GetProcessForPIDFunction = @convention(c) (pid_t, UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
-        typealias SetFrontProcessWithOptionsFunction = @convention(c) (UnsafePointer<ProcessSerialNumber>, OptionBits) -> OSStatus
-
-        guard let getProcessSymbol = dlsym(dlopen(nil, RTLD_NOW), "GetProcessForPID"),
-              let setFrontSymbol = dlsym(dlopen(nil, RTLD_NOW), "SetFrontProcessWithOptions") else {
-            return "carbonSymbols=missing"
-        }
-
-        let getProcessForPID = unsafeBitCast(getProcessSymbol, to: GetProcessForPIDFunction.self)
-        let setFrontProcessWithOptions = unsafeBitCast(setFrontSymbol, to: SetFrontProcessWithOptionsFunction.self)
-        var processSerialNumber = ProcessSerialNumber()
-        let getStatus = getProcessForPID(processIdentifier, &processSerialNumber)
-        guard getStatus == noErr else {
-            return "getProcess=\(getStatus)"
-        }
-        let options: OptionBits = allWindows ? 0 : OptionBits(kSetFrontProcessFrontWindowOnly)
-        let frontStatus = setFrontProcessWithOptions(&processSerialNumber, options)
-        return "getProcess=\(getStatus) setFront=\(frontStatus)"
+        return "systemFocusedApplication=\(systemFocusResult.rawValue) appFrontmost=\(appFrontmostResult.rawValue) raiseBefore=\(raiseBefore.rawValue) main=\(mainResult.rawValue) windowFocused=\(windowFocusResult.rawValue) appFocusedWindow=\(appFocusResult.rawValue) raiseAfter=\(raiseAfter.rawValue)"
     }
 
     @discardableResult
@@ -1084,6 +1084,9 @@ final class WindowSwitcherController {
             moveDormantWindowsToEnd()
         case kAXWindowCreatedNotification,
              kAXFocusedWindowChangedNotification:
+            if notification == kAXFocusedWindowChangedNotification {
+                verifyFocusedWindowChangeIfNeeded(processIdentifier: processIdentifier, source: "notification")
+            }
             recordFocusedWindow()
         default:
             pruneRecentWindows()
@@ -1116,6 +1119,52 @@ final class WindowSwitcherController {
         }
         windows.forEach(configureAXTimeout)
         return windows.contains { isSwitchableAXWindow($0) }
+    }
+
+    private func expectFocusedWindowChange(to choice: WindowChoice) {
+        if axApplicationObservers[choice.processIdentifier] == nil {
+            installAXObserver(processIdentifier: choice.processIdentifier)
+        }
+        pendingFocusVerification = PendingFocusVerification(
+            key: choice.key,
+            title: choice.title,
+            processIdentifier: choice.processIdentifier,
+            window: choice.axWindow,
+            startedAt: CFAbsoluteTimeGetCurrent()
+        )
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self,
+                  let pending = self.pendingFocusVerification,
+                  pending.key == choice.key else {
+                return
+            }
+            self.verifyFocusedWindowChangeIfNeeded(
+                processIdentifier: pending.processIdentifier,
+                source: "timeout"
+            )
+        }
+    }
+
+    private func verifyFocusedWindowChangeIfNeeded(processIdentifier: pid_t, source: String) {
+        guard let pending = pendingFocusVerification,
+              pending.processIdentifier == processIdentifier else {
+            return
+        }
+
+        guard let focusedWindow = focusedAXWindow(processIdentifier: processIdentifier) else {
+            log("focus verify source=\(source) key=\(pending.key) title=\(pending.title) elapsed=\(elapsedMilliseconds(since: pending.startedAt)) result=no-focused-window")
+            if source == "timeout" {
+                pendingFocusVerification = nil
+            }
+            return
+        }
+
+        let matches = CFEqual(focusedWindow, pending.window)
+        log("focus verify source=\(source) key=\(pending.key) title=\(pending.title) elapsed=\(elapsedMilliseconds(since: pending.startedAt)) matches=\(matches) focused=\(debugAXWindow(focusedWindow))")
+        if matches || source == "timeout" {
+            pendingFocusVerification = nil
+        }
     }
 
     private func showStatus(_ message: String) {
@@ -1190,13 +1239,22 @@ final class WindowSwitcherController {
         return "name=\(app?.localizedName ?? "<nil>") bundle=\(app?.bundleIdentifier ?? "<nil>") pid=\(app?.processIdentifier.description ?? "<nil>")"
     }
 
-    private func focusedAXDescription(processIdentifier: pid_t) -> String {
-        let appElement = AXUIElementCreateApplication(processIdentifier)
+    private func focusedAXWindow(processIdentifier: pid_t) -> AXUIElement? {
+        let appElement = axApplication(processIdentifier: processIdentifier)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &value) == .success,
               let value else {
+            return nil
+        }
+        let window = value as! AXUIElement
+        configureAXTimeout(window)
+        return window
+    }
+
+    private func focusedAXDescription(processIdentifier: pid_t) -> String {
+        guard let window = focusedAXWindow(processIdentifier: processIdentifier) else {
             return "<none>"
         }
-        return debugAXWindow(value as! AXUIElement)
+        return debugAXWindow(window)
     }
 }
