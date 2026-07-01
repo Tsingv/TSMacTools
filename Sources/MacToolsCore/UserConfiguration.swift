@@ -178,6 +178,8 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
     public var model: String
     public var thinkingEnabled: Bool
     public var thinkingParameter: String
+    public var contextWindowTokens: Int
+    public var outputTokenLimit: Int
     public var temperature: Double
     public var promptTemplate: String
     public var systemPrompt: String
@@ -191,6 +193,8 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         model: String,
         thinkingEnabled: Bool = false,
         thinkingParameter: String = "include_reasoning",
+        contextWindowTokens: Int = 262144,
+        outputTokenLimit: Int = 65536,
         temperature: Double,
         promptTemplate: String,
         systemPrompt: String,
@@ -203,6 +207,8 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         self.model = model
         self.thinkingEnabled = thinkingEnabled
         self.thinkingParameter = thinkingParameter
+        self.contextWindowTokens = contextWindowTokens
+        self.outputTokenLimit = outputTokenLimit
         self.temperature = temperature
         self.promptTemplate = promptTemplate
         self.systemPrompt = systemPrompt
@@ -217,6 +223,8 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         case model
         case thinkingEnabled
         case thinkingParameter
+        case contextWindowTokens
+        case outputTokenLimit
         case temperature
         case promptTemplate
         case systemPrompt
@@ -232,6 +240,8 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         self.model = try container.decode(String.self, forKey: .model)
         self.thinkingEnabled = try container.decodeIfPresent(Bool.self, forKey: .thinkingEnabled) ?? false
         self.thinkingParameter = try container.decodeIfPresent(String.self, forKey: .thinkingParameter) ?? "include_reasoning"
+        self.contextWindowTokens = try container.decodeIfPresent(Int.self, forKey: .contextWindowTokens) ?? 262144
+        self.outputTokenLimit = try container.decodeIfPresent(Int.self, forKey: .outputTokenLimit) ?? 65536
         self.temperature = try container.decode(Double.self, forKey: .temperature)
         self.promptTemplate = try container.decode(String.self, forKey: .promptTemplate)
         self.systemPrompt = try container.decode(String.self, forKey: .systemPrompt)
@@ -315,6 +325,8 @@ public extension UserConfiguration {
                 model: "qwen/qwen3.6-27b",
                 thinkingEnabled: false,
                 thinkingParameter: "include_reasoning",
+                contextWindowTokens: 262144,
+                outputTokenLimit: 65536,
                 temperature: 0.2,
                 promptTemplate: """
                 You are a professional English translator with strong knowledge of computing terms.

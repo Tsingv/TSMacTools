@@ -197,6 +197,8 @@
     "enabled": true, // Reserved switch for translation-related features.
     "endpoint": "http://127.0.0.1:8787/v1/chat/completions", // Chat completions endpoint URL.
     "model": "qwen/qwen3.6-27b", // Model name sent to the endpoint.
+    "contextWindowTokens": 262144, // Model context window. Used for a preflight selected-text budget warning.
+    "outputTokenLimit": 65536, // Output budget sent as max_completion_tokens.
     "thinkingEnabled": false, // Sends enable_thinking to disable or enable model reasoning when supported.
     "thinkingParameter": "include_reasoning", // For Groq/CLIProxyAPI, false hides reasoning output; use "enable_thinking" for Qwen-compatible endpoints.
     "nativeWindow": {

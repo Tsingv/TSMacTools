@@ -16,6 +16,8 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(result.configuration.translation.model, "qwen/qwen3.6-27b")
         XCTAssertFalse(result.configuration.translation.thinkingEnabled)
         XCTAssertEqual(result.configuration.translation.thinkingParameter, "include_reasoning")
+        XCTAssertEqual(result.configuration.translation.contextWindowTokens, 262144)
+        XCTAssertEqual(result.configuration.translation.outputTokenLimit, 65536)
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.configURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.scriptsDirectoryURL.path))
         XCTAssertTrue(result.createdTranslationScript)
@@ -28,6 +30,8 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertTrue(configText.contains(#""scripting" : {"#))
         XCTAssertTrue(configText.contains(#""thinkingEnabled" : false"#))
         XCTAssertTrue(configText.contains(#""thinkingParameter" : "include_reasoning""#))
+        XCTAssertTrue(configText.contains(#""contextWindowTokens" : 262144"#))
+        XCTAssertTrue(configText.contains(#""outputTokenLimit" : 65536"#))
         XCTAssertFalse(configText.contains(#""version":"#))
         XCTAssertFalse(configText.contains(#""configDirectoryName":"#))
 
@@ -35,6 +39,13 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertTrue(scriptText.contains(#"translation.get("thinkingParameter") == "enable_thinking""#))
         XCTAssertTrue(scriptText.contains(#"translation.get("thinkingParameter") == "include_reasoning""#))
         XCTAssertTrue(scriptText.contains(#"body["include_reasoning"]"#))
+        XCTAssertTrue(scriptText.contains(#"def collect_text(value):"#))
+        XCTAssertTrue(scriptText.contains(#"def validate_token_budget(translation, messages, output_token_limit):"#))
+        XCTAssertTrue(scriptText.contains(#"def format_http_error(error):"#))
+        XCTAssertTrue(scriptText.contains(#"max_completion_tokens"#))
+        XCTAssertTrue(scriptText.contains(#"def log_response_summary(response):"#))
+        XCTAssertTrue(scriptText.contains(#"response.get("output_text")"#))
+        XCTAssertTrue(scriptText.contains(#"The provider returned reasoning data but no final translation text."#))
         XCTAssertFalse(scriptText.contains(#"/no_think"#))
         XCTAssertFalse(scriptText.contains(#"strip_thinking_blocks"#))
     }
@@ -93,6 +104,8 @@ final class UserConfigurationStoreTests: XCTestCase {
 
         XCTAssertFalse(configuration.translation.thinkingEnabled)
         XCTAssertEqual(configuration.translation.thinkingParameter, "include_reasoning")
+        XCTAssertEqual(configuration.translation.contextWindowTokens, 262144)
+        XCTAssertEqual(configuration.translation.outputTokenLimit, 65536)
     }
 
     func testBootstrapDoesNotOverwriteExistingTranslationScript() throws {
