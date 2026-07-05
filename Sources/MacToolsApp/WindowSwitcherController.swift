@@ -107,6 +107,12 @@ final class WindowSwitcherController {
         var window: AXUIElement
     }
 
+    private struct FrontmostApplicationIdentity {
+        var bundleIdentifier: String?
+        var processIdentifier: pid_t
+        var localizedName: String?
+    }
+
     private let runtime: AutomationRuntime
     private var configuration: UserConfiguration
     private var eventTap: CFMachPort?
@@ -663,7 +669,17 @@ final class WindowSwitcherController {
 
     @discardableResult
     func focusMostRecentWindow(excluding excludedBundleIdentifier: String? = nil) -> Bool {
-        recordFocusedWindow()
+        focusMostRecentWindow(excluding: excludedBundleIdentifier, recordCurrentFocus: true)
+    }
+
+    @discardableResult
+    private func focusMostRecentWindow(
+        excluding excludedBundleIdentifier: String? = nil,
+        recordCurrentFocus: Bool
+    ) -> Bool {
+        if recordCurrentFocus {
+            recordFocusedWindow()
+        }
         guard let candidate = recentKeys.lazy.compactMap({ self.recentChoices[$0] }).first(where: { choice in
             if let excludedBundleIdentifier, choice.bundleIdentifier == excludedBundleIdentifier {
                 return false
@@ -1076,7 +1092,10 @@ final class WindowSwitcherController {
                 recentKeys.removeAll { $0 == key }
                 removeAXObserver(forWindowKey: key)
             }
-            restorePreviousApplicationIfFrontmostHasNoWindows(processIdentifier: processIdentifier)
+            restorePreviousApplicationIfFrontmostHasNoWindows(
+                processIdentifier: processIdentifier,
+                destroyedElementHash: elementHash
+            )
         case kAXWindowMiniaturizedNotification,
              kAXWindowDeminiaturizedNotification,
              kAXApplicationHiddenNotification,
@@ -1099,14 +1118,44 @@ final class WindowSwitcherController {
         }
     }
 
-    private func restorePreviousApplicationIfFrontmostHasNoWindows(processIdentifier: pid_t) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier,
-                  !self.hasSwitchableWindows(processIdentifier: processIdentifier) else {
+    private func restorePreviousApplicationIfFrontmostHasNoWindows(
+        processIdentifier: pid_t,
+        destroyedElementHash: CFHashCode
+    ) {
+        guard let expectedFrontmost = frontmostApplicationIdentity(),
+              expectedFrontmost.processIdentifier == processIdentifier else {
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            guard let self else {
                 return
             }
-            self.log("frontmost app pid=\(processIdentifier) has no switchable windows after destroy; restoring previous app")
-            _ = self.focusMostRecentWindow(excluding: NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+            guard self.frontmostApplicationMatches(expectedFrontmost) else {
+                self.log("skip restore previous app; frontmost changed from \(self.describe(expectedFrontmost)) to \(self.frontmostDescription())")
+                return
+            }
+            if self.hasFocusedSwitchableWindowAfterDestroy(
+                processIdentifier: processIdentifier,
+                destroyedElementHash: destroyedElementHash
+            ) {
+                return
+            }
+            guard !self.hasSwitchableWindows(processIdentifier: processIdentifier) else {
+                return
+            }
+            guard self.frontmostApplicationMatches(expectedFrontmost) else {
+                self.log("skip restore previous app after window check; frontmost changed from \(self.describe(expectedFrontmost)) to \(self.frontmostDescription())")
+                return
+            }
+            if self.hasFocusedSwitchableWindowAfterDestroy(
+                processIdentifier: processIdentifier,
+                destroyedElementHash: destroyedElementHash
+            ) {
+                return
+            }
+            self.log("frontmost app \(self.describe(expectedFrontmost)) has no switchable windows after destroy; restoring previous app")
+            _ = self.focusMostRecentWindow(excluding: expectedFrontmost.bundleIdentifier, recordCurrentFocus: false)
         }
     }
 
@@ -1119,6 +1168,23 @@ final class WindowSwitcherController {
         }
         windows.forEach(configureAXTimeout)
         return windows.contains { isSwitchableAXWindow($0) }
+    }
+
+    private func hasFocusedSwitchableWindowAfterDestroy(
+        processIdentifier: pid_t,
+        destroyedElementHash: CFHashCode
+    ) -> Bool {
+        guard let focusedWindow = focusedAXWindow(processIdentifier: processIdentifier),
+              isSwitchableAXWindow(focusedWindow) else {
+            return false
+        }
+        let focusedHash = CFHash(focusedWindow)
+        guard focusedHash != destroyedElementHash else {
+            return false
+        }
+        log("skip restore previous app; focused window changed after destroy pid=\(processIdentifier) destroyedHash=\(destroyedElementHash) focusedHash=\(focusedHash) focused=\(debugAXWindow(focusedWindow))")
+        recordFocusedWindow()
+        return true
     }
 
     private func expectFocusedWindowChange(to choice: WindowChoice) {
@@ -1237,6 +1303,29 @@ final class WindowSwitcherController {
     private func frontmostDescription() -> String {
         let app = NSWorkspace.shared.frontmostApplication
         return "name=\(app?.localizedName ?? "<nil>") bundle=\(app?.bundleIdentifier ?? "<nil>") pid=\(app?.processIdentifier.description ?? "<nil>")"
+    }
+
+    private func frontmostApplicationIdentity() -> FrontmostApplicationIdentity? {
+        guard let app = NSWorkspace.shared.frontmostApplication else {
+            return nil
+        }
+        return FrontmostApplicationIdentity(
+            bundleIdentifier: app.bundleIdentifier,
+            processIdentifier: app.processIdentifier,
+            localizedName: app.localizedName
+        )
+    }
+
+    private func frontmostApplicationMatches(_ identity: FrontmostApplicationIdentity) -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication else {
+            return false
+        }
+        return app.processIdentifier == identity.processIdentifier
+            && app.bundleIdentifier == identity.bundleIdentifier
+    }
+
+    private func describe(_ identity: FrontmostApplicationIdentity) -> String {
+        "name=\(identity.localizedName ?? "<nil>") bundle=\(identity.bundleIdentifier ?? "<nil>") pid=\(identity.processIdentifier)"
     }
 
     private func focusedAXWindow(processIdentifier: pid_t) -> AXUIElement? {
