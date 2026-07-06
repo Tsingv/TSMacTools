@@ -190,15 +190,22 @@
     "width": 760
   },
 
-  // LLM translation settings consumed by scripts/translate_selection.py.
+  // Translation settings consumed by scripts/translate_selection.py.
   "translation": {
-    "apiKey": "", // API key for the chat-completions-compatible endpoint. Leave blank in examples.
+    "provider": "google_web", // "google_web" uses the unofficial web endpoint; "google" uses Cloud Translation; "llm" uses the chat-completions endpoint below.
+    "apiKey": "", // API key for the chat-completions-compatible LLM endpoint. Leave blank in examples.
     "copyKeystrokeDelay": 0.18, // Delay after Command+C before reading selected text from the pasteboard.
     "enabled": true, // Reserved switch for translation-related features.
+    "googleApiKey": "", // Google Cloud Translation API key. Leave blank in examples.
+    "googleSourceLanguage": "auto", // "auto" lets Google detect the source language.
+    "googleTargetLanguage": "zh-CN", // Target used for non-Chinese selected text.
+    "googleTargetLanguageForChinese": "en", // Target used when selected text contains Chinese.
     "endpoint": "http://127.0.0.1:8787/v1/chat/completions", // Chat completions endpoint URL.
     "model": "qwen/qwen3.6-27b", // Model name sent to the endpoint.
+    "normalizePDFLineBreaks": true, // Joins common PDF hard-wrapped lines before translation while preserving blank paragraphs and lists.
     "contextWindowTokens": 262144, // Model context window. Used for a preflight selected-text budget warning.
-    "outputTokenLimit": 65536, // Output budget sent as max_completion_tokens.
+    "outputTokenLimit": 2048, // Desired output budget sent as max_completion_tokens after request-limit clamping.
+    "requestTokenLimit": 8000, // Service-tier request budget for prompt plus max_completion_tokens. Set 0 to disable.
     "thinkingEnabled": false, // Sends enable_thinking to disable or enable model reasoning when supported.
     "thinkingParameter": "include_reasoning", // For Groq/CLIProxyAPI, false hides reasoning output; use "enable_thinking" for Qwen-compatible endpoints.
     "nativeWindow": {

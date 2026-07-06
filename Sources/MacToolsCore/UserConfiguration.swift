@@ -173,80 +173,163 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
 
 public struct TranslationSettings: Equatable, Codable, Sendable {
     public var enabled: Bool
+    public var provider: String
     public var endpoint: String
     public var apiKey: String
+    public var googleEndpoint: String
+    public var googleApiKey: String
+    public var googleSourceLanguage: String
+    public var googleTargetLanguage: String
+    public var googleTargetLanguageForChinese: String
+    public var googleWebEndpoint: String
+    public var googleWebClient: String
     public var model: String
     public var thinkingEnabled: Bool
     public var thinkingParameter: String
     public var contextWindowTokens: Int
     public var outputTokenLimit: Int
+    public var requestTokenLimit: Int
     public var temperature: Double
     public var promptTemplate: String
     public var systemPrompt: String
     public var copyKeystrokeDelay: Double
+    public var normalizePDFLineBreaks: Bool
     public var nativeWindow: TranslationWindowSettings
 
     public init(
         enabled: Bool,
+        provider: String = "llm",
         endpoint: String,
         apiKey: String,
+        googleEndpoint: String = "https://translation.googleapis.com/language/translate/v2",
+        googleApiKey: String = "",
+        googleSourceLanguage: String = "auto",
+        googleTargetLanguage: String = "zh-CN",
+        googleTargetLanguageForChinese: String = "en",
+        googleWebEndpoint: String = "https://translate.googleapis.com/translate_a/single",
+        googleWebClient: String = "gtx",
         model: String,
         thinkingEnabled: Bool = false,
         thinkingParameter: String = "include_reasoning",
         contextWindowTokens: Int = 262144,
-        outputTokenLimit: Int = 65536,
+        outputTokenLimit: Int = 2048,
+        requestTokenLimit: Int = 8000,
         temperature: Double,
         promptTemplate: String,
         systemPrompt: String,
         copyKeystrokeDelay: Double,
+        normalizePDFLineBreaks: Bool = true,
         nativeWindow: TranslationWindowSettings
     ) {
         self.enabled = enabled
+        self.provider = provider
         self.endpoint = endpoint
         self.apiKey = apiKey
+        self.googleEndpoint = googleEndpoint
+        self.googleApiKey = googleApiKey
+        self.googleSourceLanguage = googleSourceLanguage
+        self.googleTargetLanguage = googleTargetLanguage
+        self.googleTargetLanguageForChinese = googleTargetLanguageForChinese
+        self.googleWebEndpoint = googleWebEndpoint
+        self.googleWebClient = googleWebClient
         self.model = model
         self.thinkingEnabled = thinkingEnabled
         self.thinkingParameter = thinkingParameter
         self.contextWindowTokens = contextWindowTokens
         self.outputTokenLimit = outputTokenLimit
+        self.requestTokenLimit = requestTokenLimit
         self.temperature = temperature
         self.promptTemplate = promptTemplate
         self.systemPrompt = systemPrompt
         self.copyKeystrokeDelay = copyKeystrokeDelay
+        self.normalizePDFLineBreaks = normalizePDFLineBreaks
         self.nativeWindow = nativeWindow
     }
 
     private enum CodingKeys: String, CodingKey {
         case enabled
+        case provider
         case endpoint
         case apiKey
+        case googleEndpoint
+        case googleApiKey
+        case googleSourceLanguage
+        case googleTargetLanguage
+        case googleTargetLanguageForChinese
+        case googleWebEndpoint
+        case googleWebClient
         case model
         case thinkingEnabled
         case thinkingParameter
         case contextWindowTokens
         case outputTokenLimit
+        case requestTokenLimit
         case temperature
         case promptTemplate
         case systemPrompt
         case copyKeystrokeDelay
+        case normalizePDFLineBreaks
         case nativeWindow
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.enabled = try container.decode(Bool.self, forKey: .enabled)
+        self.provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? "llm"
         self.endpoint = try container.decode(String.self, forKey: .endpoint)
         self.apiKey = try container.decode(String.self, forKey: .apiKey)
+        self.googleEndpoint = try container.decodeIfPresent(String.self, forKey: .googleEndpoint) ?? "https://translation.googleapis.com/language/translate/v2"
+        self.googleApiKey = try container.decodeIfPresent(String.self, forKey: .googleApiKey) ?? ""
+        self.googleSourceLanguage = try container.decodeIfPresent(String.self, forKey: .googleSourceLanguage) ?? "auto"
+        self.googleTargetLanguage = try container.decodeIfPresent(String.self, forKey: .googleTargetLanguage) ?? "zh-CN"
+        self.googleTargetLanguageForChinese = try container.decodeIfPresent(String.self, forKey: .googleTargetLanguageForChinese) ?? "en"
+        self.googleWebEndpoint = try container.decodeIfPresent(String.self, forKey: .googleWebEndpoint) ?? "https://translate.googleapis.com/translate_a/single"
+        self.googleWebClient = try container.decodeIfPresent(String.self, forKey: .googleWebClient) ?? "gtx"
         self.model = try container.decode(String.self, forKey: .model)
         self.thinkingEnabled = try container.decodeIfPresent(Bool.self, forKey: .thinkingEnabled) ?? false
         self.thinkingParameter = try container.decodeIfPresent(String.self, forKey: .thinkingParameter) ?? "include_reasoning"
         self.contextWindowTokens = try container.decodeIfPresent(Int.self, forKey: .contextWindowTokens) ?? 262144
-        self.outputTokenLimit = try container.decodeIfPresent(Int.self, forKey: .outputTokenLimit) ?? 65536
+        self.outputTokenLimit = try container.decodeIfPresent(Int.self, forKey: .outputTokenLimit) ?? 2048
+        self.requestTokenLimit = try container.decodeIfPresent(Int.self, forKey: .requestTokenLimit) ?? 8000
         self.temperature = try container.decode(Double.self, forKey: .temperature)
         self.promptTemplate = try container.decode(String.self, forKey: .promptTemplate)
         self.systemPrompt = try container.decode(String.self, forKey: .systemPrompt)
         self.copyKeystrokeDelay = try container.decode(Double.self, forKey: .copyKeystrokeDelay)
+        self.normalizePDFLineBreaks = try container.decodeIfPresent(Bool.self, forKey: .normalizePDFLineBreaks) ?? true
         self.nativeWindow = try container.decode(TranslationWindowSettings.self, forKey: .nativeWindow)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encode(provider, forKey: .provider)
+        try container.encode(endpoint, forKey: .endpoint)
+        try container.encode(apiKey, forKey: .apiKey)
+        if googleEndpoint != "https://translation.googleapis.com/language/translate/v2" {
+            try container.encode(googleEndpoint, forKey: .googleEndpoint)
+        }
+        try container.encode(googleApiKey, forKey: .googleApiKey)
+        try container.encode(googleSourceLanguage, forKey: .googleSourceLanguage)
+        try container.encode(googleTargetLanguage, forKey: .googleTargetLanguage)
+        try container.encode(googleTargetLanguageForChinese, forKey: .googleTargetLanguageForChinese)
+        if googleWebEndpoint != "https://translate.googleapis.com/translate_a/single" {
+            try container.encode(googleWebEndpoint, forKey: .googleWebEndpoint)
+        }
+        if googleWebClient != "gtx" {
+            try container.encode(googleWebClient, forKey: .googleWebClient)
+        }
+        try container.encode(model, forKey: .model)
+        try container.encode(thinkingEnabled, forKey: .thinkingEnabled)
+        try container.encode(thinkingParameter, forKey: .thinkingParameter)
+        try container.encode(contextWindowTokens, forKey: .contextWindowTokens)
+        try container.encode(outputTokenLimit, forKey: .outputTokenLimit)
+        try container.encode(requestTokenLimit, forKey: .requestTokenLimit)
+        try container.encode(temperature, forKey: .temperature)
+        try container.encode(promptTemplate, forKey: .promptTemplate)
+        try container.encode(systemPrompt, forKey: .systemPrompt)
+        try container.encode(copyKeystrokeDelay, forKey: .copyKeystrokeDelay)
+        try container.encode(normalizePDFLineBreaks, forKey: .normalizePDFLineBreaks)
+        try container.encode(nativeWindow, forKey: .nativeWindow)
     }
 }
 
@@ -320,13 +403,22 @@ public extension UserConfiguration {
             ),
             translation: TranslationSettings(
                 enabled: true,
+                provider: "google_web",
                 endpoint: "http://127.0.0.1:8787/v1/chat/completions",
                 apiKey: apiKey,
+                googleEndpoint: "https://translation.googleapis.com/language/translate/v2",
+                googleApiKey: "",
+                googleSourceLanguage: "auto",
+                googleTargetLanguage: "zh-CN",
+                googleTargetLanguageForChinese: "en",
+                googleWebEndpoint: "https://translate.googleapis.com/translate_a/single",
+                googleWebClient: "gtx",
                 model: "qwen/qwen3.6-27b",
                 thinkingEnabled: false,
                 thinkingParameter: "include_reasoning",
                 contextWindowTokens: 262144,
-                outputTokenLimit: 65536,
+                outputTokenLimit: 2048,
+                requestTokenLimit: 8000,
                 temperature: 0.2,
                 promptTemplate: """
                 You are a professional English translator with strong knowledge of computing terms.
@@ -341,6 +433,7 @@ public extension UserConfiguration {
                 """,
                 systemPrompt: "",
                 copyKeystrokeDelay: 0.18,
+                normalizePDFLineBreaks: true,
                 nativeWindow: TranslationWindowSettings(
                     id: "translate",
                     title: "LLM Translate",

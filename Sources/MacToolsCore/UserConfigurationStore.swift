@@ -173,10 +173,13 @@ public final class UserConfigurationStore {
 
     private static let defaultTranslationScript = """
     #!/usr/bin/env python3
-    import urllib.error
-    import urllib.request
+    import html
     import json
+    import re
     import sys
+    import urllib.error
+    import urllib.parse
+    import urllib.request
 
 
     class TranslationBudgetError(Exception):
@@ -266,6 +269,185 @@ public final class UserConfigurationStore {
         return f"HTTP {error.code}: {error.reason}\\n\\n{body}"
 
 
+    def contains_cjk(text):
+        return any("\\u4e00" <= character <= "\\u9fff" for character in text)
+
+
+    def is_cjk_character(character):
+        return "\\u4e00" <= character <= "\\u9fff"
+
+
+    def is_structural_line(line):
+        stripped = line.strip()
+        return bool(
+            re.match(r"^(```|~~~)", stripped)
+            or re.match(r"^([-*+]|[0-9]+[.)]|[A-Za-z][.)])\\s+", stripped)
+            or re.match(r"^\\|.*\\|$", stripped)
+            or re.match(r"^\\s{2,}\\S", line)
+        )
+
+
+    def join_wrapped_lines(lines):
+        if any(is_structural_line(line) for line in lines):
+            return "\\n".join(line.strip() for line in lines).strip()
+
+        output = lines[0].strip()
+        for raw_line in lines[1:]:
+            line = raw_line.strip()
+            if not line:
+                continue
+            previous = output[-1] if output else ""
+            next_character = line[0]
+            if previous == "-" and len(output) >= 2 and output[-2].isalpha() and next_character.isalpha():
+                output = output[:-1] + line
+            elif is_cjk_character(previous) and is_cjk_character(next_character):
+                output += line
+            elif previous in "([{/" or next_character in ".,;:!?)]}%":
+                output += line
+            else:
+                output += " " + line
+        return output.strip()
+
+
+    def normalize_source_text(source_text):
+        text = source_text.replace("\\r\\n", "\\n").replace("\\r", "\\n").strip()
+        if not config["translation"].get("normalizePDFLineBreaks", True):
+            return text
+
+        paragraphs = []
+        current = []
+        for line in text.split("\\n"):
+            if line.strip():
+                current.append(line)
+            elif current:
+                paragraphs.append(join_wrapped_lines(current))
+                current = []
+        if current:
+            paragraphs.append(join_wrapped_lines(current))
+        return "\\n\\n".join(paragraph for paragraph in paragraphs if paragraph).strip()
+
+
+    def target_language_for_text(translation, source_text):
+        if contains_cjk(source_text):
+            return translation.get("googleTargetLanguageForChinese", "en")
+        return translation.get("googleTargetLanguage", "zh-CN")
+
+
+    def google_translate_url(endpoint, api_key):
+        parts = urllib.parse.urlsplit(endpoint)
+        query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+        query["key"] = api_key
+        return urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), parts.fragment)
+        )
+
+
+    def request_google_translation(source_text):
+        translation = config["translation"]
+        api_key = translation.get("googleApiKey", "").strip()
+        if not api_key:
+            raise TranslationBudgetError(
+                "Google translation is enabled, but translation.googleApiKey is empty.\\n\\n"
+                "Create a Google Cloud Translation API key and set it in config.jsonc."
+            )
+
+        target_language = target_language_for_text(translation, source_text)
+        body = {
+            "q": source_text,
+            "target": target_language,
+            "format": "text",
+        }
+        source_language = translation.get("googleSourceLanguage", "auto")
+        if source_language and source_language != "auto":
+            body["source"] = source_language
+
+        request = urllib.request.Request(
+            google_translate_url(
+                translation.get("googleEndpoint", "https://translation.googleapis.com/language/translate/v2"),
+                api_key,
+            ),
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response_json = json.loads(response.read().decode("utf-8"))
+
+        translations = ((response_json.get("data") or {}).get("translations") or [])
+        if not translations:
+            return "The Google translation response did not contain translation text."
+
+        translated_text = "\\n".join(
+            html.unescape(item.get("translatedText", "")).strip()
+            for item in translations
+            if item.get("translatedText")
+        ).strip()
+        if not translated_text:
+            return "The Google translation response did not contain translation text."
+
+        detected_language = translations[0].get("detectedSourceLanguage") or source_language
+        print(
+            "[translate] "
+            f"provider=google detected={detected_language} target={target_language} "
+            f"content_len={len(translated_text)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return f"Google Translate ({detected_language} -> {target_language})\\n\\n{translated_text}"
+
+
+    def google_web_translate_url(translation, source_text, target_language):
+        params = {
+            "client": translation.get("googleWebClient", "gtx"),
+            "sl": translation.get("googleSourceLanguage", "auto"),
+            "tl": target_language,
+            "dt": "t",
+            "ie": "UTF-8",
+            "oe": "UTF-8",
+            "q": source_text,
+        }
+        endpoint = translation.get("googleWebEndpoint", "https://translate.googleapis.com/translate_a/single")
+        separator = "&" if urllib.parse.urlsplit(endpoint).query else "?"
+        return endpoint + separator + urllib.parse.urlencode(params)
+
+
+    def extract_google_web_text(response):
+        segments = response[0] if isinstance(response, list) and response else []
+        if not isinstance(segments, list):
+            return ""
+        translated_parts = []
+        for segment in segments:
+            if isinstance(segment, list) and segment and isinstance(segment[0], str):
+                translated_parts.append(segment[0])
+        return html.unescape("".join(translated_parts)).strip()
+
+
+    def request_google_web_translation(source_text):
+        translation = config["translation"]
+        target_language = target_language_for_text(translation, source_text)
+        request = urllib.request.Request(
+            google_web_translate_url(translation, source_text, target_language),
+            headers={"User-Agent": "Mozilla/5.0"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response_json = json.loads(response.read().decode("utf-8"))
+
+        translated_text = extract_google_web_text(response_json)
+        if not translated_text:
+            return "The Google web translation response did not contain translation text."
+
+        detected_language = response_json[2] if len(response_json) > 2 and isinstance(response_json[2], str) else "auto"
+        print(
+            "[translate] "
+            f"provider=google_web detected={detected_language} target={target_language} "
+            f"content_len={len(translated_text)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return f"Google Web Translate ({detected_language} -> {target_language})\\n\\n{translated_text}"
+
+
     def estimate_token_count(text):
         cjk_count = sum(1 for character in text if "\\u4e00" <= character <= "\\u9fff")
         non_cjk_count = len(text) - cjk_count
@@ -280,8 +462,9 @@ public final class UserConfigurationStore {
         return total
 
 
-    def validate_token_budget(translation, messages, output_token_limit):
+    def resolve_output_token_limit(translation, messages, output_token_limit):
         context_window = int(translation.get("contextWindowTokens", 262144) or 0)
+        request_token_limit = int(translation.get("requestTokenLimit", 8000) or 0)
         prompt_tokens = estimate_message_tokens(messages)
 
         if context_window > 0 and output_token_limit > 0 and prompt_tokens + output_token_limit > context_window:
@@ -294,8 +477,30 @@ public final class UserConfigurationStore {
                 f"Estimated prompt budget available: {available_input}"
             )
 
+        if request_token_limit > 0 and output_token_limit > 0 and prompt_tokens + output_token_limit > request_token_limit:
+            adjusted_limit = max(request_token_limit - prompt_tokens, 0)
+            if adjusted_limit <= 0:
+                raise TranslationBudgetError(
+                    "Selected text is too long for the configured request token budget.\\n\\n"
+                    f"Estimated prompt tokens: {prompt_tokens}\\n"
+                    f"Request token limit: {request_token_limit}\\n"
+                    "Increase translation.requestTokenLimit for a higher service tier or select less text."
+                )
+            print(
+                "[translate] "
+                f"clamped max_completion_tokens={adjusted_limit} "
+                f"from configured={output_token_limit} "
+                f"requestTokenLimit={request_token_limit} "
+                f"prompt_estimate={prompt_tokens}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return adjusted_limit
 
-    def request_translation(source_text):
+        return output_token_limit
+
+
+    def request_llm_translation(source_text):
         translation = config["translation"]
         prompt = translation["promptTemplate"].replace("{{sourceText}}", source_text)
         messages = []
@@ -308,8 +513,8 @@ public final class UserConfigurationStore {
             "temperature": translation["temperature"],
             "messages": messages,
         }
-        output_token_limit = int(translation.get("outputTokenLimit", 65536) or 0)
-        validate_token_budget(translation, messages, output_token_limit)
+        output_token_limit = int(translation.get("outputTokenLimit", 2048) or 0)
+        output_token_limit = resolve_output_token_limit(translation, messages, output_token_limit)
         if output_token_limit > 0:
             body["max_completion_tokens"] = output_token_limit
         if translation.get("thinkingParameter") == "enable_thinking":
@@ -335,6 +540,17 @@ public final class UserConfigurationStore {
             return extract_text(response_json)
 
 
+    def request_translation(source_text):
+        provider = config["translation"].get("provider", "llm").lower()
+        if provider == "google_web":
+            return request_google_web_translation(source_text)
+        if provider == "google":
+            return request_google_translation(source_text)
+        if provider == "llm":
+            return request_llm_translation(source_text)
+        raise TranslationBudgetError(f"Unsupported translation.provider: {provider}")
+
+
     def emit_window_command(source_text, translated_text, status_text="Ready"):
         window = config["translation"]["nativeWindow"]
         body = f\"\"\"# Translation
@@ -353,7 +569,7 @@ public final class UserConfigurationStore {
 
 
     def main():
-        source_text = input_text.strip()
+        source_text = normalize_source_text(input_text)
         if not source_text:
             emit_window_command("", "No selected text was provided.", "Missing source")
             return 1
