@@ -16,6 +16,44 @@ public protocol SystemEventObserving: AnyObject {
     func stop()
 }
 
+public enum WindowPresence: Equatable, Sendable {
+    case present
+    case absent
+    case indeterminate
+}
+
+public enum WindowAbsenceDecision: Equatable, Sendable {
+    case cancel
+    case retry
+    case restorePreviousApplication
+}
+
+public struct WindowAbsenceConfirmation: Equatable, Sendable {
+    public let requiredConsecutiveAbsences: Int
+    public private(set) var consecutiveAbsences = 0
+
+    public init(requiredConsecutiveAbsences: Int = 3) {
+        precondition(requiredConsecutiveAbsences > 0)
+        self.requiredConsecutiveAbsences = requiredConsecutiveAbsences
+    }
+
+    public mutating func observe(_ presence: WindowPresence) -> WindowAbsenceDecision {
+        switch presence {
+        case .present:
+            consecutiveAbsences = 0
+            return .cancel
+        case .indeterminate:
+            consecutiveAbsences = 0
+            return .retry
+        case .absent:
+            consecutiveAbsences += 1
+            return consecutiveAbsences >= requiredConsecutiveAbsences
+                ? .restorePreviousApplication
+                : .retry
+        }
+    }
+}
+
 @MainActor
 public final class AutomationRuntime {
     private let windowManager: WindowManaging

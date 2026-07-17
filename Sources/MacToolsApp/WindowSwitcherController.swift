@@ -134,6 +134,7 @@ final class WindowSwitcherController {
     private var axWindowObservers: [String: AXWindowObservation] = [:]
     private var pendingFocusVerification: PendingFocusVerification?
     private let axMessagingTimeout: Float = 0.08
+    private let axWindowEnumerationRetryTimeout: Float = 0.30
 
     init(runtime: AutomationRuntime, configuration: UserConfiguration) {
         self.runtime = runtime
@@ -364,6 +365,8 @@ final class WindowSwitcherController {
         cgCount = windowInfo.count
 
         var seen = Set<String>()
+        var axWindowsByProcessIdentifier: [pid_t: [AXUIElement]] = [:]
+        var unavailableAXWindowLists = Set<pid_t>()
         let enumerated = windowInfo.compactMap { info -> WindowChoice? in
             guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
                   let pid = info[kCGWindowOwnerPID as String] as? pid_t,
@@ -390,7 +393,26 @@ final class WindowSwitcherController {
             }
 
             let cgTitle = cgTitle(from: info)
-            guard let axWindow = findAXWindow(processIdentifier: pid, title: cgTitle, bounds: cgBounds(from: info)) else {
+            let axWindows: [AXUIElement]
+            if let cached = axWindowsByProcessIdentifier[pid] {
+                axWindows = cached
+            } else {
+                guard !unavailableAXWindowLists.contains(pid),
+                      let copied = copyAXWindows(processIdentifier: pid) else {
+                    unavailableAXWindowLists.insert(pid)
+                    log("skip AX owner=\(ownerName) pid=\(pid) cgTitle=\(cgTitle) reason=no-ax-window-list attrs=\(debugWindowInfo(info))")
+                    return nil
+                }
+                axWindowsByProcessIdentifier[pid] = copied
+                axWindows = copied
+            }
+            guard let axWindow = findAXWindow(
+                processIdentifier: pid,
+                title: cgTitle,
+                bounds: cgBounds(from: info),
+                windows: axWindows,
+                excludingKeys: seen
+            ) else {
                 log("skip AX owner=\(ownerName) pid=\(pid) cgTitle=\(cgTitle) reason=no-ax-window attrs=\(debugWindowInfo(info))")
                 return nil
             }
@@ -446,29 +468,57 @@ final class WindowSwitcherController {
         return result
     }
 
-    private func findAXWindow(processIdentifier: pid_t, title: String, bounds: CGRect?) -> AXUIElement? {
+    private func copyAXWindows(processIdentifier: pid_t) -> [AXUIElement]? {
         let started = CFAbsoluteTimeGetCurrent()
         let app = axApplication(processIdentifier: processIdentifier)
         var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
+        var result = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
+        if result == .cannotComplete {
+            AXUIElementSetMessagingTimeout(app, axWindowEnumerationRetryTimeout)
+            value = nil
+            result = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
+            log("AX windows retry pid=\(processIdentifier) timeout=\(axWindowEnumerationRetryTimeout)s result=\(result.rawValue)")
+        }
         guard result == .success, let windows = value as? [AXUIElement] else {
             logSlowAX("AX windows failed pid=\(processIdentifier) result=\(result.rawValue)", since: started)
-            return nil
+            var focusedValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focusedValue) == .success,
+                  let focusedValue else {
+                return nil
+            }
+            let focusedWindow = focusedValue as! AXUIElement
+            configureAXTimeout(focusedWindow)
+            guard isSwitchableAXWindow(focusedWindow) else {
+                return nil
+            }
+            log("AX windows fallback to focused window pid=\(processIdentifier)")
+            return [focusedWindow]
         }
 
         windows.forEach(configureAXTimeout)
-        let realWindows = windows.filter { isSwitchableAXWindow($0) }
+        logSlowAX("AX windows copied pid=\(processIdentifier) windows=\(windows.count)", since: started)
+        return windows
+    }
+
+    private func findAXWindow(
+        processIdentifier: pid_t,
+        title: String,
+        bounds: CGRect?,
+        windows: [AXUIElement],
+        excludingKeys: Set<String>
+    ) -> AXUIElement? {
+        let realWindows = windows.filter {
+            isSwitchableAXWindow($0)
+                && !excludingKeys.contains(windowKey(processIdentifier: processIdentifier, axWindow: $0))
+        }
         if !title.isEmpty, let exact = realWindows.first(where: { axTitle(for: $0) == title }) {
-            logSlowAX("findAXWindow exact pid=\(processIdentifier) windows=\(windows.count)", since: started)
             return exact
         }
 
         if let bounds, let matchingBounds = realWindows.first(where: { axBounds(for: $0).map { approximatelyEqual($0, bounds) } == true }) {
-            logSlowAX("findAXWindow bounds pid=\(processIdentifier) windows=\(windows.count)", since: started)
             return matchingBounds
         }
 
-        logSlowAX("findAXWindow fallback pid=\(processIdentifier) windows=\(windows.count)", since: started)
         return realWindows.first
     }
 
@@ -498,6 +548,16 @@ final class WindowSwitcherController {
         }
 
         guard let size = axSize(for: window),
+              size.width >= 80,
+              size.height >= 60 else {
+            return false
+        }
+        return true
+    }
+
+    private func isSubstantialAXWindow(_ window: AXUIElement) -> Bool {
+        guard axStringAttribute(kAXRoleAttribute, for: window) == kAXWindowRole as String,
+              let size = axSize(for: window),
               size.width >= 80,
               size.height >= 60 else {
             return false
@@ -1127,62 +1187,91 @@ final class WindowSwitcherController {
             return
         }
 
+        confirmFrontmostApplicationHasNoWindows(
+            expectedFrontmost: expectedFrontmost,
+            destroyedElementHash: destroyedElementHash,
+            confirmation: WindowAbsenceConfirmation(),
+            remainingAttempts: 5
+        )
+    }
+
+    private func confirmFrontmostApplicationHasNoWindows(
+        expectedFrontmost: FrontmostApplicationIdentity,
+        destroyedElementHash: CFHashCode,
+        confirmation: WindowAbsenceConfirmation,
+        remainingAttempts: Int
+    ) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            guard let self else {
+            guard let self,
+                  self.frontmostApplicationMatches(expectedFrontmost) else {
                 return
             }
-            guard self.frontmostApplicationMatches(expectedFrontmost) else {
-                self.log("skip restore previous app; frontmost changed from \(self.describe(expectedFrontmost)) to \(self.frontmostDescription())")
-                return
-            }
-            if self.hasFocusedSwitchableWindowAfterDestroy(
-                processIdentifier: processIdentifier,
+            if self.hasFocusedSubstantialWindowAfterDestroy(
+                processIdentifier: expectedFrontmost.processIdentifier,
                 destroyedElementHash: destroyedElementHash
             ) {
                 return
             }
-            guard !self.hasSwitchableWindows(processIdentifier: processIdentifier) else {
+
+            let presence = self.substantialWindowPresence(
+                processIdentifier: expectedFrontmost.processIdentifier
+            )
+            var nextConfirmation = confirmation
+            let decision = nextConfirmation.observe(presence)
+            self.log("restore check app=\(self.describe(expectedFrontmost)) presence=\(presence) consecutiveAbsences=\(nextConfirmation.consecutiveAbsences) remainingAttempts=\(remainingAttempts)")
+
+            switch decision {
+            case .cancel:
                 return
+            case .retry where remainingAttempts > 1:
+                self.confirmFrontmostApplicationHasNoWindows(
+                    expectedFrontmost: expectedFrontmost,
+                    destroyedElementHash: destroyedElementHash,
+                    confirmation: nextConfirmation,
+                    remainingAttempts: remainingAttempts - 1
+                )
+            case .retry:
+                self.log("skip restore previous app; unable to confirm stable window absence for \(self.describe(expectedFrontmost))")
+            case .restorePreviousApplication:
+                guard self.frontmostApplicationMatches(expectedFrontmost),
+                      !self.hasFocusedSubstantialWindowAfterDestroy(
+                        processIdentifier: expectedFrontmost.processIdentifier,
+                        destroyedElementHash: destroyedElementHash
+                      ) else {
+                    return
+                }
+                self.log("frontmost app \(self.describe(expectedFrontmost)) has no substantial windows after repeated checks; restoring previous app")
+                _ = self.focusMostRecentWindow(excluding: expectedFrontmost.bundleIdentifier, recordCurrentFocus: false)
             }
-            guard self.frontmostApplicationMatches(expectedFrontmost) else {
-                self.log("skip restore previous app after window check; frontmost changed from \(self.describe(expectedFrontmost)) to \(self.frontmostDescription())")
-                return
-            }
-            if self.hasFocusedSwitchableWindowAfterDestroy(
-                processIdentifier: processIdentifier,
-                destroyedElementHash: destroyedElementHash
-            ) {
-                return
-            }
-            self.log("frontmost app \(self.describe(expectedFrontmost)) has no switchable windows after destroy; restoring previous app")
-            _ = self.focusMostRecentWindow(excluding: expectedFrontmost.bundleIdentifier, recordCurrentFocus: false)
         }
     }
 
-    private func hasSwitchableWindows(processIdentifier: pid_t) -> Bool {
+    private func substantialWindowPresence(processIdentifier: pid_t) -> WindowPresence {
         let appElement = axApplication(processIdentifier: processIdentifier)
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+        let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
+        guard result == .success,
               let windows = value as? [AXUIElement] else {
-            return false
+            log("AX windows unavailable during restore check pid=\(processIdentifier) result=\(result.rawValue)")
+            return .indeterminate
         }
         windows.forEach(configureAXTimeout)
-        return windows.contains { isSwitchableAXWindow($0) }
+        return windows.contains { isSubstantialAXWindow($0) } ? .present : .absent
     }
 
-    private func hasFocusedSwitchableWindowAfterDestroy(
+    private func hasFocusedSubstantialWindowAfterDestroy(
         processIdentifier: pid_t,
         destroyedElementHash: CFHashCode
     ) -> Bool {
         guard let focusedWindow = focusedAXWindow(processIdentifier: processIdentifier),
-              isSwitchableAXWindow(focusedWindow) else {
+              isSubstantialAXWindow(focusedWindow) else {
             return false
         }
         let focusedHash = CFHash(focusedWindow)
         guard focusedHash != destroyedElementHash else {
             return false
         }
-        log("skip restore previous app; focused window changed after destroy pid=\(processIdentifier) destroyedHash=\(destroyedElementHash) focusedHash=\(focusedHash) focused=\(debugAXWindow(focusedWindow))")
+        log("skip restore previous app; focused substantial window changed after destroy pid=\(processIdentifier) destroyedHash=\(destroyedElementHash) focusedHash=\(focusedHash) focused=\(debugAXWindow(focusedWindow))")
         recordFocusedWindow()
         return true
     }

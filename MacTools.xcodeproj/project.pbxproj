@@ -26,6 +26,7 @@
 		1A0001130000000000000001 /* GlobalHotkeyController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000C0000000000000001 /* GlobalHotkeyController.swift */; };
 		1A0001140000000000000001 /* Carbon.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002070000000000000001 /* Carbon.framework */; };
 		1A0001150000000000000001 /* WindowSwitcherController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000D0000000000000001 /* WindowSwitcherController.swift */; };
+		1A0001160000000000000001 /* WindowAbsenceConfirmationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000E0000000000000001 /* WindowAbsenceConfirmationTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -93,6 +94,7 @@
 		1A00000B0000000000000001 /* Resources/Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
 		1A00000C0000000000000001 /* GlobalHotkeyController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalHotkeyController.swift; sourceTree = "<group>"; };
 		1A00000D0000000000000001 /* WindowSwitcherController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowSwitcherController.swift; sourceTree = "<group>"; };
+		1A00000E0000000000000001 /* WindowAbsenceConfirmationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowAbsenceConfirmationTests.swift; sourceTree = "<group>"; };
 		1A0002010000000000000001 /* libMacToolsCore.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libMacToolsCore.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002020000000000000001 /* libMacToolsScripting.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libMacToolsScripting.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002030000000000000001 /* TSMacTools.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TSMacTools.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -217,6 +219,7 @@
 			children = (
 				1A0000050000000000000001 /* PythonScriptBridgeTests.swift */,
 				1A00000A0000000000000001 /* UserConfigurationStoreTests.swift */,
+				1A00000E0000000000000001 /* WindowAbsenceConfirmationTests.swift */,
 			);
 			path = MacToolsCoreTests;
 			sourceTree = "<group>";
@@ -401,6 +404,7 @@
 			files = (
 				1A0001090000000000000001 /* PythonScriptBridgeTests.swift in Sources */,
 				1A0001110000000000000001 /* UserConfigurationStoreTests.swift in Sources */,
+				1A0001160000000000000001 /* WindowAbsenceConfirmationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
