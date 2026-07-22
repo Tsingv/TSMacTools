@@ -489,11 +489,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkeyController: GlobalHotkeyController?
     private var windowSwitcherController: WindowSwitcherController?
     private var statusItem: NSStatusItem?
+    private var menuBarVisibilityMenuController: MenuBarVisibilityMenuController?
 
     static func main() {
         if CommandLine.arguments.contains("--check-accessibility") {
             let status = AccessibilityPermissionClient().snapshot().accessibility
             print("accessibility=\(status == .granted ? "granted" : "missing")")
+            return
+        }
+
+        if CommandLine.arguments.contains("--list-menu-bar-applications") {
+            let app = NSApplication.shared
+            app.setActivationPolicy(.prohibited)
+            let controller = MenuBarVisibilityController()
+            controller.applications { result in
+                switch result {
+                case let .success(applications):
+                    for application in applications {
+                        print("allowed=\(application.isAllowed ? "yes" : "no")\t\(application.localizedName)")
+                    }
+                case let .failure(error):
+                    fputs("error=\(error.localizedDescription)\n", stderr)
+                }
+                app.terminate(nil)
+            }
+            app.run()
             return
         }
 
@@ -540,12 +560,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "TSMacTools", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        let visibilityMenuController = MenuBarVisibilityMenuController { [weak self] error in
+            self?.showStatusWindow(title: "Menu Bar Visibility", body: error.localizedDescription)
+        }
+        let visibilityItem = NSMenuItem(title: "Menu Bar Icons", action: nil, keyEquivalent: "")
+        visibilityItem.submenu = visibilityMenuController.menu
+        menu.addItem(visibilityItem)
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Open Configuration Folder", action: #selector(openConfigurationFolder), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         item.menu = menu
         statusItem = item
+        menuBarVisibilityMenuController = visibilityMenuController
     }
 
     private func installMainMenu() {
