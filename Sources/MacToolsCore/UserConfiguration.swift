@@ -375,6 +375,7 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
     public var commandTabBehavior: String
     public var sameApplicationBehavior: String
     public var followFocusedScreen: Bool
+    public var restorePreviousApplicationWhenNoWindows: Bool
     public var width: Int
     public var height: Int
     public var maxVisibleRows: Int
@@ -385,6 +386,7 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
         commandTabBehavior: String,
         sameApplicationBehavior: String,
         followFocusedScreen: Bool,
+        restorePreviousApplicationWhenNoWindows: Bool = true,
         width: Int,
         height: Int,
         maxVisibleRows: Int,
@@ -394,6 +396,7 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
         self.commandTabBehavior = commandTabBehavior
         self.sameApplicationBehavior = sameApplicationBehavior
         self.followFocusedScreen = followFocusedScreen
+        self.restorePreviousApplicationWhenNoWindows = restorePreviousApplicationWhenNoWindows
         self.width = width
         self.height = height
         self.maxVisibleRows = maxVisibleRows
@@ -405,6 +408,7 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
         case commandTabBehavior
         case sameApplicationBehavior
         case followFocusedScreen
+        case restorePreviousApplicationWhenNoWindows
         case width
         case height
         case maxVisibleRows
@@ -417,6 +421,10 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
         self.commandTabBehavior = try container.decode(String.self, forKey: .commandTabBehavior)
         self.sameApplicationBehavior = try container.decode(String.self, forKey: .sameApplicationBehavior)
         self.followFocusedScreen = try container.decode(Bool.self, forKey: .followFocusedScreen)
+        self.restorePreviousApplicationWhenNoWindows = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .restorePreviousApplicationWhenNoWindows
+        ) ?? true
         self.width = try container.decode(Int.self, forKey: .width)
         self.height = try container.decode(Int.self, forKey: .height)
         self.maxVisibleRows = try container.decode(Int.self, forKey: .maxVisibleRows)
@@ -649,6 +657,7 @@ public extension UserConfiguration {
                 commandTabBehavior: "most-recent-window",
                 sameApplicationBehavior: "cycle-same-application-windows",
                 followFocusedScreen: true,
+                restorePreviousApplicationWhenNoWindows: true,
                 width: 760,
                 height: 420,
                 maxVisibleRows: 9,

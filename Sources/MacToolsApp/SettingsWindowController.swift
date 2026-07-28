@@ -417,10 +417,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         let followScreen = checkbox("Follow the focused screen", action: #selector(generalControlChanged(_:)))
         followScreen.state = configuration.windowSwitcher.followFocusedScreen ? .on : .off
         followScreen.tag = 4
+        let restorePreviousApplication = checkbox("Switch to the previous app when no windows remain", action: #selector(generalControlChanged(_:)))
+        restorePreviousApplication.state = configuration.windowSwitcher.restorePreviousApplicationWhenNoWindows ? .on : .off
+        restorePreviousApplication.tag = 6
         stack.addArrangedSubview(formSection(rows: [
             ("Command-Tab", readOnlyValue(configuration.windowSwitcher.commandTabBehavior), "Current strategy identifier; alternative strategies are not implemented yet."),
             ("Same application", readOnlyValue(configuration.windowSwitcher.sameApplicationBehavior), "Current strategy identifier; alternative strategies are not implemented yet."),
             ("Screen", followScreen, "Places the switcher on the screen containing the focused window."),
+            ("Empty application", restorePreviousApplication, "Returns to the most recent window after repeated checks confirm that the frontmost application has no usable windows."),
             ("Width", editableField(String(configuration.windowSwitcher.width), field: .switcherWidth, width: 150), "Switcher overlay width in points."),
             ("Height", editableField(String(configuration.windowSwitcher.height), field: .switcherHeight, width: 150), "Switcher overlay height in points."),
             ("Maximum rows", editableField(String(configuration.windowSwitcher.maxVisibleRows), field: .switcherMaxRows, width: 150), "Maximum number of visible window rows.")
@@ -1043,6 +1047,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case 5:
             configuration.translation.normalizePDFLineBreaks = value
             persist { $0.translation.normalizePDFLineBreaks = value }
+        case 6:
+            configuration.windowSwitcher.restorePreviousApplicationWhenNoWindows = value
+            persist { $0.windowSwitcher.restorePreviousApplicationWhenNoWindows = value }
         default: return
         }
     }

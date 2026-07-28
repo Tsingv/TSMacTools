@@ -224,6 +224,7 @@
     "followFocusedScreen": true, // Centers the overlay on the selected Accessibility window's display.
     "height": 420, // Settings accepts 120...1200; runtime also guards malformed external values.
     "maxVisibleRows": 9, // Settings accepts 1...50.
+    "restorePreviousApplicationWhenNoWindows": true, // Switches back only after repeated checks confirm that the frontmost app has no usable windows.
     "sameApplicationBehavior": "cycle-same-application-windows", // Reserved current strategy identifier.
     "width": 760 // Settings accepts 320...1600; runtime also guards malformed external values.
   },

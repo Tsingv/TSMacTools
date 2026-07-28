@@ -1223,6 +1223,9 @@ final class WindowSwitcherController {
         processIdentifier: pid_t,
         destroyedElementHash: CFHashCode
     ) {
+        guard configuration.windowSwitcher.restorePreviousApplicationWhenNoWindows else {
+            return
+        }
         guard let expectedFrontmost = frontmostApplicationIdentity(),
               expectedFrontmost.processIdentifier == processIdentifier else {
             return

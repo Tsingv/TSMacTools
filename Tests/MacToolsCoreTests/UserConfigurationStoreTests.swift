@@ -396,6 +396,37 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(configuration.scroll, .default)
     }
 
+    func testDecodeWindowSwitcherWithoutRestorePreviousApplicationSettingDefaultsOn() throws {
+        let store = UserConfigurationStore()
+        let encoded = try store.encodeConfigurationAsJSONC(.migratedHammerspoonDefault())
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(String(decoding: encoded, as: UTF8.self)
+                .split(separator: "\n")
+                .dropFirst(3)
+                .joined(separator: "\n").utf8)
+        ) as? [String: Any])
+        var windowSwitcher = try XCTUnwrap(object["windowSwitcher"] as? [String: Any])
+        windowSwitcher.removeValue(forKey: "restorePreviousApplicationWhenNoWindows")
+        object["windowSwitcher"] = windowSwitcher
+
+        let configuration = try store.decodeConfiguration(
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        XCTAssertTrue(configuration.windowSwitcher.restorePreviousApplicationWhenNoWindows)
+    }
+
+    func testWindowSwitcherRestorePreviousApplicationSettingRoundTripsOff() throws {
+        let store = UserConfigurationStore()
+        var expected = UserConfiguration.migratedHammerspoonDefault()
+        expected.windowSwitcher.restorePreviousApplicationWhenNoWindows = false
+
+        let data = try store.encodeConfigurationAsJSONC(expected)
+        let actual = try store.decodeConfiguration(from: data)
+
+        XCTAssertFalse(actual.windowSwitcher.restorePreviousApplicationWhenNoWindows)
+    }
+
     func testDecodeConfigurationWithoutScrollSectionUsesBalancedDefaults() throws {
         let store = UserConfigurationStore()
         let encoded = try store.encodeConfigurationAsJSONC(.migratedHammerspoonDefault())
