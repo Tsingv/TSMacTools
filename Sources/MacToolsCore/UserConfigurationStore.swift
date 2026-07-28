@@ -28,6 +28,310 @@ public struct UserConfigurationBootstrapResult: Equatable, Sendable {
     }
 }
 
+private struct JSONCLayoutEditor {
+    private struct Node {
+        enum Kind {
+            case object([Property])
+            case array([Node])
+            case scalar
+        }
+
+        var range: Range<Int>
+        var kind: Kind
+    }
+
+    private struct Property {
+        var key: String
+        var value: Node
+    }
+
+    private struct Replacement {
+        var range: Range<Int>
+        var bytes: [UInt8]
+    }
+
+    private enum LayoutError: Error {
+        case malformedJSONC
+        case unsupportedReplacement
+    }
+
+    private let source: [UInt8]
+
+    init(source: Data) {
+        self.source = Array(source)
+    }
+
+    func merging(_ replacementObject: Any) throws -> Data {
+        var parser = Parser(bytes: source)
+        let root = try parser.parseDocument()
+        var replacements: [Replacement] = []
+        try collectReplacements(node: root, replacement: replacementObject, into: &replacements)
+
+        var result = source
+        for replacement in replacements.sorted(by: { lhs, rhs in
+            if lhs.range.lowerBound == rhs.range.lowerBound {
+                return lhs.range.upperBound > rhs.range.upperBound
+            }
+            return lhs.range.lowerBound > rhs.range.lowerBound
+        }) {
+            result.replaceSubrange(replacement.range, with: replacement.bytes)
+        }
+        return Data(result)
+    }
+
+    private func collectReplacements(
+        node: Node,
+        replacement: Any,
+        into replacements: inout [Replacement]
+    ) throws {
+        switch (node.kind, replacement) {
+        case let (.object(properties), object as [String: Any]):
+            var propertiesByKey: [String: Node] = [:]
+            for property in properties { propertiesByKey[property.key] = property.value }
+            for (key, value) in object {
+                if let child = propertiesByKey[key] {
+                    try collectReplacements(node: child, replacement: value, into: &replacements)
+                }
+            }
+
+            let missingKeys = object.keys.filter { propertiesByKey[$0] == nil }.sorted()
+            if !missingKeys.isEmpty {
+                let closingBrace = node.range.upperBound - 1
+                let closeIndent = indentation(before: closingBrace)
+                let childIndent = closeIndent + "  "
+                let fields = try missingKeys.map { key -> String in
+                    guard let value = object[key] else { throw LayoutError.unsupportedReplacement }
+                    return "\(childIndent)\(try renderJSONString(key)): \(try render(value, continuationIndent: childIndent))"
+                }.joined(separator: ",\n")
+                let prefix = properties.isEmpty ? "" : ","
+                let insertion = "\(prefix)\n\(fields)\n\(closeIndent)"
+                replacements.append(
+                    Replacement(range: closingBrace ..< closingBrace, bytes: Array(insertion.utf8))
+                )
+            }
+
+        case let (.array(children), array as [Any]) where children.count == array.count:
+            for (child, value) in zip(children, array) {
+                try collectReplacements(node: child, replacement: value, into: &replacements)
+            }
+
+        case (.scalar, _):
+            replacements.append(
+                Replacement(
+                    range: node.range,
+                    bytes: Array(try render(replacement, continuationIndent: indentation(before: node.range.lowerBound)).utf8)
+                )
+            )
+
+        default:
+            replacements.append(
+                Replacement(
+                    range: node.range,
+                    bytes: Array(try render(replacement, continuationIndent: indentation(before: node.range.lowerBound)).utf8)
+                )
+            )
+        }
+    }
+
+    private func render(_ value: Any, continuationIndent: String) throws -> String {
+        guard JSONSerialization.isValidJSONObject([value]) else {
+            throw LayoutError.unsupportedReplacement
+        }
+        let wrapped = try JSONSerialization.data(
+            withJSONObject: [value],
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        guard var text = String(data: wrapped, encoding: .utf8),
+              let firstNewline = text.firstIndex(of: "\n"),
+              let lastNewline = text.lastIndex(of: "\n"),
+              firstNewline < lastNewline else {
+            throw LayoutError.unsupportedReplacement
+        }
+        text = String(text[text.index(after: firstNewline) ..< lastNewline])
+        if text.hasPrefix("  ") { text.removeFirst(2) }
+        return text.replacingOccurrences(of: "\n  ", with: "\n\(continuationIndent)")
+    }
+
+    private func renderJSONString(_ value: String) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: [value])
+        guard let text = String(data: data, encoding: .utf8), text.count >= 2 else {
+            throw LayoutError.unsupportedReplacement
+        }
+        return String(text.dropFirst().dropLast())
+    }
+
+    private func indentation(before offset: Int) -> String {
+        guard offset > 0 else { return "" }
+        var start = offset
+        while start > 0, source[start - 1] != 10, source[start - 1] != 13 { start -= 1 }
+        var end = start
+        while end < offset, source[end] == 32 || source[end] == 9 { end += 1 }
+        return String(decoding: source[start ..< end], as: UTF8.self)
+    }
+
+    private struct Parser {
+        let bytes: [UInt8]
+        var offset = 0
+
+        mutating func parseDocument() throws -> Node {
+            try skipTrivia()
+            let node = try parseValue()
+            try skipTrivia()
+            guard offset == bytes.count else { throw LayoutError.malformedJSONC }
+            return node
+        }
+
+        private mutating func parseValue() throws -> Node {
+            try skipTrivia()
+            guard offset < bytes.count else { throw LayoutError.malformedJSONC }
+            switch bytes[offset] {
+            case 123: return try parseObject() // {
+            case 91: return try parseArray() // [
+            case 34:
+                let range = try parseStringRange()
+                return Node(range: range, kind: .scalar)
+            default:
+                return try parseScalar()
+            }
+        }
+
+        private mutating func parseObject() throws -> Node {
+            let start = offset
+            offset += 1
+            try skipTrivia()
+            var properties: [Property] = []
+            if consume(125) { // }
+                return Node(range: start ..< offset, kind: .object(properties))
+            }
+
+            while true {
+                try skipTrivia()
+                let keyRange = try parseStringRange()
+                let keyData = Data(bytes[keyRange])
+                let key = try JSONDecoder().decode(String.self, from: keyData)
+                try skipTrivia()
+                guard consume(58) else { throw LayoutError.malformedJSONC } // :
+                let value = try parseValue()
+                properties.append(Property(key: key, value: value))
+                try skipTrivia()
+                if consume(125) { break }
+                guard consume(44) else { throw LayoutError.malformedJSONC } // ,
+                try skipTrivia()
+                if consume(125) { break }
+            }
+            return Node(range: start ..< offset, kind: .object(properties))
+        }
+
+        private mutating func parseArray() throws -> Node {
+            let start = offset
+            offset += 1
+            try skipTrivia()
+            var children: [Node] = []
+            if consume(93) { // ]
+                return Node(range: start ..< offset, kind: .array(children))
+            }
+
+            while true {
+                children.append(try parseValue())
+                try skipTrivia()
+                if consume(93) { break }
+                guard consume(44) else { throw LayoutError.malformedJSONC } // ,
+                try skipTrivia()
+                if consume(93) { break }
+            }
+            return Node(range: start ..< offset, kind: .array(children))
+        }
+
+        private mutating func parseScalar() throws -> Node {
+            let start = offset
+            while offset < bytes.count {
+                let byte = bytes[offset]
+                if byte == 44 || byte == 93 || byte == 125 || isWhitespace(byte) { break }
+                if byte == 47, offset + 1 < bytes.count,
+                   bytes[offset + 1] == 47 || bytes[offset + 1] == 42 {
+                    break
+                }
+                offset += 1
+            }
+            guard offset > start else { throw LayoutError.malformedJSONC }
+            return Node(range: start ..< offset, kind: .scalar)
+        }
+
+        private mutating func parseStringRange() throws -> Range<Int> {
+            guard offset < bytes.count, bytes[offset] == 34 else {
+                throw LayoutError.malformedJSONC
+            }
+            let start = offset
+            offset += 1
+            var escaping = false
+            while offset < bytes.count {
+                let byte = bytes[offset]
+                offset += 1
+                if escaping {
+                    escaping = false
+                } else if byte == 92 {
+                    escaping = true
+                } else if byte == 34 {
+                    return start ..< offset
+                }
+            }
+            throw LayoutError.malformedJSONC
+        }
+
+        private mutating func skipTrivia() throws {
+            while offset < bytes.count {
+                if isWhitespace(bytes[offset]) {
+                    offset += 1
+                    continue
+                }
+                guard bytes[offset] == 47, offset + 1 < bytes.count else { return }
+                if bytes[offset + 1] == 47 {
+                    offset += 2
+                    while offset < bytes.count, bytes[offset] != 10, bytes[offset] != 13 { offset += 1 }
+                } else if bytes[offset + 1] == 42 {
+                    offset += 2
+                    var closed = false
+                    while offset + 1 < bytes.count {
+                        if bytes[offset] == 42, bytes[offset + 1] == 47 {
+                            offset += 2
+                            closed = true
+                            break
+                        }
+                        offset += 1
+                    }
+                    guard closed else { throw LayoutError.malformedJSONC }
+                } else {
+                    return
+                }
+            }
+        }
+
+        private mutating func consume(_ byte: UInt8) -> Bool {
+            guard offset < bytes.count, bytes[offset] == byte else { return false }
+            offset += 1
+            return true
+        }
+
+        private func isWhitespace(_ byte: UInt8) -> Bool {
+            byte == 32 || byte == 9 || byte == 10 || byte == 13
+        }
+    }
+}
+
+private enum UserConfigurationUpdateError: LocalizedError {
+    case coordinationDidNotRun
+    case concurrentModification
+
+    var errorDescription: String? {
+        switch self {
+        case .coordinationDidNotRun:
+            "The configuration file could not be coordinated for writing."
+        case .concurrentModification:
+            "The configuration changed repeatedly while Settings was saving. Reload it and try again."
+        }
+    }
+}
+
 public final class UserConfigurationStore {
     private let fileManager: FileManager
     private let encoder: JSONEncoder
@@ -102,6 +406,10 @@ public final class UserConfigurationStore {
         return try decoder.decode(UserConfiguration.self, from: jsoncData)
     }
 
+    public func load(from configURL: URL) throws -> UserConfiguration {
+        try decodeConfiguration(from: Data(contentsOf: configURL))
+    }
+
     public func encodeConfigurationAsJSONC(_ configuration: UserConfiguration) throws -> Data {
         let data = try encoder.encode(configuration)
         let json = String(decoding: data, as: UTF8.self)
@@ -112,6 +420,66 @@ public final class UserConfigurationStore {
         \(json)
         """
         return Data(text.utf8)
+    }
+
+    public func save(_ configuration: UserConfiguration, to configURL: URL) throws {
+        let data = try encodeConfigurationAsJSONC(configuration)
+        try data.write(to: configURL, options: [.atomic])
+    }
+
+    /// Reloads the latest file, applies one settings mutation, and changes only matching JSON
+    /// values in the existing JSONC text. Comments, property order, and unknown extension fields
+    /// therefore survive settings-window edits. Reloading before the mutation also prevents a
+    /// long-lived settings window from overwriting unrelated edits made in a text editor.
+    /// The mutation can be replayed if a non-coordinating writer changes the file during the
+    /// operation, so callers should keep it deterministic and free of external side effects.
+    @discardableResult
+    public func update(
+        at configURL: URL,
+        mutation: (inout UserConfiguration) throws -> Void
+    ) throws -> UserConfiguration {
+        var coordinationError: NSError?
+        var coordinatedResult: Result<UserConfiguration, Error>?
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        coordinator.coordinate(
+            writingItemAt: configURL,
+            options: .forReplacing,
+            error: &coordinationError
+        ) { coordinatedURL in
+            coordinatedResult = Result {
+                for _ in 0 ..< 3 {
+                    let original = try Data(contentsOf: coordinatedURL)
+                    var configuration = try decodeConfiguration(from: original)
+                    try mutation(&configuration)
+
+                    let encoded = try encoder.encode(configuration)
+                    let replacementObject = try JSONSerialization.jsonObject(
+                        with: encoded,
+                        options: [.fragmentsAllowed]
+                    )
+                    let updated = try JSONCLayoutEditor(source: original).merging(replacementObject)
+
+                    // Validate the exact bytes that will be committed. A parser/layout bug must
+                    // never replace a working user configuration with an unreadable file.
+                    let validated = try decodeConfiguration(from: updated)
+                    guard validated == configuration else {
+                        throw CocoaError(.fileWriteUnknown)
+                    }
+
+                    // NSFileCoordinator serializes cooperating editors. The byte comparison also
+                    // catches command-line/non-coordinating writers before the atomic replace.
+                    guard try Data(contentsOf: coordinatedURL) == original else { continue }
+                    try updated.write(to: coordinatedURL, options: [.atomic])
+                    return configuration
+                }
+                throw UserConfigurationUpdateError.concurrentModification
+            }
+        }
+        if let coordinationError { throw coordinationError }
+        guard let coordinatedResult else {
+            throw UserConfigurationUpdateError.coordinationDidNotRun
+        }
+        return try coordinatedResult.get()
     }
 
     private func stripJSONComments(from text: String) -> String {

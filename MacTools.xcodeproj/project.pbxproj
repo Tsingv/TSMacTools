@@ -28,6 +28,21 @@
 		1A0001150000000000000001 /* WindowSwitcherController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000D0000000000000001 /* WindowSwitcherController.swift */; };
 		1A0001160000000000000001 /* WindowAbsenceConfirmationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000E0000000000000001 /* WindowAbsenceConfirmationTests.swift */; };
 		1A0001170000000000000001 /* MenuBarVisibilityController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000F0000000000000001 /* MenuBarVisibilityController.swift */; };
+		1A0001180000000000000001 /* SmoothScrollModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000100000000000000001 /* SmoothScrollModels.swift */; };
+		1A0001190000000000000001 /* SmoothScrollController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000110000000000000001 /* SmoothScrollController.swift */; };
+		1A00011A0000000000000001 /* SmoothScrollEngineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000120000000000000001 /* SmoothScrollEngineTests.swift */; };
+		1A00011B0000000000000001 /* SettingsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000130000000000000001 /* SettingsWindowController.swift */; };
+		1A00011C0000000000000001 /* SmoothScrollController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000140000000000000001 /* SmoothScrollController.swift */; };
+		1A00011D0000000000000001 /* SmoothScrollControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000150000000000000001 /* SmoothScrollControllerTests.swift */; };
+		1A00011E0000000000000001 /* libMacToolsMacOS.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002080000000000000001 /* libMacToolsMacOS.a */; };
+		1A00011F0000000000000001 /* libMacToolsMacOS.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002080000000000000001 /* libMacToolsMacOS.a */; };
+		1A0001200000000000000001 /* libMacToolsCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002010000000000000001 /* libMacToolsCore.a */; };
+		1A0001210000000000000001 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002050000000000000001 /* AppKit.framework */; };
+		1A0001220000000000000001 /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002060000000000000001 /* ApplicationServices.framework */; };
+		1A0001230000000000000001 /* CoreVideo.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002090000000000000001 /* CoreVideo.framework */; };
+		1A0001240000000000000001 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002050000000000000001 /* AppKit.framework */; };
+		1A0001250000000000000001 /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002060000000000000001 /* ApplicationServices.framework */; };
+		1A0001260000000000000001 /* CoreVideo.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002090000000000000001 /* CoreVideo.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -66,6 +81,27 @@
 			remoteGlobalIDString = 1A0005020000000000000001;
 			remoteInfo = MacToolsScripting;
 		};
+		1A0003070000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1A0004010000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1A0005010000000000000001;
+			remoteInfo = MacToolsCore;
+		};
+		1A0003080000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1A0004010000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1A0005040000000000000001;
+			remoteInfo = MacToolsMacOS;
+		};
+		1A0003090000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1A0004010000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1A0005040000000000000001;
+			remoteInfo = MacToolsMacOS;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -97,6 +133,12 @@
 		1A00000D0000000000000001 /* WindowSwitcherController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowSwitcherController.swift; sourceTree = "<group>"; };
 		1A00000E0000000000000001 /* WindowAbsenceConfirmationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowAbsenceConfirmationTests.swift; sourceTree = "<group>"; };
 		1A00000F0000000000000001 /* MenuBarVisibilityController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarVisibilityController.swift; sourceTree = "<group>"; };
+		1A0000100000000000000001 /* SmoothScrollModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmoothScrollModels.swift; sourceTree = "<group>"; };
+		1A0000110000000000000001 /* SmoothScrollController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmoothScrollController.swift; sourceTree = "<group>"; };
+		1A0000120000000000000001 /* SmoothScrollEngineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmoothScrollEngineTests.swift; sourceTree = "<group>"; };
+		1A0000130000000000000001 /* SettingsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsWindowController.swift; sourceTree = "<group>"; };
+		1A0000140000000000000001 /* SmoothScrollController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmoothScrollController.swift; sourceTree = "<group>"; };
+		1A0000150000000000000001 /* SmoothScrollControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmoothScrollControllerTests.swift; sourceTree = "<group>"; };
 		1A0002010000000000000001 /* libMacToolsCore.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libMacToolsCore.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002020000000000000001 /* libMacToolsScripting.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libMacToolsScripting.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002030000000000000001 /* TSMacTools.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TSMacTools.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -104,6 +146,8 @@
 		1A0002050000000000000001 /* AppKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = System/Library/Frameworks/AppKit.framework; sourceTree = SDKROOT; };
 		1A0002060000000000000001 /* ApplicationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ApplicationServices.framework; path = System/Library/Frameworks/ApplicationServices.framework; sourceTree = SDKROOT; };
 		1A0002070000000000000001 /* Carbon.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Carbon.framework; path = System/Library/Frameworks/Carbon.framework; sourceTree = SDKROOT; };
+		1A0002080000000000000001 /* libMacToolsMacOS.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libMacToolsMacOS.a; sourceTree = BUILT_PRODUCTS_DIR; };
+		1A0002090000000000000001 /* CoreVideo.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreVideo.framework; path = System/Library/Frameworks/CoreVideo.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -116,6 +160,7 @@
 				1A0001140000000000000001 /* Carbon.framework in Frameworks */,
 				1A0001050000000000000001 /* libMacToolsCore.a in Frameworks */,
 				1A0001060000000000000001 /* libMacToolsScripting.a in Frameworks */,
+				1A00011E0000000000000001 /* libMacToolsMacOS.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -139,6 +184,21 @@
 			buildActionMask = 2147483647;
 			files = (
 				1A0001080000000000000001 /* libMacToolsScripting.a in Frameworks */,
+				1A00011F0000000000000001 /* libMacToolsMacOS.a in Frameworks */,
+				1A0001240000000000000001 /* AppKit.framework in Frameworks */,
+				1A0001250000000000000001 /* ApplicationServices.framework in Frameworks */,
+				1A0001260000000000000001 /* CoreVideo.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1A0008050000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1A0001200000000000000001 /* libMacToolsCore.a in Frameworks */,
+				1A0001210000000000000001 /* AppKit.framework in Frameworks */,
+				1A0001220000000000000001 /* ApplicationServices.framework in Frameworks */,
+				1A0001230000000000000001 /* CoreVideo.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -161,6 +221,7 @@
 				1A0009030000000000000001 /* MacToolsApp */,
 				1A0009040000000000000001 /* MacToolsCore */,
 				1A0009050000000000000001 /* MacToolsScripting */,
+				1A00090A0000000000000001 /* MacToolsMacOS */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -173,6 +234,8 @@
 				1A00000C0000000000000001 /* GlobalHotkeyController.swift */,
 				1A00000D0000000000000001 /* WindowSwitcherController.swift */,
 				1A00000F0000000000000001 /* MenuBarVisibilityController.swift */,
+				1A0000110000000000000001 /* SmoothScrollController.swift */,
+				1A0000130000000000000001 /* SettingsWindowController.swift */,
 				1A00000B0000000000000001 /* Resources/Assets.xcassets */,
 			);
 			path = MacToolsApp;
@@ -186,6 +249,7 @@
 				1A0000070000000000000001 /* SystemPermissions.swift */,
 				1A0000080000000000000001 /* UserConfiguration.swift */,
 				1A0000090000000000000001 /* UserConfigurationStore.swift */,
+				1A0000100000000000000001 /* SmoothScrollModels.swift */,
 			);
 			path = MacToolsCore;
 			sourceTree = "<group>";
@@ -198,10 +262,19 @@
 			path = MacToolsScripting;
 			sourceTree = "<group>";
 		};
+		1A00090A0000000000000001 /* MacToolsMacOS */ = {
+			isa = PBXGroup;
+			children = (
+				1A0000140000000000000001 /* SmoothScrollController.swift */,
+			);
+			path = MacToolsMacOS;
+			sourceTree = "<group>";
+		};
 		1A0009060000000000000001 /* Tests */ = {
 			isa = PBXGroup;
 			children = (
 				1A0009080000000000000001 /* MacToolsCoreTests */,
+				1A00090B0000000000000001 /* MacToolsMacOSTests */,
 			);
 			path = Tests;
 			sourceTree = "<group>";
@@ -213,6 +286,7 @@
 				1A0002010000000000000001 /* libMacToolsCore.a */,
 				1A0002020000000000000001 /* libMacToolsScripting.a */,
 				1A0002040000000000000001 /* MacToolsTests.xctest */,
+				1A0002080000000000000001 /* libMacToolsMacOS.a */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -223,8 +297,17 @@
 				1A0000050000000000000001 /* PythonScriptBridgeTests.swift */,
 				1A00000A0000000000000001 /* UserConfigurationStoreTests.swift */,
 				1A00000E0000000000000001 /* WindowAbsenceConfirmationTests.swift */,
+				1A0000120000000000000001 /* SmoothScrollEngineTests.swift */,
 			);
 			path = MacToolsCoreTests;
+			sourceTree = "<group>";
+		};
+		1A00090B0000000000000001 /* MacToolsMacOSTests */ = {
+			isa = PBXGroup;
+			children = (
+				1A0000150000000000000001 /* SmoothScrollControllerTests.swift */,
+			);
+			path = MacToolsMacOSTests;
 			sourceTree = "<group>";
 		};
 		1A0009090000000000000001 /* Frameworks */ = {
@@ -233,6 +316,7 @@
 				1A0002050000000000000001 /* AppKit.framework */,
 				1A0002060000000000000001 /* ApplicationServices.framework */,
 				1A0002070000000000000001 /* Carbon.framework */,
+				1A0002090000000000000001 /* CoreVideo.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -254,6 +338,7 @@
 			dependencies = (
 				1A0006010000000000000001 /* PBXTargetDependency */,
 				1A0006020000000000000001 /* PBXTargetDependency */,
+				1A0006080000000000000001 /* PBXTargetDependency */,
 			);
 			name = MacTools;
 			productName = TSMacTools;
@@ -305,12 +390,29 @@
 			dependencies = (
 				1A0006040000000000000001 /* PBXTargetDependency */,
 				1A0006050000000000000001 /* PBXTargetDependency */,
-				1A0006060000000000000001 /* PBXTargetDependency */,
+				1A0006090000000000000001 /* PBXTargetDependency */,
 			);
 			name = MacToolsTests;
 			productName = MacToolsTests;
 			productReference = 1A0002040000000000000001 /* MacToolsTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		1A0005040000000000000001 /* MacToolsMacOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1A000A050000000000000001 /* Build configuration list for PBXNativeTarget "MacToolsMacOS" */;
+			buildPhases = (
+				1A000B060000000000000001 /* Sources */,
+				1A0008050000000000000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				1A0006070000000000000001 /* PBXTargetDependency */,
+			);
+			name = MacToolsMacOS;
+			productName = MacToolsMacOS;
+			productReference = 1A0002080000000000000001 /* libMacToolsMacOS.a */;
+			productType = "com.apple.product-type.library.static";
 		};
 /* End PBXNativeTarget section */
 
@@ -335,6 +437,9 @@
 						CreatedOnToolsVersion = 26.5;
 						TestTargetID = 1A0005000000000000000001;
 					};
+					1A0005040000000000000001 = {
+						CreatedOnToolsVersion = 26.5;
+					};
 				};
 			};
 			buildConfigurationList = 1A000A000000000000000001 /* Build configuration list for PBXProject "MacTools" */;
@@ -355,6 +460,7 @@
 				1A0005010000000000000001 /* MacToolsCore */,
 				1A0005020000000000000001 /* MacToolsScripting */,
 				1A0005030000000000000001 /* MacToolsTests */,
+				1A0005040000000000000001 /* MacToolsMacOS */,
 			);
 		};
 /* End PBXProject section */
@@ -379,6 +485,8 @@
 				1A0001130000000000000001 /* GlobalHotkeyController.swift in Sources */,
 				1A0001150000000000000001 /* WindowSwitcherController.swift in Sources */,
 				1A0001170000000000000001 /* MenuBarVisibilityController.swift in Sources */,
+				1A0001190000000000000001 /* SmoothScrollController.swift in Sources */,
+				1A00011B0000000000000001 /* SettingsWindowController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -391,6 +499,7 @@
 				1A00010D0000000000000001 /* SystemPermissions.swift in Sources */,
 				1A00010F0000000000000001 /* UserConfiguration.swift in Sources */,
 				1A0001100000000000000001 /* UserConfigurationStore.swift in Sources */,
+				1A0001180000000000000001 /* SmoothScrollModels.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -409,6 +518,16 @@
 				1A0001090000000000000001 /* PythonScriptBridgeTests.swift in Sources */,
 				1A0001110000000000000001 /* UserConfigurationStoreTests.swift in Sources */,
 				1A0001160000000000000001 /* WindowAbsenceConfirmationTests.swift in Sources */,
+				1A00011A0000000000000001 /* SmoothScrollEngineTests.swift in Sources */,
+				1A00011D0000000000000001 /* SmoothScrollControllerTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1A000B060000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1A00011C0000000000000001 /* SmoothScrollController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -444,6 +563,21 @@
 			isa = PBXTargetDependency;
 			target = 1A0005000000000000000001 /* MacTools */;
 			targetProxy = 1A0003050000000000000001 /* PBXContainerItemProxy */;
+		};
+		1A0006070000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1A0005010000000000000001 /* MacToolsCore */;
+			targetProxy = 1A0003070000000000000001 /* PBXContainerItemProxy */;
+		};
+		1A0006080000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1A0005040000000000000001 /* MacToolsMacOS */;
+			targetProxy = 1A0003080000000000000001 /* PBXContainerItemProxy */;
+		};
+		1A0006090000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1A0005040000000000000001 /* MacToolsMacOS */;
+			targetProxy = 1A0003090000000000000001 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -703,6 +837,40 @@
 			};
 			name = Release;
 		};
+		1A000C0A0000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				MACH_O_TYPE = staticlib;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = local.clearain.MacTools.MacOS;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+			};
+			name = Debug;
+		};
+		1A000C0B0000000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				MACH_O_TYPE = staticlib;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = local.clearain.MacTools.MacOS;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -747,6 +915,15 @@
 			buildConfigurations = (
 				1A000C080000000000000001 /* Debug */,
 				1A000C090000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1A000A050000000000000001 /* Build configuration list for PBXNativeTarget "MacToolsMacOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A000C0A0000000000000001 /* Debug */,
+				1A000C0B0000000000000001 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

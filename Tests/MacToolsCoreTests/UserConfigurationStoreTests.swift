@@ -2,6 +2,71 @@ import XCTest
 import MacToolsCore
 
 final class UserConfigurationStoreTests: XCTestCase {
+    func testHotkeyShortcutNormalizesModifierAliasesOrderAndKeyCase() {
+        let configured = HotkeyShortcut(modifiers: ["shift", "command", "option", "control"], key: "r")
+        let recorded = HotkeyShortcut(modifiers: ["ALT", "ctrl", "cmd", "shift"], key: "R")
+
+        XCTAssertEqual(configured, recorded)
+        XCTAssertEqual(configured.modifiers, ["alt", "cmd", "ctrl", "shift"])
+        XCTAssertEqual(configured.key, "R")
+    }
+
+    func testHotkeyShortcutIgnoresDuplicateModifiersButDistinguishesDifferentKeys() {
+        let duplicated = HotkeyShortcut(modifiers: ["cmd", "command", "shift", "unknown"], key: " d ")
+        let canonical = HotkeyShortcut(modifiers: ["shift", "cmd"], key: "D")
+        let different = HotkeyShortcut(modifiers: ["shift", "cmd"], key: "F")
+
+        XCTAssertEqual(duplicated, canonical)
+        XCTAssertNotEqual(canonical, different)
+    }
+
+    func testHotkeyBindingExposesCanonicalShortcut() {
+        let binding = HotkeyBinding(
+            modifiers: ["Option", "Command"],
+            key: "s",
+            action: HotkeyAction(kind: .translateSelection)
+        )
+
+        XCTAssertEqual(binding.shortcut, HotkeyShortcut(modifiers: ["alt", "cmd"], key: "S"))
+    }
+
+    func testHotkeyConflictExcludesCurrentRowButFindsAnotherBinding() {
+        var configuration = UserConfiguration.migratedHammerspoonDefault()
+        let shortcut = configuration.hotkeys[0].shortcut
+
+        XCTAssertNil(configuration.conflictingHotkey(for: shortcut, excluding: 0))
+
+        configuration.hotkeys[1].modifiers = ["control", "command"]
+        configuration.hotkeys[1].key = "."
+        XCTAssertEqual(
+            configuration.conflictingHotkey(for: shortcut, excluding: 0),
+            configuration.hotkeys[1]
+        )
+    }
+
+    func testUpdateMutationConflictDoesNotWriteConfiguration() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let store = UserConfigurationStore()
+        let configuration = UserConfiguration.migratedHammerspoonDefault()
+        let configURL = root.appendingPathComponent("config.jsonc")
+        let original = try store.encodeConfigurationAsJSONC(configuration)
+        try original.write(to: configURL)
+        let conflictingShortcut = configuration.hotkeys[1].shortcut
+
+        XCTAssertThrowsError(try store.update(at: configURL) { latest in
+            if latest.conflictingHotkey(for: conflictingShortcut, excluding: 0) != nil {
+                throw TestHotkeyConflict()
+            }
+            latest.hotkeys[0].modifiers = configuration.hotkeys[1].modifiers
+            latest.hotkeys[0].key = configuration.hotkeys[1].key
+        })
+        XCTAssertEqual(try Data(contentsOf: configURL), original)
+    }
+
     func testBootstrapCreatesDefaultConfiguration() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -33,6 +98,14 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertTrue(result.createdTranslationScript)
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.translationScriptURL.path))
         XCTAssertEqual(result.configuration.scripting.pythonPath, "/usr/bin/python3")
+        XCTAssertTrue(result.configuration.scroll.enabled)
+        XCTAssertEqual(result.configuration.scroll.preset, .balanced)
+        XCTAssertTrue(result.configuration.scroll.smoothVertical)
+        XCTAssertTrue(result.configuration.scroll.smoothHorizontal)
+        XCTAssertFalse(result.configuration.scroll.reverseVertical)
+        XCTAssertFalse(result.configuration.scroll.reverseHorizontal)
+        XCTAssertTrue(result.configuration.scroll.excludeTrackpad)
+        XCTAssertEqual(result.configuration.scroll.tuning, ScrollPreset.balanced.tuning)
 
         let configText = try String(contentsOf: result.configURL, encoding: .utf8)
         XCTAssertTrue(configText.contains("// TSMacTools user configuration."))
@@ -52,6 +125,13 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertTrue(configText.contains(#""outputTokenLimit" : 2048"#))
         XCTAssertTrue(configText.contains(#""requestTokenLimit" : 8000"#))
         XCTAssertTrue(configText.contains(#""normalizePDFLineBreaks" : true"#))
+        XCTAssertTrue(configText.contains(#""preset" : "balanced""#))
+        XCTAssertTrue(configText.contains(#""smoothVertical" : true"#))
+        XCTAssertTrue(configText.contains(#""smoothHorizontal" : true"#))
+        XCTAssertTrue(configText.contains(#""reverseVertical" : false"#))
+        XCTAssertTrue(configText.contains(#""reverseHorizontal" : false"#))
+        XCTAssertTrue(configText.contains(#""excludeTrackpad" : true"#))
+        XCTAssertTrue(configText.contains(#""duration" : 0.36"#))
         XCTAssertFalse(configText.contains(#""version":"#))
         XCTAssertFalse(configText.contains(#""configDirectoryName":"#))
 
@@ -155,6 +235,24 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(configuration.translation.outputTokenLimit, 2048)
         XCTAssertEqual(configuration.translation.requestTokenLimit, 8000)
         XCTAssertTrue(configuration.translation.normalizePDFLineBreaks)
+        XCTAssertEqual(configuration.scroll, .default)
+    }
+
+    func testDecodeConfigurationWithoutScrollSectionUsesBalancedDefaults() throws {
+        let store = UserConfigurationStore()
+        let encoded = try store.encodeConfigurationAsJSONC(.migratedHammerspoonDefault())
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(String(decoding: encoded, as: UTF8.self)
+                .split(separator: "\n")
+                .dropFirst(3)
+                .joined(separator: "\n").utf8)
+        ) as? [String: Any])
+        var legacy = object
+        legacy.removeValue(forKey: "scroll")
+
+        let configuration = try store.decodeConfiguration(from: JSONSerialization.data(withJSONObject: legacy))
+
+        XCTAssertEqual(configuration.scroll, .default)
     }
 
     func testBootstrapDoesNotOverwriteExistingTranslationScript() throws {
@@ -171,5 +269,152 @@ final class UserConfigurationStoreTests: XCTestCase {
 
         XCTAssertFalse(result.createdTranslationScript)
         XCTAssertEqual(try String(contentsOf: scriptURL, encoding: .utf8), "custom")
+    }
+
+    func testUpdatePreservesCommentsUnknownFieldsAndConcurrentKnownEdits() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let store = UserConfigurationStore()
+        var configuration = UserConfiguration.migratedHammerspoonDefault()
+        configuration.translation.googleApiKey = "edited-outside-settings"
+        var text = String(decoding: try store.encodeConfigurationAsJSONC(configuration), as: UTF8.self)
+        text = text.replacingOccurrences(
+            of: #"    "provider" : "google_web","#,
+            with: "    // Keep this provider explanation.\n" + #"    "provider" : "google_web","#
+        )
+        let rootClosingBrace = try XCTUnwrap(text.range(of: "\n}", options: .backwards))
+        text.replaceSubrange(
+            rootClosingBrace,
+            with: ",\n  \"thirdPartyExtension\" : { \"keep\" : true }\n}"
+        )
+        let configURL = root.appendingPathComponent("config.jsonc")
+        try text.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let updated = try store.update(at: configURL) {
+            $0.scroll.reverseVertical = true
+        }
+
+        XCTAssertTrue(updated.scroll.reverseVertical)
+        XCTAssertEqual(updated.translation.googleApiKey, "edited-outside-settings")
+        let updatedText = try String(contentsOf: configURL, encoding: .utf8)
+        XCTAssertTrue(updatedText.contains("// Keep this provider explanation."))
+        XCTAssertTrue(updatedText.contains(#""thirdPartyExtension" : { "keep" : true }"#))
+        XCTAssertTrue(updatedText.contains(#""googleApiKey" : "edited-outside-settings""#))
+        XCTAssertTrue(try store.load(from: configURL).scroll.reverseVertical)
+    }
+
+    func testUpdatePreservesArrayCommentsWhileChangingOneHotkey() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let store = UserConfigurationStore()
+        var text = String(
+            decoding: try store.encodeConfigurationAsJSONC(.migratedHammerspoonDefault()),
+            as: UTF8.self
+        )
+        text = text.replacingOccurrences(
+            of: #"      "key" : "F","#,
+            with: "      // Keep the user's hotkey note.\n" + #"      "key" : "F","#,
+            maxReplacements: 1
+        )
+        let configURL = root.appendingPathComponent("config.jsonc")
+        try text.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let updated = try store.update(at: configURL) {
+            $0.hotkeys[0].key = "G"
+            $0.hotkeys[0].modifiers = ["cmd", "shift"]
+        }
+
+        XCTAssertEqual(updated.hotkeys[0].key, "G")
+        XCTAssertEqual(updated.hotkeys[0].modifiers, ["cmd", "shift"])
+        let updatedText = try String(contentsOf: configURL, encoding: .utf8)
+        XCTAssertTrue(updatedText.contains("// Keep the user's hotkey note."))
+    }
+
+    func testUpdateInsertsScrollIntoLegacyConfiguration() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(UserConfiguration.migratedHammerspoonDefault())
+            ) as? [String: Any]
+        )
+        object.removeValue(forKey: "scroll")
+        object["futureExtension"] = ["value": 42]
+        let legacyData = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        let configURL = root.appendingPathComponent("config.jsonc")
+        try legacyData.write(to: configURL)
+
+        let updated = try UserConfigurationStore().update(at: configURL) {
+            $0.scroll.enabled = false
+            $0.scroll.applyPreset(.glide)
+        }
+
+        XCTAssertFalse(updated.scroll.enabled)
+        XCTAssertEqual(updated.scroll.preset, .glide)
+        let text = try String(contentsOf: configURL, encoding: .utf8)
+        XCTAssertTrue(text.contains(#""futureExtension" : {"#))
+        XCTAssertTrue(text.contains(#""scroll": {"#) || text.contains(#""scroll" : {"#))
+        XCTAssertEqual(try UserConfigurationStore().load(from: configURL).scroll, updated.scroll)
+    }
+
+    func testTranslationActionClassificationIncludesShippedScriptPath() {
+        XCTAssertTrue(HotkeyAction(kind: .translateSelection).isSelectedTextTranslation)
+        XCTAssertTrue(
+            HotkeyAction(
+                kind: .callInterface,
+                interfaceName: "translateSelection"
+            ).isSelectedTextTranslation
+        )
+        XCTAssertTrue(
+            HotkeyAction(
+                kind: .runScript,
+                path: "scripts/translate_selection.py",
+                function: "main",
+                input: "selectedText"
+            ).isSelectedTextTranslation
+        )
+        XCTAssertFalse(
+            HotkeyAction(
+                kind: .runScript,
+                path: "scripts/summarize_selection.py",
+                function: "main",
+                input: "selectedText"
+            ).isSelectedTextTranslation
+        )
+    }
+}
+
+private struct TestHotkeyConflict: Error {}
+
+private extension String {
+    func replacingOccurrences(
+        of target: String,
+        with replacement: String,
+        maxReplacements: Int
+    ) -> String {
+        guard maxReplacements > 0 else { return self }
+        var result = self
+        var searchStart = result.startIndex
+        var replacements = 0
+        while replacements < maxReplacements,
+              let range = result.range(of: target, range: searchStart ..< result.endIndex) {
+            let replacementOffset = result.distance(from: result.startIndex, to: range.lowerBound)
+            result.replaceSubrange(range, with: replacement)
+            searchStart = result.index(result.startIndex, offsetBy: replacementOffset + replacement.count)
+            replacements += 1
+        }
+        return result
     }
 }

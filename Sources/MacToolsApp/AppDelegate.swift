@@ -487,11 +487,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var runtime: AutomationRuntime?
     private var configurationBootstrap: UserConfigurationBootstrapResult?
     private var hotkeyController: GlobalHotkeyController?
+    private var settingsHotkeyCaptureToken: GlobalHotkeyController.CaptureToken?
     private var windowSwitcherController: WindowSwitcherController?
+    private var smoothScrollController: SmoothScrollController?
+    private var settingsWindowController: SettingsWindowController?
     private var statusItem: NSStatusItem?
     private var menuBarVisibilityMenuController: MenuBarVisibilityMenuController?
 
     static func main() {
+        #if DEBUG
+        if let optionIndex = CommandLine.arguments.firstIndex(of: "--render-settings-previews") {
+            guard CommandLine.arguments.indices.contains(optionIndex + 1) else {
+                fputs("error=--render-settings-previews requires an output directory\n", stderr)
+                return
+            }
+            _ = NSApplication.shared
+            let outputDirectory = URL(
+                fileURLWithPath: CommandLine.arguments[optionIndex + 1],
+                isDirectory: true
+            )
+            let controller = SettingsWindowController(
+                configuration: .migratedHammerspoonDefault(),
+                configURL: outputDirectory.appendingPathComponent("preview-config.jsonc"),
+                configurationStore: UserConfigurationStore(),
+                didSave: { _ in },
+                didFail: { _ in }
+            )
+            do {
+                for url in try controller.renderPreviews(to: outputDirectory) {
+                    print("preview=\(url.path)")
+                }
+                controller.close()
+            } catch {
+                fputs("error=\(error.localizedDescription)\n", stderr)
+            }
+            return
+        }
+        #endif
+
         if CommandLine.arguments.contains("--check-accessibility") {
             let status = AccessibilityPermissionClient().snapshot().accessibility
             print("accessibility=\(status == .granted ? "granted" : "missing")")
@@ -549,6 +582,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        smoothScrollController?.start()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        settingsHotkeyCaptureToken = nil
+        hotkeyController?.shutdown()
+        windowSwitcherController?.stop()
+        smoothScrollController?.shutdown()
+    }
+
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
@@ -567,6 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         visibilityItem.submenu = visibilityMenuController.menu
         menu.addItem(visibilityItem)
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Open Configuration Folder", action: #selector(openConfigurationFolder), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -596,22 +641,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startAutomation(runtime: AutomationRuntime, configuration: UserConfiguration) {
-        windowSwitcherController?.stop()
-        hotkeyController?.stop()
+        let windowSwitcherController: WindowSwitcherController
+        if let existing = self.windowSwitcherController {
+            existing.apply(configuration: configuration)
+            windowSwitcherController = existing
+        } else {
+            let controller = WindowSwitcherController(runtime: runtime, configuration: configuration)
+            controller.start()
+            self.windowSwitcherController = controller
+            windowSwitcherController = controller
+        }
 
-        let windowSwitcherController = WindowSwitcherController(runtime: runtime, configuration: configuration)
-        windowSwitcherController.start()
-        self.windowSwitcherController = windowSwitcherController
+        if let hotkeyController {
+            hotkeyController.apply(
+                configuration: configuration,
+                windowSwitcherController: windowSwitcherController
+            )
+        } else {
+            let controller = GlobalHotkeyController(
+                runtime: runtime,
+                configuration: configuration,
+                windowSwitcherController: windowSwitcherController,
+                reloadConfigurationHandler: { [weak self] in
+                    self?.reloadConfiguration()
+                }
+            )
+            controller.start()
+            hotkeyController = controller
+        }
 
-        hotkeyController = GlobalHotkeyController(
-            runtime: runtime,
-            configuration: configuration,
-            windowSwitcherController: windowSwitcherController,
-            reloadConfigurationHandler: { [weak self] in
-                self?.reloadConfiguration()
+        if let smoothScrollController {
+            smoothScrollController.apply(configuration.scroll)
+        } else {
+            let controller = SmoothScrollController(settings: configuration.scroll)
+            controller.start()
+            smoothScrollController = controller
+        }
+    }
+
+    @objc private func showSettings() {
+        do {
+            let previousConfiguration = configurationBootstrap?.configuration
+            let result = try configurationStore.bootstrap()
+            configurationBootstrap = result
+
+            if let previousConfiguration {
+                applyAutomationChange(from: previousConfiguration, to: result.configuration)
+            } else if let runtime {
+                startAutomation(runtime: runtime, configuration: result.configuration)
             }
-        )
-        hotkeyController?.start()
+
+            if let settingsWindowController {
+                settingsWindowController.present(
+                    configuration: result.configuration,
+                    configURL: result.configURL
+                )
+            } else {
+                let controller = SettingsWindowController(
+                    configuration: result.configuration,
+                    configURL: result.configURL,
+                    configurationStore: configurationStore,
+                    hotkeyRecordingDidChange: { [weak self] isRecording in
+                        self?.settingsHotkeyRecordingDidChange(isRecording)
+                    },
+                    didSave: { [weak self] configuration in
+                        self?.settingsDidSave(configuration)
+                    },
+                    didFail: { [weak self] error in
+                        self?.showStatusWindow(title: "Settings Error", body: error.localizedDescription)
+                    }
+                )
+                settingsWindowController = controller
+                controller.present(configuration: result.configuration, configURL: result.configURL)
+            }
+        } catch {
+            showStatusWindow(title: "Settings Error", body: error.localizedDescription)
+        }
     }
 
     @objc private func openConfigurationFolder() {
@@ -623,15 +728,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func reloadConfiguration() {
         do {
+            let previousConfiguration = configurationBootstrap?.configuration
             let result = try configurationStore.bootstrap()
             configurationBootstrap = result
-            if let runtime {
+
+            if let previousConfiguration {
+                applyAutomationChange(from: previousConfiguration, to: result.configuration)
+            } else if let runtime {
                 startAutomation(runtime: runtime, configuration: result.configuration)
             }
+            settingsWindowController?.refresh(
+                configuration: result.configuration,
+                configURL: result.configURL
+            )
             showStatusWindow(title: "TSMacTools", body: "Configuration reloaded from \(result.configURL.path)")
         } catch {
             showStatusWindow(title: "Reload Error", body: error.localizedDescription)
         }
+    }
+
+    private func settingsDidSave(_ configuration: UserConfiguration) {
+        guard var bootstrap = configurationBootstrap else {
+            return
+        }
+        let previousConfiguration = bootstrap.configuration
+        bootstrap.configuration = configuration
+        configurationBootstrap = bootstrap
+        applyAutomationChange(from: previousConfiguration, to: configuration)
+    }
+
+    private func settingsHotkeyRecordingDidChange(_ isRecording: Bool) {
+        if isRecording {
+            guard settingsHotkeyCaptureToken == nil else { return }
+            settingsHotkeyCaptureToken = hotkeyController?.beginHotkeyCapture()
+            return
+        }
+
+        guard let token = settingsHotkeyCaptureToken else { return }
+        settingsHotkeyCaptureToken = nil
+        _ = hotkeyController?.endHotkeyCapture(token)
+    }
+
+    private func applyAutomationChange(from previous: UserConfiguration, to configuration: UserConfiguration) {
+        guard previous != configuration, let runtime else {
+            return
+        }
+        startAutomation(runtime: runtime, configuration: configuration)
     }
 
     private func showStatusWindow(title: String, body: String) {

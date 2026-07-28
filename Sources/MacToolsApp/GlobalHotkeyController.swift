@@ -36,8 +36,35 @@ private func hotkeyEventHandler(
 
 @MainActor
 final class GlobalHotkeyController {
+    struct CaptureToken: Hashable, Sendable {
+        fileprivate let identifier: UInt64
+    }
+
+    private struct HotkeyCombination: Hashable {
+        var keyCode: UInt32
+        var modifiers: UInt32
+    }
+
+    private struct RegistrationSet {
+        var hotkeys: [EventHotKeyRef]
+        var handlers: [UInt32: HotkeyBinding]
+        var bindings: [HotkeyBinding]
+    }
+
+    private struct RegistrationFailure: Error {
+        var message: String
+    }
+
+    private enum Lifecycle {
+        case inactive
+        case active
+        case capturing(token: CaptureToken, fallback: [HotkeyBinding])
+        case shutdown
+    }
+
     private static var controllers: [UInt32: GlobalHotkeyController] = [:]
     private static var nextSignature: UInt32 = 0x54534D31
+    private static var nextCaptureIdentifier: UInt64 = 1
 
     private let runtime: AutomationRuntime
     private let configurationStore: UserConfigurationStore
@@ -45,8 +72,10 @@ final class GlobalHotkeyController {
     private weak var windowSwitcherController: WindowSwitcherController?
     private var configuration: UserConfiguration
     private var eventHandler: EventHandlerRef?
-    private var registeredHotkeys: [EventHotKeyRef?] = []
+    private var registeredHotkeys: [EventHotKeyRef] = []
+    private var registeredBindings: [HotkeyBinding] = []
     private var handlers: [UInt32: HotkeyBinding] = [:]
+    private var lifecycle = Lifecycle.inactive
 
     init(
         runtime: AutomationRuntime,
@@ -63,25 +92,85 @@ final class GlobalHotkeyController {
     }
 
     func start() {
-        stop()
+        precondition(Thread.isMainThread)
+        switch lifecycle {
+        case .capturing, .shutdown:
+            return
+        case .inactive, .active:
+            break
+        }
         installEventHandlerIfNeeded()
+        guard eventHandler != nil else { return }
+        _ = replaceRegistrations(with: configuration.hotkeys, fallingBackTo: registeredBindings)
+    }
 
-        for binding in configuration.hotkeys {
-            register(binding)
+    func apply(
+        configuration: UserConfiguration,
+        windowSwitcherController: WindowSwitcherController?
+    ) {
+        precondition(Thread.isMainThread)
+        let shouldReregisterHotkeys = self.configuration.hotkeys != configuration.hotkeys
+        self.configuration = configuration
+        self.windowSwitcherController = windowSwitcherController
+        switch lifecycle {
+        case .capturing, .shutdown:
+            return
+        case .inactive, .active:
+            break
+        }
+        if shouldReregisterHotkeys || registeredBindings != configuration.hotkeys || eventHandler == nil {
+            start()
         }
     }
 
     func stop() {
-        for hotkey in registeredHotkeys {
-            if let hotkey {
-                UnregisterEventHotKey(hotkey)
-            }
+        precondition(Thread.isMainThread)
+        unregisterActiveHotkeys()
+        if case .shutdown = lifecycle { return }
+        lifecycle = .inactive
+    }
+
+    func shutdown() {
+        // AppDelegate owns this main-actor controller for the process lifetime and
+        // calls shutdown explicitly before termination. A Swift 6 deinitializer is
+        // nonisolated, so Carbon teardown must not be deferred to deinit.
+        precondition(Thread.isMainThread)
+        unregisterActiveHotkeys()
+        lifecycle = .shutdown
+        if let eventHandler {
+            RemoveEventHandler(eventHandler)
+            self.eventHandler = nil
         }
-        for signature in handlers.keys {
-            Self.controllers[signature] = nil
+    }
+
+    @discardableResult
+    func beginHotkeyCapture() -> CaptureToken? {
+        precondition(Thread.isMainThread)
+        let fallback: [HotkeyBinding]
+        switch lifecycle {
+        case let .capturing(_, existingFallback):
+            fallback = existingFallback
+        case .shutdown:
+            return nil
+        case .inactive, .active:
+            fallback = registeredBindings
         }
-        registeredHotkeys.removeAll()
-        handlers.removeAll()
+
+        unregisterActiveHotkeys()
+        let token = CaptureToken(identifier: Self.nextCaptureIdentifier)
+        Self.nextCaptureIdentifier &+= 1
+        lifecycle = .capturing(token: token, fallback: fallback)
+        return token
+    }
+
+    @discardableResult
+    func endHotkeyCapture(_ token: CaptureToken) -> Bool {
+        finishHotkeyCapture(token)
+    }
+
+    @discardableResult
+    func cancelHotkeyCapture(_ token: CaptureToken) -> Bool {
+        finishHotkeyCapture(token)
     }
 
     private func installEventHandlerIfNeeded() {
@@ -104,39 +193,129 @@ final class GlobalHotkeyController {
         }
     }
 
-    private func register(_ binding: HotkeyBinding) {
-        guard let keyCode = keyCode(for: binding.key) else {
-            showStatusWindow(title: "Hotkey Error", body: "Unsupported key in \(binding.label): \(binding.key)")
-            return
+    private func finishHotkeyCapture(_ token: CaptureToken) -> Bool {
+        precondition(Thread.isMainThread)
+        guard case let .capturing(currentToken, fallback) = lifecycle,
+              currentToken == token else {
+            return false
+        }
+        installEventHandlerIfNeeded()
+        guard eventHandler != nil else {
+            lifecycle = .inactive
+            return false
+        }
+        return replaceRegistrations(with: configuration.hotkeys, fallingBackTo: fallback)
+    }
+
+    @discardableResult
+    private func replaceRegistrations(
+        with desiredBindings: [HotkeyBinding],
+        fallingBackTo fallbackBindings: [HotkeyBinding]
+    ) -> Bool {
+        unregisterActiveHotkeys()
+        switch makeRegistrationSet(for: desiredBindings) {
+        case let .success(registrationSet):
+            activate(registrationSet)
+            return true
+        case let .failure(desiredFailure):
+            guard fallbackBindings != desiredBindings else {
+                lifecycle = .inactive
+                showStatusWindow(title: "Hotkey Error", body: desiredFailure.message)
+                return false
+            }
+            switch makeRegistrationSet(for: fallbackBindings) {
+            case let .success(registrationSet):
+                activate(registrationSet)
+                showStatusWindow(
+                    title: "Hotkey Error",
+                    body: "\(desiredFailure.message) The previous hotkeys remain active."
+                )
+            case let .failure(fallbackFailure):
+                lifecycle = .inactive
+                showStatusWindow(
+                    title: "Hotkey Error",
+                    body: "\(desiredFailure.message) Previous hotkeys could not be restored: \(fallbackFailure.message)"
+                )
+            }
+            return false
+        }
+    }
+
+    private func makeRegistrationSet(for bindings: [HotkeyBinding]) -> Result<RegistrationSet, RegistrationFailure> {
+        var hotkeys: [EventHotKeyRef] = []
+        var stagedHandlers: [UInt32: HotkeyBinding] = [:]
+        var combinations: [HotkeyCombination: HotkeyBinding] = [:]
+
+        func fail(_ message: String) -> Result<RegistrationSet, RegistrationFailure> {
+            for hotkey in hotkeys {
+                UnregisterEventHotKey(hotkey)
+            }
+            return .failure(RegistrationFailure(message: message))
         }
 
-        let signature = Self.nextSignature
-        Self.nextSignature += 1
-        Self.controllers[signature] = self
-        handlers[signature] = binding
+        for (index, binding) in bindings.enumerated() {
+            guard !binding.modifiers.isEmpty else {
+                return fail("A global hotkey requires at least one modifier: \(binding.label).")
+            }
+            guard let keyCode = keyCode(for: binding.key) else {
+                return fail("Unsupported key in \(binding.label): \(binding.key).")
+            }
+            let modifierMask = carbonModifiers(for: binding.modifiers)
+            guard modifierMask != 0 else {
+                return fail("A global hotkey requires at least one recognized modifier: \(binding.label).")
+            }
+            let combination = HotkeyCombination(keyCode: UInt32(keyCode), modifiers: modifierMask)
+            if let existing = combinations[combination] {
+                return fail("\(binding.label) duplicates the shortcut used by \(existing.label).")
+            }
+            combinations[combination] = binding
 
-        let hotkeyID = EventHotKeyID(signature: OSType(signature), id: UInt32(handlers.count))
-        var hotkeyRef: EventHotKeyRef?
-        let status = RegisterEventHotKey(
-            UInt32(keyCode),
-            carbonModifiers(for: binding.modifiers),
-            hotkeyID,
-            GetApplicationEventTarget(),
-            0,
-            &hotkeyRef
-        )
+            let signature = Self.nextSignature
+            Self.nextSignature &+= 1
+            let hotkeyID = EventHotKeyID(signature: OSType(signature), id: UInt32(index + 1))
+            var hotkeyRef: EventHotKeyRef?
+            let status = RegisterEventHotKey(
+                UInt32(keyCode),
+                modifierMask,
+                hotkeyID,
+                GetApplicationEventTarget(),
+                0,
+                &hotkeyRef
+            )
+            guard status == noErr, let hotkeyRef else {
+                return fail("Unable to register \(binding.label): \(status).")
+            }
+            hotkeys.append(hotkeyRef)
+            stagedHandlers[signature] = binding
+        }
+        return .success(RegistrationSet(hotkeys: hotkeys, handlers: stagedHandlers, bindings: bindings))
+    }
 
-        if status == noErr {
-            registeredHotkeys.append(hotkeyRef)
-        } else {
-            handlers[signature] = nil
+    private func activate(_ registrationSet: RegistrationSet) {
+        registeredHotkeys = registrationSet.hotkeys
+        registeredBindings = registrationSet.bindings
+        handlers = registrationSet.handlers
+        for signature in handlers.keys {
+            Self.controllers[signature] = self
+        }
+        lifecycle = .active
+    }
+
+    private func unregisterActiveHotkeys() {
+        for signature in handlers.keys {
             Self.controllers[signature] = nil
-            showStatusWindow(title: "Hotkey Error", body: "Unable to register \(binding.label): \(status)")
         }
+        handlers.removeAll(keepingCapacity: true)
+        for hotkey in registeredHotkeys {
+            UnregisterEventHotKey(hotkey)
+        }
+        registeredHotkeys.removeAll(keepingCapacity: true)
+        registeredBindings.removeAll(keepingCapacity: true)
     }
 
     static func handleHotkey(signature: OSType) {
         guard let controller = controllers[signature],
+              case .active = controller.lifecycle,
               let binding = controller.handlers[signature] else {
             return
         }
@@ -145,6 +324,13 @@ final class GlobalHotkeyController {
     }
 
     private func handle(_ binding: HotkeyBinding) {
+        guard configuration.translation.enabled || !binding.action.isSelectedTextTranslation else {
+            showStatusWindow(
+                title: "Translation Disabled",
+                body: "Enable selected-text translation in Settings before using this shortcut."
+            )
+            return
+        }
         let started = CFAbsoluteTimeGetCurrent()
         logHotkey("begin \(binding.label) action=\(binding.action.kind.rawValue)")
         defer {
@@ -333,6 +519,10 @@ final class GlobalHotkeyController {
     }
 
     private func translateSelection() {
+        guard configuration.translation.enabled else {
+            showStatusWindow(title: "Translation Disabled", body: "Enable selected-text translation in Settings before using this shortcut.")
+            return
+        }
         copySelectionToPasteboard { [weak self] selectedText in
             guard let self else {
                 return

@@ -1,3 +1,6 @@
 [submodule "references/hammerspoon"]
 	path = references/hammerspoon
 	url = https://github.com/Hammerspoon/hammerspoon.git
+[submodule "references/Mos"]
+	path = references/Mos
+	url = https://github.com/Caldis/Mos.git

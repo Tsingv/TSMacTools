@@ -179,6 +179,24 @@ final class WindowSwitcherController {
         }
     }
 
+    func apply(configuration: UserConfiguration) {
+        precondition(Thread.isMainThread)
+        let wasEnabled = self.configuration.windowSwitcher.enabled
+        let isEnabled = configuration.windowSwitcher.enabled
+        self.configuration = configuration
+
+        switch (wasEnabled, isEnabled) {
+        case (false, true):
+            start()
+        case (true, false):
+            stop()
+        case (true, true) where eventTap == nil:
+            start()
+        default:
+            break
+        }
+    }
+
     func stop() {
         hideOverlay()
         removeWorkspaceObservers()
@@ -853,7 +871,7 @@ final class WindowSwitcherController {
         container.addSubview(rowStack)
 
         NSLayoutConstraint.activate([
-            container.widthAnchor.constraint(equalToConstant: CGFloat(configuration.windowSwitcher.width - 28)),
+            container.widthAnchor.constraint(equalToConstant: CGFloat(max(320, configuration.windowSwitcher.width) - 28)),
             container.heightAnchor.constraint(equalToConstant: 48),
             iconView.widthAnchor.constraint(equalToConstant: 30),
             iconView.heightAnchor.constraint(equalToConstant: 30),
@@ -885,16 +903,39 @@ final class WindowSwitcherController {
     }
 
     private func overlayFrame() -> NSRect {
-        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let width = CGFloat(configuration.windowSwitcher.width)
+        let screenFrame = overlayScreen()?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let width = CGFloat(max(320, configuration.windowSwitcher.width))
         let rows = max(1, min(configuration.windowSwitcher.maxVisibleRows, max(choices.count, 1)))
-        let height = min(CGFloat(configuration.windowSwitcher.height), CGFloat(rows * 54 + 28))
+        let height = min(CGFloat(max(120, configuration.windowSwitcher.height)), CGFloat(rows * 54 + 28))
         return NSRect(
             x: screenFrame.midX - width / 2,
             y: screenFrame.midY - height / 2,
             width: width,
             height: height
         )
+    }
+
+    private func overlayScreen() -> NSScreen? {
+        let fallback = NSScreen.main ?? NSScreen.screens.first
+        guard configuration.windowSwitcher.followFocusedScreen,
+              choices.indices.contains(selectedIndex),
+              let position = axPosition(for: choices[selectedIndex].axWindow),
+              let size = axSize(for: choices[selectedIndex].axWindow) else {
+            return fallback
+        }
+
+        let windowBounds = CGRect(origin: position, size: size)
+        let ranked = NSScreen.screens.compactMap { screen -> (NSScreen, CGFloat)? in
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return nil
+            }
+            let displayBounds = CGDisplayBounds(CGDirectDisplayID(number.uint32Value))
+            let intersection = displayBounds.intersection(windowBounds)
+            guard !intersection.isNull else { return (screen, 0) }
+            return (screen, intersection.width * intersection.height)
+        }
+        guard let best = ranked.max(by: { $0.1 < $1.1 }), best.1 > 0 else { return fallback }
+        return best.0
     }
 
     private func hideOverlay() {

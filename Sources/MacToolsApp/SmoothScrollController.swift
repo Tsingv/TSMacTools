@@ -1,0 +1,3 @@
+import MacToolsMacOS
+
+typealias SmoothScrollController = MacToolsMacOS.SmoothScrollController

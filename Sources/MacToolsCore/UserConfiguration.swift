@@ -5,6 +5,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
     public var scripting: ScriptingSettings
     public var hotkeys: [HotkeyBinding]
     public var windowSwitcher: WindowSwitcherSettings
+    public var scroll: ScrollSettings
     public var translation: TranslationSettings
 
     public init(
@@ -12,12 +13,14 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         scripting: ScriptingSettings,
         hotkeys: [HotkeyBinding],
         windowSwitcher: WindowSwitcherSettings,
+        scroll: ScrollSettings = .default,
         translation: TranslationSettings
     ) {
         self.application = application
         self.scripting = scripting
         self.hotkeys = hotkeys
         self.windowSwitcher = windowSwitcher
+        self.scroll = scroll
         self.translation = translation
     }
 
@@ -26,6 +29,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         case scripting
         case hotkeys
         case windowSwitcher
+        case scroll
         case translation
     }
 
@@ -36,6 +40,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
             ?? ScriptingSettings(pythonPath: "/usr/bin/python3")
         self.hotkeys = try container.decode([HotkeyBinding].self, forKey: .hotkeys)
         self.windowSwitcher = try container.decode(WindowSwitcherSettings.self, forKey: .windowSwitcher)
+        self.scroll = try container.decodeIfPresent(ScrollSettings.self, forKey: .scroll) ?? .default
         self.translation = try container.decode(TranslationSettings.self, forKey: .translation)
     }
 }
@@ -76,6 +81,41 @@ public struct HotkeyBinding: Equatable, Codable, Sendable {
         self.key = key
         self.action = action
     }
+
+    public var shortcut: HotkeyShortcut {
+        HotkeyShortcut(modifiers: modifiers, key: key)
+    }
+}
+
+public struct HotkeyShortcut: Hashable, Sendable {
+    public let modifiers: [String]
+    public let key: String
+
+    public init(modifiers: [String], key: String) {
+        self.modifiers = Array(Set(modifiers.compactMap(Self.canonicalModifier))).sorted()
+        self.key = key.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    }
+
+    private static func canonicalModifier(_ modifier: String) -> String? {
+        switch modifier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "command", "cmd": "cmd"
+        case "control", "ctrl": "ctrl"
+        case "option", "alt": "alt"
+        case "shift": "shift"
+        default: nil
+        }
+    }
+}
+
+public extension UserConfiguration {
+    func conflictingHotkey(
+        for shortcut: HotkeyShortcut,
+        excluding excludedIndex: Int? = nil
+    ) -> HotkeyBinding? {
+        hotkeys.enumerated().first { index, binding in
+            index != excludedIndex && binding.shortcut == shortcut
+        }?.element
+    }
 }
 
 public struct HotkeyAction: Equatable, Codable, Sendable {
@@ -114,6 +154,22 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
         self.interfaceName = interfaceName
         self.function = function
         self.input = input
+    }
+
+    /// Covers both the typed interface and the shipped Python entrypoint so the Settings toggle
+    /// has one meaning even while translation remains script-backed.
+    public var isSelectedTextTranslation: Bool {
+        switch kind {
+        case .translateSelection:
+            true
+        case .callInterface:
+            interfaceName == "translateSelection"
+        case .runScript:
+            input == "selectedText"
+                && path.map { URL(fileURLWithPath: $0).lastPathComponent == "translate_selection.py" } == true
+        default:
+            false
+        }
     }
 }
 
@@ -401,6 +457,7 @@ public extension UserConfiguration {
                 maxVisibleRows: 9,
                 debug: false
             ),
+            scroll: .default,
             translation: TranslationSettings(
                 enabled: true,
                 provider: "google_web",

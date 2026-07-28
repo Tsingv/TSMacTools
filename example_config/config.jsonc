@@ -18,7 +18,8 @@
     "pythonPath": "/Users/clearain/.venv/bin/python"
   },
 
-  // Global hotkeys. runScript loads path, injects config/input_text/nativewindow/window, then calls function.
+  // Global hotkeys. Each binding requires at least one modifier. runScript loads path,
+  // injects config/input_text/nativewindow/window, then calls function.
   "hotkeys": [
     {
       "action": {
@@ -178,16 +179,37 @@
     }
   ],
 
+  // Mouse-wheel smoothing. Trackpad/Magic Mouse gestures and already-continuous remote-desktop
+  // events bypass this path by default; Logitech Options wheel metadata is treated as mouse input.
+  // A restarted display link passes input through until that run delivers a real frame. macOS 26
+  // routes marked frames by pointer location; clicking a mouse button cancels the remaining tail.
+  "scroll": {
+    "enabled": true,
+    "preset": "balanced", // "precise", "balanced", "fluid", "glide", or "custom".
+    "smoothVertical": true,
+    "smoothHorizontal": true,
+    "reverseVertical": false,
+    "reverseHorizontal": false,
+    "excludeTrackpad": true,
+    "tuning": { // Used directly by "custom"; choosing another preset replaces these values in Settings.
+      "step": 24.0, // Normalized wheel step, clamped to 1...120.
+      "speed": 1.55, // Output multiplier, clamped to 0.20...6.
+      "duration": 0.36, // Smoothing tail in seconds, clamped to 0.08...1.50.
+      "acceleration": 0.28, // Burst acceleration, clamped to 0...1.
+      "deadZone": 0.10 // Stop threshold, clamped to 0.01...2.
+    }
+  },
+
   // Native Command+Tab style window switcher settings.
   "windowSwitcher": {
-    "commandTabBehavior": "most-recent-window",
+    "commandTabBehavior": "most-recent-window", // Reserved current strategy identifier; alternate strategies are not implemented yet.
     "debug": true,
     "enabled": true,
-    "followFocusedScreen": true,
-    "height": 420,
-    "maxVisibleRows": 9,
-    "sameApplicationBehavior": "cycle-same-application-windows",
-    "width": 760
+    "followFocusedScreen": true, // Centers the overlay on the selected Accessibility window's display.
+    "height": 420, // Settings accepts 120...1200; runtime also guards malformed external values.
+    "maxVisibleRows": 9, // Settings accepts 1...50.
+    "sameApplicationBehavior": "cycle-same-application-windows", // Reserved current strategy identifier.
+    "width": 760 // Settings accepts 320...1600; runtime also guards malformed external values.
   },
 
   // Translation settings consumed by scripts/translate_selection.py.
@@ -195,7 +217,7 @@
     "provider": "google_web", // "google_web" uses the unofficial web endpoint; "google" uses Cloud Translation; "llm" uses the chat-completions endpoint below.
     "apiKey": "", // API key for the chat-completions-compatible LLM endpoint. Leave blank in examples.
     "copyKeystrokeDelay": 0.18, // Delay after Command+C before reading selected text from the pasteboard.
-    "enabled": true, // Reserved switch for translation-related features.
+    "enabled": true, // Disables the built-in selected-text translation action when false.
     "googleApiKey": "", // Google Cloud Translation API key. Leave blank in examples.
     "googleSourceLanguage": "auto", // "auto" lets Google detect the source language.
     "googleTargetLanguage": "zh-CN", // Target used for non-Chinese selected text.
