@@ -587,8 +587,7 @@ final class SmoothScrollControllerTests: XCTestCase {
         let done = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
             let pointer = UnsafeRawPointer(bitPattern: address)!
-            let controller = Unmanaged<SmoothScrollController>.fromOpaque(pointer).takeRetainedValue()
-            withExtendedLifetime(controller) {}
+            Unmanaged<SmoothScrollController>.fromOpaque(pointer).release()
             done.signal()
         }
         XCTAssertEqual(done.wait(timeout: .now() + 2), .success)
@@ -607,6 +606,43 @@ final class SmoothScrollControllerTests: XCTestCase {
             done.signal()
         }
         XCTAssertEqual(done.wait(timeout: .now() + 2), .success)
+    }
+
+    func testLiveDisplayStopDoesNotWaitForControllerFrameWork() throws {
+        let frameEntered = DispatchSemaphore(value: 0)
+        let releaseFrame = DispatchSemaphore(value: 0)
+        let stopFinished = DispatchSemaphore(value: 0)
+        let environment = SmoothScrollEnvironment.live
+        let driver = environment.makeFrameDriver({ _ in
+            frameEntered.signal()
+            releaseFrame.wait()
+        }, {})
+        defer {
+            releaseFrame.signal()
+            driver.invalidate()
+        }
+        guard driver.prepare(), driver.start() else {
+            throw XCTSkip("No active CoreVideo display is available")
+        }
+        guard frameEntered.wait(timeout: .now() + 2) == .success else {
+            throw XCTSkip("The active CoreVideo display did not deliver a frame")
+        }
+
+        DispatchQueue.global().async {
+            driver.stop()
+            stopFinished.signal()
+        }
+        let stopResult = stopFinished.wait(timeout: .now() + 1)
+        releaseFrame.signal()
+        if stopResult != .success {
+            _ = stopFinished.wait(timeout: .now() + 2)
+        }
+
+        XCTAssertEqual(
+            stopResult,
+            .success,
+            "CVDisplayLinkStop must not wait for controller work that can be blocked by its operation lock"
+        )
     }
 
     func testBackgroundDeinitCancelsHealthAndIdleTasks() throws {
@@ -631,8 +667,7 @@ final class SmoothScrollControllerTests: XCTestCase {
         let done = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
             let pointer = UnsafeRawPointer(bitPattern: address)!
-            let controller = Unmanaged<SmoothScrollController>.fromOpaque(pointer).takeRetainedValue()
-            withExtendedLifetime(controller) {}
+            Unmanaged<SmoothScrollController>.fromOpaque(pointer).release()
             done.signal()
         }
         XCTAssertEqual(done.wait(timeout: .now() + 2), .success)

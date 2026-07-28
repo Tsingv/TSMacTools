@@ -1166,10 +1166,17 @@ private final class ScrollDisplayDriver: ScrollFrameDriving, @unchecked Sendable
     private let unavailableHandler: @Sendable () -> Void
     private let scheduler: any SmoothScrollScheduling
     private let now: @Sendable () -> TimeInterval
+    private let frameQueue = DispatchQueue(
+        label: "local.clearain.MacTools.smooth-scroll.display-frames",
+        qos: .userInteractive
+    )
     private let lock = NSLock()
     private var displayLink: CVDisplayLink?
     private var running = false
     private var deliveredFrame = false
+    private var runGeneration: UInt = 0
+    private var pendingFrame: (timestamp: TimeInterval, generation: UInt)?
+    private var frameDeliveryScheduled = false
     private var lastCallbackTime: TimeInterval = 0
     private var healthTask: (any SmoothScrollScheduledTask)?
     private var callbackToken: UInt?
@@ -1244,9 +1251,12 @@ private final class ScrollDisplayDriver: ScrollFrameDriving, @unchecked Sendable
             guard !invalidated, let displayLink, let callbackToken else { return (false, nil, nil) }
             if running { return (true, displayLink, callbackToken) }
             running = true
+            runGeneration &+= 1
+            if runGeneration == 0 { runGeneration = 1 }
             // Readiness belongs to this particular CVDisplayLink run. A callback delivered by an
             // earlier run cannot prove that a restarted link will deliver synthetic scroll frames.
             deliveredFrame = false
+            pendingFrame = nil
             lastCallbackTime = now()
             return (false, displayLink, callbackToken)
         }
@@ -1257,9 +1267,13 @@ private final class ScrollDisplayDriver: ScrollFrameDriving, @unchecked Sendable
         let isCurrent = lock.withLock { () -> Bool in
             guard !invalidated, callbackToken == token else {
                 running = false
+                pendingFrame = nil
                 return false
             }
-            if result != kCVReturnSuccess { running = false }
+            if result != kCVReturnSuccess {
+                running = false
+                pendingFrame = nil
+            }
             return true
         }
         guard isCurrent else {
@@ -1278,6 +1292,7 @@ private final class ScrollDisplayDriver: ScrollFrameDriving, @unchecked Sendable
         let resources = lock.withLock { () -> (CVDisplayLink?, (any SmoothScrollScheduledTask)?) in
             running = false
             deliveredFrame = false
+            pendingFrame = nil
             let task = healthTask
             healthTask = nil
             return (displayLink, task)
@@ -1309,6 +1324,7 @@ private final class ScrollDisplayDriver: ScrollFrameDriving, @unchecked Sendable
             invalidated = true
             running = false
             deliveredFrame = false
+            pendingFrame = nil
             let resources = (displayLink, callbackToken, healthTask)
             displayLink = nil
             callbackToken = nil
@@ -1323,14 +1339,44 @@ private final class ScrollDisplayDriver: ScrollFrameDriving, @unchecked Sendable
 
     private func didRenderFrame() {
         let timestamp = now()
-        let shouldRender = lock.withLock { () -> Bool in
+        let shouldScheduleDelivery = lock.withLock { () -> Bool in
             guard running, !invalidated else { return false }
             lastCallbackTime = timestamp
             deliveredFrame = true
+            pendingFrame = (timestamp, runGeneration)
+            guard !frameDeliveryScheduled else { return false }
+            frameDeliveryScheduled = true
             return true
         }
-        guard shouldRender else { return }
-        frameHandler(timestamp)
+        guard shouldScheduleDelivery else { return }
+
+        // CoreVideo may synchronously wait for its output callback during CVDisplayLinkStop().
+        // Never enter controller code from that callback: controller teardown and mouse-down
+        // cancellation can hold their operation lock while stopping the display link. Delivering
+        // on this serial queue breaks that lock cycle and coalesces callbacks if controller work is
+        // briefly delayed.
+        frameQueue.async { [weak self] in
+            self?.drainPendingFrames()
+        }
+    }
+
+    private func drainPendingFrames() {
+        while true {
+            let timestamp: TimeInterval? = lock.withLock {
+                guard !invalidated,
+                      running,
+                      let pendingFrame,
+                      pendingFrame.generation == runGeneration else {
+                    pendingFrame = nil
+                    frameDeliveryScheduled = false
+                    return nil
+                }
+                self.pendingFrame = nil
+                return pendingFrame.timestamp
+            }
+            guard let timestamp else { return }
+            frameHandler(timestamp)
+        }
     }
 
     private func detachDisplayLink() {
