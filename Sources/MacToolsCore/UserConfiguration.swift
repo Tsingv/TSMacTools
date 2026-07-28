@@ -73,17 +73,54 @@ public struct HotkeyBinding: Equatable, Codable, Sendable {
     public var id: String?
     public var modifiers: [String]
     public var key: String
+    /// Zero-based CG mouse button number. Buttons 3 and 4 are commonly the two side buttons.
+    /// When present, this replaces the keyboard key while retaining `modifiers` as part of the
+    /// mouse trigger, allowing chords such as Command + Mouse 6.
+    public var mouseButton: Int?
     public var action: HotkeyAction
 
-    public init(id: String? = nil, modifiers: [String], key: String, action: HotkeyAction) {
+    public init(
+        id: String? = nil,
+        modifiers: [String] = [],
+        key: String = "",
+        mouseButton: Int? = nil,
+        action: HotkeyAction
+    ) {
         self.id = id
         self.modifiers = modifiers
         self.key = key
+        self.mouseButton = mouseButton
         self.action = action
     }
 
     public var shortcut: HotkeyShortcut {
         HotkeyShortcut(modifiers: modifiers, key: key)
+    }
+
+    public var trigger: HotkeyTrigger {
+        if let mouseButton {
+            return .mouseButton(mouseButton, modifiers: modifiers)
+        }
+        return .keyboard(shortcut)
+    }
+}
+
+public enum HotkeyTrigger: Hashable, Sendable {
+    case keyboard(HotkeyShortcut)
+    case mouse(HotkeyMouseShortcut)
+
+    public static func mouseButton(_ button: Int, modifiers: [String] = []) -> HotkeyTrigger {
+        .mouse(HotkeyMouseShortcut(button: button, modifiers: modifiers))
+    }
+}
+
+public struct HotkeyMouseShortcut: Hashable, Sendable {
+    public let button: Int
+    public let modifiers: [String]
+
+    public init(button: Int, modifiers: [String] = []) {
+        self.button = button
+        self.modifiers = HotkeyShortcut(modifiers: modifiers, key: "").modifiers
     }
 }
 
@@ -107,19 +144,147 @@ public struct HotkeyShortcut: Hashable, Sendable {
     }
 }
 
+/// Stable configuration representation for macOS virtual key codes. Known keys use readable
+/// names while any key-down code outside the table remains representable as `KeyCode:<number>`.
+/// Recording and execution share this type so adding a key never requires two independent
+/// allowlists.
+public struct HotkeyKey: Hashable, Sendable {
+    public let code: UInt16
+
+    public init(code: UInt16) {
+        self.code = code
+    }
+
+    public init?(configurationName: String) {
+        let trimmed = configurationName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let normalized = trimmed.uppercased()
+        if normalized.hasPrefix("KEYCODE:"),
+           let separator = trimmed.firstIndex(of: ":"),
+           let rawCode = UInt16(trimmed[trimmed.index(after: separator)...]) {
+            self.code = rawCode
+            return
+        }
+        guard let code = Self.codesByName[normalized] else { return nil }
+        self.code = code
+    }
+
+    public var configurationName: String {
+        Self.namesByCode[code] ?? "KeyCode:\(code)"
+    }
+
+    public var isModifierKey: Bool {
+        Self.modifierKeyCodes.contains(code)
+    }
+
+    public static var allKnownKeys: [HotkeyKey] {
+        definitions.map { HotkeyKey(code: $0.0) }
+    }
+
+    private static let modifierKeyCodes: Set<UInt16> = [
+        0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F
+    ]
+
+    private static let definitions: [(UInt16, String)] = [
+        // ANSI letters and punctuation.
+        (0x00, "A"), (0x01, "S"), (0x02, "D"), (0x03, "F"),
+        (0x04, "H"), (0x05, "G"), (0x06, "Z"), (0x07, "X"),
+        (0x08, "C"), (0x09, "V"), (0x0B, "B"), (0x0C, "Q"),
+        (0x0D, "W"), (0x0E, "E"), (0x0F, "R"), (0x10, "Y"),
+        (0x11, "T"), (0x1F, "O"), (0x20, "U"), (0x22, "I"),
+        (0x23, "P"), (0x25, "L"), (0x26, "J"), (0x28, "K"),
+        (0x2D, "N"), (0x2E, "M"),
+        (0x0A, "ISOSection"), (0x18, "="), (0x1B, "-"),
+        (0x1E, "]"), (0x21, "["), (0x27, "'"), (0x29, ";"),
+        (0x2A, "\\"), (0x2B, ","), (0x2C, "/"), (0x2F, "."),
+        (0x32, "`"),
+
+        // Number row.
+        (0x12, "1"), (0x13, "2"), (0x14, "3"), (0x15, "4"),
+        (0x16, "6"), (0x17, "5"), (0x19, "9"), (0x1A, "7"),
+        (0x1C, "8"), (0x1D, "0"),
+
+        // Editing, modifiers and system keyboard keys.
+        (0x24, "Return"), (0x30, "Tab"), (0x31, "Space"),
+        (0x33, "Delete"), (0x35, "Escape"), (0x36, "RightCommand"),
+        (0x37, "Command"), (0x38, "Shift"), (0x39, "CapsLock"),
+        (0x3A, "Option"), (0x3B, "Control"), (0x3C, "RightShift"),
+        (0x3D, "RightOption"), (0x3E, "RightControl"), (0x3F, "Function"),
+        (0x48, "VolumeUp"), (0x49, "VolumeDown"), (0x4A, "Mute"),
+
+        // Keypad.
+        (0x41, "KeypadDecimal"), (0x43, "KeypadMultiply"),
+        (0x45, "KeypadPlus"), (0x47, "KeypadClear"),
+        (0x4B, "KeypadDivide"), (0x4C, "KeypadEnter"),
+        (0x4E, "KeypadMinus"), (0x51, "KeypadEquals"),
+        (0x52, "Keypad0"), (0x53, "Keypad1"), (0x54, "Keypad2"),
+        (0x55, "Keypad3"), (0x56, "Keypad4"), (0x57, "Keypad5"),
+        (0x58, "Keypad6"), (0x59, "Keypad7"), (0x5B, "Keypad8"),
+        (0x5C, "Keypad9"),
+
+        // Function keys.
+        (0x7A, "F1"), (0x78, "F2"), (0x63, "F3"), (0x76, "F4"),
+        (0x60, "F5"), (0x61, "F6"), (0x62, "F7"), (0x64, "F8"),
+        (0x65, "F9"), (0x6D, "F10"), (0x67, "F11"), (0x6F, "F12"),
+        (0x69, "F13"), (0x6B, "F14"), (0x71, "F15"), (0x6A, "F16"),
+        (0x40, "F17"), (0x4F, "F18"), (0x50, "F19"), (0x5A, "F20"),
+        (0x6E, "ContextualMenu"),
+
+        // Navigation.
+        (0x72, "Help"), (0x73, "Home"), (0x74, "PageUp"),
+        (0x75, "ForwardDelete"), (0x77, "End"), (0x79, "PageDown"),
+        (0x7B, "Left"), (0x7C, "Right"), (0x7D, "Down"), (0x7E, "Up"),
+
+        // JIS-specific keys.
+        (0x5D, "JISYen"), (0x5E, "JISUnderscore"),
+        (0x5F, "JISKeypadComma"), (0x66, "JISEisu"), (0x68, "JISKana")
+    ]
+
+    private static let namesByCode: [UInt16: String] = {
+        var result: [UInt16: String] = [:]
+        for (code, name) in definitions { result[code] = name }
+        return result
+    }()
+
+    private static let codesByName: [String: UInt16] = {
+        var result: [String: UInt16] = [:]
+        for (code, name) in definitions { result[name.uppercased()] = code }
+        let aliases: [String: String] = [
+            "ENTER": "RETURN", "ESC": "ESCAPE", "BACKSPACE": "DELETE",
+            "UPARROW": "UP", "DOWNARROW": "DOWN",
+            "LEFTARROW": "LEFT", "RIGHTARROW": "RIGHT",
+            "↑": "UP", "↓": "DOWN", "←": "LEFT", "→": "RIGHT",
+            "LEFTBRACKET": "[", "RIGHTBRACKET": "]"
+        ]
+        for (alias, canonical) in aliases {
+            result[alias] = result[canonical]
+        }
+        return result
+    }()
+}
+
 public extension UserConfiguration {
     func conflictingHotkey(
         for shortcut: HotkeyShortcut,
         excluding excludedIndex: Int? = nil
     ) -> HotkeyBinding? {
         hotkeys.enumerated().first { index, binding in
-            index != excludedIndex && binding.shortcut == shortcut
+            index != excludedIndex && binding.mouseButton == nil && binding.shortcut == shortcut
+        }?.element
+    }
+
+    func conflictingHotkey(
+        for trigger: HotkeyTrigger,
+        excluding excludedIndex: Int? = nil
+    ) -> HotkeyBinding? {
+        hotkeys.enumerated().first { index, binding in
+            index != excludedIndex && binding.trigger == trigger
         }?.element
     }
 }
 
 public struct HotkeyAction: Equatable, Codable, Sendable {
-    public enum Kind: String, Codable, Sendable {
+    public enum Kind: String, Codable, CaseIterable, Sendable {
         case focusApplication
         case showFocusedWindowInfo
         case translateSelection
@@ -128,6 +293,7 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
         case reloadConfiguration
         case runScript
         case callInterface
+        case simulateKeystroke
     }
 
     public var kind: Kind
@@ -137,6 +303,8 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
     public var interfaceName: String?
     public var function: String?
     public var input: String?
+    public var modifiers: [String]?
+    public var key: String?
 
     public init(
         kind: Kind,
@@ -145,7 +313,9 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
         nativeWindowID: String? = nil,
         interfaceName: String? = nil,
         function: String? = nil,
-        input: String? = nil
+        input: String? = nil,
+        modifiers: [String]? = nil,
+        key: String? = nil
     ) {
         self.kind = kind
         self.path = path
@@ -154,6 +324,8 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
         self.interfaceName = interfaceName
         self.function = function
         self.input = input
+        self.modifiers = modifiers
+        self.key = key
     }
 
     /// Covers both the typed interface and the shipped Python entrypoint so the Settings toggle
@@ -170,6 +342,31 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
         default:
             false
         }
+    }
+
+    /// Most synthetic shortcuts release the primary key with no modifiers, matching a complete
+    /// user gesture and allowing system shortcuts such as Control+Down to finish. Command+Tab is
+    /// the exception: macOS requires Command on Tab's key-up to keep the app switcher active.
+    public var preservesModifiersOnKeyUp: Bool {
+        guard kind == .simulateKeystroke,
+              key?.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare("Tab") == .orderedSame else {
+            return false
+        }
+        return HotkeyShortcut(modifiers: modifiers ?? [], key: "Tab").modifiers.contains("cmd")
+    }
+
+    /// Returns non-user-facing flags that a physical event for this key would carry. Keep this as
+    /// a key-semantics table rather than special-casing actions in the event executor: other keys
+    /// can add their intrinsic flags here as support expands.
+    public var implicitCGEventModifiers: [String] {
+        guard kind == .simulateKeystroke,
+              let normalizedKey = key?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() else {
+            return []
+        }
+        // Real arrow events carry secondary Function even though users see only the arrow key.
+        return ["UP", "DOWN", "LEFT", "RIGHT", "↑", "↓", "←", "→"].contains(normalizedKey)
+            ? ["fn"]
+            : []
     }
 }
 

@@ -34,20 +34,127 @@ private func hotkeyEventHandler(
     return noErr
 }
 
+private func mouseHotkeyEventHandler(
+    proxy: CGEventTapProxy,
+    type: CGEventType,
+    event: CGEvent,
+    userInfo: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    guard let userInfo else { return Unmanaged.passUnretained(event) }
+    let tap = Unmanaged<MouseHotkeyTap>.fromOpaque(userInfo).takeUnretainedValue()
+    return tap.handle(type: type, event: event) ? nil : Unmanaged.passUnretained(event)
+}
+
+private func hotkeyModifiers(from flags: CGEventFlags) -> [String] {
+    var modifiers: [String] = []
+    if flags.contains(.maskControl) { modifiers.append("ctrl") }
+    if flags.contains(.maskAlternate) { modifiers.append("alt") }
+    if flags.contains(.maskShift) { modifiers.append("shift") }
+    if flags.contains(.maskCommand) { modifiers.append("cmd") }
+    return modifiers
+}
+
+private final class MouseHotkeyTap {
+    private var tap: CFMachPort?
+    private var source: CFRunLoopSource?
+    private var triggers = Set<HotkeyMouseShortcut>()
+    var onTrigger: ((HotkeyMouseShortcut) -> Void)?
+
+    func apply(triggers: Set<HotkeyMouseShortcut>) -> Bool {
+        self.triggers = triggers
+        guard !triggers.isEmpty else {
+            if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+            return true
+        }
+        if let tap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            if CFMachPortIsValid(tap), CGEvent.tapIsEnabled(tap: tap) {
+                return true
+            }
+            releaseTap()
+        }
+        if tap == nil {
+            let mask = CGEventMask(1) << CGEventType.otherMouseDown.rawValue
+            let userInfo = Unmanaged.passUnretained(self).toOpaque()
+            // Prefer the session stream used by the app's other event taps and by the
+            // Hammerspoon behavior reference. Keep HID as a fallback for unusual hosts.
+            let createdTap = CGEvent.tapCreate(
+                tap: .cgSessionEventTap,
+                place: .headInsertEventTap,
+                options: .defaultTap,
+                eventsOfInterest: mask,
+                callback: mouseHotkeyEventHandler,
+                userInfo: userInfo
+            ) ?? CGEvent.tapCreate(
+                tap: .cghidEventTap,
+                place: .headInsertEventTap,
+                options: .defaultTap,
+                eventsOfInterest: mask,
+                callback: mouseHotkeyEventHandler,
+                userInfo: userInfo
+            )
+            guard let createdTap,
+                  let createdSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, createdTap, 0) else {
+                return false
+            }
+            tap = createdTap
+            source = createdSource
+            CFRunLoopAddSource(CFRunLoopGetMain(), createdSource, .commonModes)
+        }
+        guard let tap else { return false }
+        CGEvent.tapEnable(tap: tap, enable: true)
+        return CFMachPortIsValid(tap) && CGEvent.tapIsEnabled(tap: tap)
+    }
+
+    func handle(type: CGEventType, event: CGEvent) -> Bool {
+        if type == .tapDisabledByTimeout {
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return false
+        }
+        if type == .tapDisabledByUserInput { return false }
+        guard type == .otherMouseDown else { return false }
+        let button = event.getIntegerValueField(.mouseEventButtonNumber)
+        let trigger = HotkeyMouseShortcut(
+            button: Int(button),
+            modifiers: hotkeyModifiers(from: event.flags)
+        )
+        guard triggers.contains(trigger) else { return false }
+        #if DEBUG
+        NSLog(
+            "[hotkey] mouse trigger received button=%lld modifiers=%@",
+            button + 1,
+            trigger.modifiers.joined(separator: "+")
+        )
+        #endif
+        onTrigger?(trigger)
+        return true
+    }
+
+    func invalidate() {
+        triggers.removeAll()
+        releaseTap()
+        onTrigger = nil
+    }
+
+    private func releaseTap() {
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+        if let tap { CFMachPortInvalidate(tap) }
+        source = nil
+        tap = nil
+    }
+}
+
 @MainActor
 final class GlobalHotkeyController {
     struct CaptureToken: Hashable, Sendable {
         fileprivate let identifier: UInt64
     }
 
-    private struct HotkeyCombination: Hashable {
-        var keyCode: UInt32
-        var modifiers: UInt32
-    }
-
     private struct RegistrationSet {
         var hotkeys: [EventHotKeyRef]
         var handlers: [UInt32: HotkeyBinding]
+        var mouseHandlers: [HotkeyMouseShortcut: HotkeyBinding]
         var bindings: [HotkeyBinding]
     }
 
@@ -75,6 +182,8 @@ final class GlobalHotkeyController {
     private var registeredHotkeys: [EventHotKeyRef] = []
     private var registeredBindings: [HotkeyBinding] = []
     private var handlers: [UInt32: HotkeyBinding] = [:]
+    private var mouseHandlers: [HotkeyMouseShortcut: HotkeyBinding] = [:]
+    private let mouseHotkeyTap = MouseHotkeyTap()
     private var lifecycle = Lifecycle.inactive
 
     init(
@@ -89,6 +198,13 @@ final class GlobalHotkeyController {
         self.configurationStore = configurationStore
         self.windowSwitcherController = windowSwitcherController
         self.reloadConfigurationHandler = reloadConfigurationHandler
+        mouseHotkeyTap.onTrigger = { [weak self] trigger in
+            DispatchQueue.main.async {
+                guard let self, case .active = self.lifecycle,
+                      let binding = self.mouseHandlers[trigger] else { return }
+                self.handle(binding)
+            }
+        }
     }
 
     func start() {
@@ -141,6 +257,7 @@ final class GlobalHotkeyController {
             RemoveEventHandler(eventHandler)
             self.eventHandler = nil
         }
+        mouseHotkeyTap.invalidate()
     }
 
     @discardableResult
@@ -244,7 +361,8 @@ final class GlobalHotkeyController {
     private func makeRegistrationSet(for bindings: [HotkeyBinding]) -> Result<RegistrationSet, RegistrationFailure> {
         var hotkeys: [EventHotKeyRef] = []
         var stagedHandlers: [UInt32: HotkeyBinding] = [:]
-        var combinations: [HotkeyCombination: HotkeyBinding] = [:]
+        var stagedMouseHandlers: [HotkeyMouseShortcut: HotkeyBinding] = [:]
+        var combinations: [HotkeyTrigger: HotkeyBinding] = [:]
 
         func fail(_ message: String) -> Result<RegistrationSet, RegistrationFailure> {
             for hotkey in hotkeys {
@@ -254,6 +372,21 @@ final class GlobalHotkeyController {
         }
 
         for (index, binding) in bindings.enumerated() {
+            if let mouseButton = binding.mouseButton {
+                guard (2 ... 31).contains(mouseButton) else {
+                    return fail("Unsupported mouse button in \(binding.label): \(mouseButton + 1).")
+                }
+                if let existing = combinations[binding.trigger] {
+                    return fail("\(binding.label) duplicates the trigger used by \(existing.label).")
+                }
+                combinations[binding.trigger] = binding
+                let mouseShortcut = HotkeyMouseShortcut(
+                    button: mouseButton,
+                    modifiers: binding.modifiers
+                )
+                stagedMouseHandlers[mouseShortcut] = binding
+                continue
+            }
             guard !binding.modifiers.isEmpty else {
                 return fail("A global hotkey requires at least one modifier: \(binding.label).")
             }
@@ -264,11 +397,10 @@ final class GlobalHotkeyController {
             guard modifierMask != 0 else {
                 return fail("A global hotkey requires at least one recognized modifier: \(binding.label).")
             }
-            let combination = HotkeyCombination(keyCode: UInt32(keyCode), modifiers: modifierMask)
-            if let existing = combinations[combination] {
+            if let existing = combinations[binding.trigger] {
                 return fail("\(binding.label) duplicates the shortcut used by \(existing.label).")
             }
-            combinations[combination] = binding
+            combinations[binding.trigger] = binding
 
             let signature = Self.nextSignature
             Self.nextSignature &+= 1
@@ -288,15 +420,27 @@ final class GlobalHotkeyController {
             hotkeys.append(hotkeyRef)
             stagedHandlers[signature] = binding
         }
-        return .success(RegistrationSet(hotkeys: hotkeys, handlers: stagedHandlers, bindings: bindings))
+        return .success(RegistrationSet(
+            hotkeys: hotkeys,
+            handlers: stagedHandlers,
+            mouseHandlers: stagedMouseHandlers,
+            bindings: bindings
+        ))
     }
 
     private func activate(_ registrationSet: RegistrationSet) {
         registeredHotkeys = registrationSet.hotkeys
         registeredBindings = registrationSet.bindings
         handlers = registrationSet.handlers
+        mouseHandlers = registrationSet.mouseHandlers
         for signature in handlers.keys {
             Self.controllers[signature] = self
+        }
+        if !mouseHotkeyTap.apply(triggers: Set(mouseHandlers.keys)) {
+            showStatusWindow(
+                title: "Hotkey Error",
+                body: "Unable to install the mouse-button event tap. Check Accessibility permission."
+            )
         }
         lifecycle = .active
     }
@@ -310,6 +454,8 @@ final class GlobalHotkeyController {
             UnregisterEventHotKey(hotkey)
         }
         registeredHotkeys.removeAll(keepingCapacity: true)
+        mouseHandlers.removeAll(keepingCapacity: true)
+        _ = mouseHotkeyTap.apply(triggers: [])
         registeredBindings.removeAll(keepingCapacity: true)
     }
 
@@ -354,7 +500,38 @@ final class GlobalHotkeyController {
             runScriptAction(binding.action)
         case .callInterface:
             callInterface(binding.action.interfaceName)
+        case .simulateKeystroke:
+            simulateKeystroke(
+                modifiers: binding.action.modifiers ?? [],
+                key: binding.action.key ?? "",
+                preserveModifiersOnKeyUp: binding.action.preservesModifiersOnKeyUp,
+                implicitModifiers: binding.action.implicitCGEventModifiers
+            )
         }
+    }
+
+    private func simulateKeystroke(
+        modifiers: [String],
+        key: String,
+        preserveModifiersOnKeyUp: Bool,
+        implicitModifiers: [String]
+    ) {
+        guard let keyCode = keyCode(for: key) else {
+            showStatusWindow(title: "Hotkey Error", body: "Unsupported simulated key: \(key)")
+            return
+        }
+        let source = CGEventSource(stateID: .hidSystemState)
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode), keyDown: true)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode), keyDown: false)
+        // Merge user-facing modifiers with key-intrinsic flags. For example, real arrow-key
+        // events include secondary Function, which AppleSymbolicHotKeys requires for matching.
+        let flags = cgEventFlags(for: modifiers + implicitModifiers)
+        keyDown?.flags = flags
+        // End a one-shot synthetic combination with an unmodified key-up. Command+Tab is the
+        // known exception because the app switcher requires Command to remain on Tab's key-up.
+        keyUp?.flags = preserveModifiersOnKeyUp ? flags : []
+        keyDown?.post(tap: .cghidEventTap)
+        keyUp?.post(tap: .cghidEventTap)
     }
 
     private func focusApplication(path: String?, bundleIdentifier: String?) {
@@ -746,37 +923,21 @@ final class GlobalHotkeyController {
         }
     }
 
-    private func keyCode(for key: String) -> Int? {
-        switch key.uppercased() {
-        case "A": return kVK_ANSI_A
-        case "B": return kVK_ANSI_B
-        case "C": return kVK_ANSI_C
-        case "D": return kVK_ANSI_D
-        case "E": return kVK_ANSI_E
-        case "F": return kVK_ANSI_F
-        case "G": return kVK_ANSI_G
-        case "H": return kVK_ANSI_H
-        case "I": return kVK_ANSI_I
-        case "J": return kVK_ANSI_J
-        case "K": return kVK_ANSI_K
-        case "L": return kVK_ANSI_L
-        case "M": return kVK_ANSI_M
-        case "N": return kVK_ANSI_N
-        case "O": return kVK_ANSI_O
-        case "P": return kVK_ANSI_P
-        case "Q": return kVK_ANSI_Q
-        case "R": return kVK_ANSI_R
-        case "S": return kVK_ANSI_S
-        case "T": return kVK_ANSI_T
-        case "U": return kVK_ANSI_U
-        case "V": return kVK_ANSI_V
-        case "W": return kVK_ANSI_W
-        case "X": return kVK_ANSI_X
-        case "Y": return kVK_ANSI_Y
-        case "Z": return kVK_ANSI_Z
-        case ".": return kVK_ANSI_Period
-        default: return nil
+    private func cgEventFlags(for modifiers: [String]) -> CGEventFlags {
+        modifiers.reduce(into: CGEventFlags()) { flags, modifier in
+            switch modifier.lowercased() {
+            case "cmd", "command": flags.insert(.maskCommand)
+            case "ctrl", "control": flags.insert(.maskControl)
+            case "alt", "option": flags.insert(.maskAlternate)
+            case "shift": flags.insert(.maskShift)
+            case "fn", "function": flags.insert(.maskSecondaryFn)
+            default: break
+            }
         }
+    }
+
+    private func keyCode(for key: String) -> Int? {
+        HotkeyKey(configurationName: key).map { Int($0.code) }
     }
 }
 
@@ -880,6 +1041,6 @@ if __name__ == "__main__":
 
 private extension HotkeyBinding {
     var label: String {
-        id ?? "\(modifiers.joined(separator: "+"))+\(key)"
+        id ?? mouseButton.map { "Mouse \($0 + 1)" } ?? "\(modifiers.joined(separator: "+"))+\(key)"
     }
 }

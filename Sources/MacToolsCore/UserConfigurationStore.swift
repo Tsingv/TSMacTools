@@ -29,6 +29,18 @@ public struct UserConfigurationBootstrapResult: Equatable, Sendable {
 }
 
 private struct JSONCLayoutEditor {
+    private static let hotkeyActionKeys: Set<String> = [
+        "kind",
+        "path",
+        "bundleIdentifier",
+        "function",
+        "input",
+        "nativeWindowID",
+        "interfaceName",
+        "modifiers",
+        "key"
+    ]
+
     private struct Node {
         enum Kind {
             case object([Property])
@@ -91,6 +103,21 @@ private struct JSONCLayoutEditor {
             for (key, value) in object {
                 if let child = propertiesByKey[key] {
                     try collectReplacements(node: child, replacement: value, into: &replacements)
+                }
+            }
+
+            // Codable omits nil HotkeyAction fields. When an action changes kind, known fields
+            // owned by the previous kind must not remain semantically active in the JSONC text.
+            // Replace only those existing values with null: decodeIfPresent restores nil while
+            // comments, ordering, and unknown extension fields remain untouched.
+            if let kind = object["kind"] as? String,
+               HotkeyAction.Kind(rawValue: kind) != nil,
+               propertiesByKey["kind"] != nil {
+                for key in Self.hotkeyActionKeys where key != "kind" && object[key] == nil {
+                    guard let staleValue = propertiesByKey[key] else { continue }
+                    replacements.append(
+                        Replacement(range: staleValue.range, bytes: Array("null".utf8))
+                    )
                 }
             }
 

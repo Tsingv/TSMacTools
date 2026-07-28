@@ -20,6 +20,61 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertNotEqual(canonical, different)
     }
 
+    func testHotkeyKeyUsesOneMappingForPrintableFunctionNavigationAndKeypadKeys() throws {
+        XCTAssertEqual(HotkeyKey.allKnownKeys.count, 120)
+        XCTAssertEqual(Set(HotkeyKey.allKnownKeys).count, 120)
+        for key in HotkeyKey.allKnownKeys {
+            XCTAssertEqual(
+                HotkeyKey(configurationName: key.configurationName),
+                key,
+                key.configurationName
+            )
+        }
+
+        let representatives: [(String, UInt16)] = [
+            ("[", 0x21), ("]", 0x1E), ("1", 0x12), ("/", 0x2C),
+            ("F12", 0x6F), ("ContextualMenu", 0x6E), ("Home", 0x73), ("Left", 0x7B),
+            ("Keypad7", 0x59), ("JISKana", 0x68)
+        ]
+
+        for (name, code) in representatives {
+            let parsed = try XCTUnwrap(HotkeyKey(configurationName: name))
+            XCTAssertEqual(parsed.code, code, name)
+            XCTAssertEqual(HotkeyKey(code: code).configurationName, name)
+        }
+        XCTAssertEqual(HotkeyKey(configurationName: "LeftBracket")?.code, 0x21)
+        XCTAssertEqual(HotkeyKey(configurationName: "←")?.code, 0x7B)
+    }
+
+    func testHotkeyKeyPreservesUnknownCapturedKeyCodes() throws {
+        let captured = HotkeyKey(code: 0x00FF)
+        XCTAssertEqual(captured.configurationName, "KeyCode:255")
+        XCTAssertEqual(
+            try XCTUnwrap(HotkeyKey(configurationName: captured.configurationName)),
+            captured
+        )
+        XCTAssertNil(HotkeyKey(configurationName: "KeyCode:not-a-number"))
+    }
+
+    func testCommandLeftBracketHotkeyRoundTripsAndConflictsCanonically() throws {
+        var configuration = UserConfiguration.migratedHammerspoonDefault()
+        let binding = HotkeyBinding(
+            id: "navigate-back",
+            modifiers: ["Command"],
+            key: "[",
+            action: HotkeyAction(kind: .focusApplication)
+        )
+        configuration.hotkeys.append(binding)
+
+        let data = try JSONEncoder().encode(binding)
+        XCTAssertEqual(try JSONDecoder().decode(HotkeyBinding.self, from: data), binding)
+        XCTAssertNotNil(
+            configuration.conflictingHotkey(
+                for: HotkeyShortcut(modifiers: ["cmd"], key: "[")
+            )
+        )
+    }
+
     func testHotkeyBindingExposesCanonicalShortcut() {
         let binding = HotkeyBinding(
             modifiers: ["Option", "Command"],
@@ -41,6 +96,109 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(
             configuration.conflictingHotkey(for: shortcut, excluding: 0),
             configuration.hotkeys[1]
+        )
+    }
+
+    func testMouseButtonTriggerConflictsOnlyWithSameMouseButton() {
+        var configuration = UserConfiguration.migratedHammerspoonDefault()
+        configuration.hotkeys.append(HotkeyBinding(
+            id: "mouse-back",
+            mouseButton: 3,
+            action: HotkeyAction(kind: .simulateKeystroke, modifiers: ["ctrl"], key: "Down")
+        ))
+
+        XCTAssertEqual(configuration.hotkeys.last?.trigger, .mouseButton(3))
+        XCTAssertNotNil(configuration.conflictingHotkey(for: .mouseButton(3)))
+        XCTAssertNil(configuration.conflictingHotkey(for: .mouseButton(4)))
+    }
+
+    func testMouseButtonTriggerIncludesCanonicalModifiers() {
+        var configuration = UserConfiguration.migratedHammerspoonDefault()
+        let commandMouseSix = HotkeyBinding(
+            id: "command-mouse-six",
+            modifiers: ["Command"],
+            mouseButton: 5,
+            action: HotkeyAction(kind: .focusApplication)
+        )
+        configuration.hotkeys.append(commandMouseSix)
+
+        XCTAssertEqual(
+            commandMouseSix.trigger,
+            .mouseButton(5, modifiers: ["cmd"])
+        )
+        XCTAssertNotNil(
+            configuration.conflictingHotkey(for: .mouseButton(5, modifiers: ["command"]))
+        )
+        XCTAssertNil(configuration.conflictingHotkey(for: .mouseButton(5)))
+        XCTAssertNil(configuration.conflictingHotkey(for: .mouseButton(4, modifiers: ["cmd"])))
+    }
+
+    func testMouseButtonAndSimulatedKeystrokeRoundTrip() throws {
+        let binding = HotkeyBinding(
+            id: "mouse-forward",
+            modifiers: ["cmd"],
+            mouseButton: 4,
+            action: HotkeyAction(
+                kind: .simulateKeystroke,
+                modifiers: ["ctrl"],
+                key: "Down"
+            )
+        )
+
+        let data = try JSONEncoder().encode(binding)
+        let decoded = try JSONDecoder().decode(HotkeyBinding.self, from: data)
+        XCTAssertEqual(decoded, binding)
+        XCTAssertEqual(decoded.trigger, .mouseButton(4, modifiers: ["cmd"]))
+    }
+
+    func testSimulatedKeystrokeKeyUpModifierPolicy() {
+        XCTAssertFalse(
+            HotkeyAction(
+                kind: .simulateKeystroke,
+                modifiers: ["ctrl"],
+                key: "Down"
+            ).preservesModifiersOnKeyUp
+        )
+        XCTAssertFalse(
+            HotkeyAction(
+                kind: .simulateKeystroke,
+                modifiers: ["cmd"],
+                key: "D"
+            ).preservesModifiersOnKeyUp
+        )
+        XCTAssertTrue(
+            HotkeyAction(
+                kind: .simulateKeystroke,
+                modifiers: ["command"],
+                key: "tab"
+            ).preservesModifiersOnKeyUp
+        )
+    }
+
+    func testSimulatedKeystrokeIntrinsicModifierTableRestoresSecondaryFunctionFlag() {
+        XCTAssertEqual(
+            HotkeyAction(
+                kind: .simulateKeystroke,
+                modifiers: ["ctrl"],
+                key: "Down"
+            ).implicitCGEventModifiers,
+            ["fn"]
+        )
+        XCTAssertEqual(
+            HotkeyAction(
+                kind: .simulateKeystroke,
+                modifiers: ["ctrl"],
+                key: "↑"
+            ).implicitCGEventModifiers,
+            ["fn"]
+        )
+        XCTAssertEqual(
+            HotkeyAction(
+                kind: .simulateKeystroke,
+                modifiers: ["cmd"],
+                key: "D"
+            ).implicitCGEventModifiers,
+            []
         )
     }
 
@@ -334,6 +492,51 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(updated.hotkeys[0].modifiers, ["cmd", "shift"])
         let updatedText = try String(contentsOf: configURL, encoding: .utf8)
         XCTAssertTrue(updatedText.contains("// Keep the user's hotkey note."))
+    }
+
+    func testUpdateChangesSimulatedKeystrokeActionToFocusApplication() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let store = UserConfigurationStore()
+        var configuration = UserConfiguration.migratedHammerspoonDefault()
+        configuration.hotkeys.append(HotkeyBinding(
+            id: "mouse-six",
+            mouseButton: 5,
+            action: HotkeyAction(kind: .simulateKeystroke, modifiers: ["ctrl"], key: "Down")
+        ))
+        var text = String(decoding: try store.encodeConfigurationAsJSONC(configuration), as: UTF8.self)
+        let kindField = #""kind" : "simulateKeystroke""#
+        XCTAssertTrue(text.contains(kindField))
+        text = text.replacingOccurrences(
+            of: kindField,
+            with: #"""
+        "futureActionField" : { "keep" : true },
+        // Keep the user's action note.
+        "kind" : "simulateKeystroke"
+        """#,
+            maxReplacements: 1
+        )
+        let configURL = root.appendingPathComponent("config.jsonc")
+        try text.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let updated = try store.update(at: configURL) { latest in
+            let index = try XCTUnwrap(latest.hotkeys.firstIndex(where: { $0.id == "mouse-six" }))
+            latest.hotkeys[index].action = HotkeyAction(kind: .focusApplication)
+        }
+
+        let action = try XCTUnwrap(updated.hotkeys.first(where: { $0.id == "mouse-six" })?.action)
+        XCTAssertEqual(action.kind, .focusApplication)
+        XCTAssertNil(action.modifiers)
+        XCTAssertNil(action.key)
+        let updatedText = try String(contentsOf: configURL, encoding: .utf8)
+        XCTAssertTrue(updatedText.contains("// Keep the user's action note."))
+        XCTAssertTrue(updatedText.contains(#""futureActionField" : { "keep" : true }"#))
+        XCTAssertTrue(updatedText.contains(#""modifiers" : null"#))
+        XCTAssertTrue(updatedText.contains(#""key" : null"#))
+        XCTAssertEqual(try store.load(from: configURL), updated)
     }
 
     func testUpdateInsertsScrollIntoLegacyConfiguration() throws {

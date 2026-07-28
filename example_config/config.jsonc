@@ -18,8 +18,14 @@
     "pythonPath": "/Users/clearain/.venv/bin/python"
   },
 
-  // Global hotkeys. Each binding requires at least one modifier. runScript loads path,
-  // injects config/input_text/nativewindow/window, then calls function.
+  // Global hotkeys. A trigger is either modifiers + key or modifiers + a zero-based CG mouseButton
+  // (3 and 4 are commonly the two side buttons), so Command + Mouse 6 is represented by root-level
+  // "modifiers": ["cmd"] plus "mouseButton": 5. Keyboard keys include letters, digits, punctuation,
+  // F-keys, navigation, and keypad names; unknown captured keys use "KeyCode:<number>". For example,
+  // Command+[ is "modifiers": ["cmd"] plus "key": "[". simulateKeystroke posts its action modifiers on
+  // key-down, restores the implicit Function flag carried by real arrow-key events, and normally
+  // clears flags on key-up. This lets symbolic system combinations such as Control+Down match.
+  // runScript injects config/input_text/nativewindow/window.
   "hotkeys": [
     {
       "action": {
@@ -31,6 +37,16 @@
         "ctrl",
         "cmd"
       ]
+    },
+    {
+      "action": {
+        "key": "Down",
+        "kind": "simulateKeystroke",
+        "modifiers": [
+          "ctrl"
+        ]
+      },
+      "mouseButton": 3
     },
     {
       "action": {

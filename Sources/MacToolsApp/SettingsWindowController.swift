@@ -1,6 +1,74 @@
 import AppKit
 import Carbon.HIToolbox
 import MacToolsCore
+import QuartzCore
+import UniformTypeIdentifiers
+
+private func hotkeyRecorderEventTapCallback(
+    proxy: CGEventTapProxy,
+    type: CGEventType,
+    event: CGEvent,
+    userInfo: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    guard let userInfo else { return Unmanaged.passUnretained(event) }
+    let tap = Unmanaged<HotkeyRecorderEventTap>.fromOpaque(userInfo).takeUnretainedValue()
+    return tap.handle(type: type, event: event) ? nil : Unmanaged.passUnretained(event)
+}
+
+private final class HotkeyRecorderEventTap {
+    private var tap: CFMachPort?
+    private var source: CFRunLoopSource?
+    var onKeyDown: ((UInt16, CGEventFlags) -> Void)?
+
+    func install() -> Bool {
+        guard tap == nil else { return true }
+        let mask = CGEventMask(1) << CGEventType.keyDown.rawValue
+        let userInfo = Unmanaged.passUnretained(self).toOpaque()
+        let createdTap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: hotkeyRecorderEventTapCallback,
+            userInfo: userInfo
+        ) ?? CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: hotkeyRecorderEventTapCallback,
+            userInfo: userInfo
+        )
+        guard let createdTap,
+              let createdSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, createdTap, 0) else {
+            return false
+        }
+        tap = createdTap
+        source = createdSource
+        CFRunLoopAddSource(CFRunLoopGetMain(), createdSource, .commonModes)
+        CGEvent.tapEnable(tap: createdTap, enable: true)
+        return CGEvent.tapIsEnabled(tap: createdTap)
+    }
+
+    func handle(type: CGEventType, event: CGEvent) -> Bool {
+        if type == .tapDisabledByTimeout {
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return false
+        }
+        guard type == .keyDown else { return false }
+        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        onKeyDown?(keyCode, event.flags)
+        return true
+    }
+
+    func invalidate() {
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+        source = nil
+        tap = nil
+        onKeyDown = nil
+    }
+}
 
 @MainActor
 final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, NSWindowDelegate {
@@ -76,6 +144,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private var selectedPage: Page = .general
     private let contentContainer = NSView()
     private var pageButtons: [Page: NSButton] = [:]
+    private var cachedPageViews: [Page: NSView] = [:]
 
     private var windowSwitcherToggle: NSButton?
     private var translationToggle: NSButton?
@@ -103,7 +172,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private var pendingTuningChanges: [Int: Double] = [:]
     private var reconciliationScheduled = false
     private weak var activeHotkeyRecorder: HotkeyRecorderButton?
+    private weak var hotkeyTableView: NSTableView?
+    private weak var hotkeyCountLabel: NSTextField?
+    private var hotkeyTableHeightConstraint: NSLayoutConstraint?
     private var isHotkeyRecordingActive = false
+    private var pendingHotkeyFocusID: String?
     private static let tuningSaveDelay: TimeInterval = 0.12
     private static let reconciliationDelay: TimeInterval = 0.05
 
@@ -167,7 +240,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         self.configuration = configuration
         lastKnownGoodConfiguration = configuration
         self.configURL = configURL
-        showPage(selectedPage)
+        cachedPageViews.removeAll()
+        showPage(selectedPage, animated: false)
     }
 
     private func buildWindow() {
@@ -177,19 +251,21 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         pageBar.orientation = .horizontal
         pageBar.alignment = .centerY
         pageBar.distribution = .fillEqually
-        pageBar.spacing = 10
-        pageBar.edgeInsets = NSEdgeInsets(top: 10, left: 150, bottom: 8, right: 150)
+        pageBar.spacing = 8
+        pageBar.edgeInsets = NSEdgeInsets(top: 8, left: 205, bottom: 6, right: 205)
         pageBar.translatesAutoresizingMaskIntoConstraints = false
 
         for page in Page.allCases {
-            let button = SettingsPageButton(title: page.title, target: self, action: #selector(selectPage(_:)))
+            let button = SettingsPageButton(
+                title: page.title,
+                symbol: page.symbol,
+                target: self,
+                action: #selector(selectPage(_:))
+            )
             button.tag = page.rawValue
-            button.imagePosition = .imageAbove
-            button.image = NSImage(systemSymbolName: page.symbol, accessibilityDescription: page.title)
-            button.font = .systemFont(ofSize: 12, weight: .medium)
             button.toolTip = page.title
             button.translatesAutoresizingMaskIntoConstraints = false
-            button.heightAnchor.constraint(equalToConstant: 62).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 54).isActive = true
             pageBar.addArrangedSubview(button)
             pageButtons[page] = button
         }
@@ -206,7 +282,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             pageBar.topAnchor.constraint(equalTo: root.topAnchor),
             pageBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             pageBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            pageBar.heightAnchor.constraint(equalToConstant: 80),
+            pageBar.heightAnchor.constraint(equalToConstant: 68),
             separator.topAnchor.constraint(equalTo: pageBar.bottomAnchor),
             separator.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -224,21 +300,25 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         showPage(page)
     }
 
-    private func showPage(_ page: Page) {
+    private func showPage(_ page: Page, rebuild: Bool = false, animated: Bool = true) {
         endActiveHotkeyRecording()
+        let previousPage = selectedPage
         selectedPage = page
         for (candidate, button) in pageButtons {
             let isSelected = candidate == page
             button.state = .off
             (button as? SettingsPageButton)?.isPageSelected = isSelected
         }
-        contentContainer.subviews.forEach { $0.removeFromSuperview() }
-
-        let pageView: NSView = switch page {
-        case .general: makeGeneralPage()
-        case .hotkeys: makeHotkeysPage()
-        case .scrolling: makeScrollingPage()
+        if rebuild {
+            cachedPageViews[page]?.removeFromSuperview()
+            cachedPageViews[page] = nil
         }
+        let pageView = cachedPageViews[page] ?? makePage(page)
+        cachedPageViews[page] = pageView
+        if contentContainer.subviews.first === pageView { return }
+
+        let previousView = contentContainer.subviews.first
+        previousView?.removeFromSuperview()
         pageView.translatesAutoresizingMaskIntoConstraints = false
         contentContainer.addSubview(pageView)
         NSLayoutConstraint.activate([
@@ -247,6 +327,24 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             pageView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
             pageView.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor)
         ])
+        guard animated, previousPage != page, window?.isVisible == true else {
+            pageView.alphaValue = 1
+            return
+        }
+        pageView.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            pageView.animator().alphaValue = 1
+        }
+    }
+
+    private func makePage(_ page: Page) -> NSView {
+        switch page {
+        case .general: makeGeneralPage()
+        case .hotkeys: makeHotkeysPage()
+        case .scrolling: makeScrollingPage()
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -362,24 +460,296 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     }
 
     private func makeHotkeysPage() -> NSView {
-        let stack = pageStack(title: "Hotkeys", subtitle: "Click a shortcut, then press a modifier combination and a letter or period.")
-        for (index, binding) in configuration.hotkeys.enumerated() {
-            let row = SettingsCardStackView()
-            row.orientation = .horizontal
-            row.alignment = .centerY
-            row.distribution = .fill
-            row.spacing = 14
-            row.edgeInsets = NSEdgeInsets(top: 9, left: 12, bottom: 9, right: 12)
-            row.cornerRadius = 8
-            row.widthAnchor.constraint(equalToConstant: 680).isActive = true
+        let stack = pageStack(
+            title: "Hotkeys",
+            subtitle: "Create a binding, then record a keyboard shortcut or a mouse side button with optional modifiers."
+        )
+        let focusID = pendingHotkeyFocusID
+        pendingHotkeyFocusID = nil
 
-            let action = NSTextField(labelWithString: hotkeyActionDescription(binding.action))
-            action.font = .systemFont(ofSize: 13, weight: .medium)
-            action.lineBreakMode = .byTruncatingMiddle
-            action.toolTip = hotkeyActionDescription(binding.action)
-            action.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let toolbar = NSStackView()
+        toolbar.orientation = .horizontal
+        toolbar.alignment = .centerY
+        toolbar.spacing = 10
+        toolbar.widthAnchor.constraint(equalToConstant: 680).isActive = true
+        let countLabel = NSTextField(labelWithString: "\(configuration.hotkeys.count) bindings")
+        countLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        countLabel.textColor = .secondaryLabelColor
+        hotkeyCountLabel = countLabel
+        let toolbarSpacer = NSView()
+        toolbarSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let add = NSButton(title: "Add", target: self, action: #selector(addHotkey))
+        add.bezelStyle = .rounded
+        add.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
+        add.imagePosition = .imageLeading
+        toolbar.addArrangedSubview(countLabel)
+        toolbar.addArrangedSubview(toolbarSpacer)
+        toolbar.addArrangedSubview(add)
+        stack.addArrangedSubview(toolbar)
 
-            let recorder = HotkeyRecorderButton(binding: binding)
+        let list = SettingsCardView(cornerRadius: 10)
+        list.widthAnchor.constraint(equalToConstant: 680).isActive = true
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 10
+        header.edgeInsets = NSEdgeInsets(top: 7, left: 12, bottom: 5, right: 12)
+        let iconHeader = NSTextField(labelWithString: "")
+        iconHeader.widthAnchor.constraint(equalToConstant: 38).isActive = true
+        let triggerHeader = compactColumnHeader("Trigger", width: 120)
+        let actionHeader = compactColumnHeader("Action", width: 160)
+        let targetHeader = compactColumnHeader("Target", width: 205)
+        let deleteHeader = NSTextField(labelWithString: "")
+        deleteHeader.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        [iconHeader, triggerHeader, actionHeader, targetHeader, deleteHeader].forEach(header.addArrangedSubview)
+        header.translatesAutoresizingMaskIntoConstraints = false
+        list.addSubview(header)
+
+        let table = NSTableView()
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("HotkeyBinding"))
+        column.width = 680
+        column.resizingMask = []
+        table.addTableColumn(column)
+        table.headerView = nil
+        table.delegate = self
+        table.dataSource = self
+        table.rowHeight = 60
+        table.intercellSpacing = .zero
+        table.selectionHighlightStyle = .none
+        table.allowsEmptySelection = true
+        table.allowsMultipleSelection = false
+        table.backgroundColor = .clear
+        table.focusRingType = .none
+        table.gridStyleMask = []
+        table.translatesAutoresizingMaskIntoConstraints = false
+        list.addSubview(table)
+        hotkeyTableView = table
+
+        let tableHeight = table.heightAnchor.constraint(
+            equalToConstant: CGFloat(configuration.hotkeys.count) * table.rowHeight
+        )
+        hotkeyTableHeightConstraint = tableHeight
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: list.topAnchor),
+            header.leadingAnchor.constraint(equalTo: list.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: list.trailingAnchor),
+            header.heightAnchor.constraint(equalToConstant: 32),
+            table.topAnchor.constraint(equalTo: header.bottomAnchor),
+            table.leadingAnchor.constraint(equalTo: list.leadingAnchor),
+            table.trailingAnchor.constraint(equalTo: list.trailingAnchor),
+            table.bottomAnchor.constraint(equalTo: list.bottomAnchor),
+            tableHeight
+        ])
+
+        stack.addArrangedSubview(list)
+        stack.addArrangedSubview(note("Select a trigger to record. Mouse buttons use Accessibility; simulated shortcuts post one key-down/key-up pair."))
+        let page = scrollable(stack)
+        if let focusID {
+            focusHotkeyRow(id: focusID)
+        }
+        return page
+    }
+
+    private func makeHotkeyTableCell(binding: HotkeyBinding, index: Int) -> NSView {
+        let cell = HotkeyTableCellView()
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.topAnchor.constraint(equalTo: cell.topAnchor),
+            row.leadingAnchor.constraint(equalTo: cell.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: cell.trailingAnchor),
+            row.bottomAnchor.constraint(equalTo: cell.bottomAnchor)
+        ])
+
+        row.addArrangedSubview(hotkeyIconView(for: binding.action))
+
+        let recorder = HotkeyRecorderButton(binding: binding, allowsMouseButton: true)
+        recorder.onRecordingBegan = { [weak self, weak recorder] in
+            guard let self, let recorder else { return }
+            self.beginHotkeyRecording(recorder)
+        }
+        recorder.onRecordingEnded = { [weak self, weak recorder] in
+            guard let self, let recorder else { return }
+            self.endHotkeyRecording(recorder)
+        }
+        recorder.onRecord = { [weak self] modifiers, key, mouseButton in
+            guard let self, self.configuration.hotkeys.indices.contains(index) else {
+                return .rejected(MutationError.hotkeyChangedExternally.localizedDescription)
+            }
+            let trigger: HotkeyTrigger = mouseButton.map {
+                HotkeyTrigger.mouseButton($0, modifiers: modifiers)
+            }
+                ?? .keyboard(HotkeyShortcut(modifiers: modifiers, key: key))
+            let result = self.persist(reportFailure: false) { latest in
+                guard let latestIndex = self.resolveHotkeyIndex(
+                    for: binding,
+                    preferredIndex: index,
+                    in: latest.hotkeys
+                ) else { throw MutationError.hotkeyChangedExternally }
+                if let conflict = latest.conflictingHotkey(for: trigger, excluding: latestIndex) {
+                    throw MutationError.hotkeyConflict(self.hotkeyActionDescription(conflict.action))
+                }
+                latest.hotkeys[latestIndex].modifiers = modifiers
+                latest.hotkeys[latestIndex].key = key
+                latest.hotkeys[latestIndex].mouseButton = mouseButton
+            }
+            switch result {
+            case .success: return .accepted
+            case let .failure(error):
+                self.didFail(error)
+                return .rejected(error.localizedDescription)
+            }
+        }
+        recorder.widthAnchor.constraint(equalToConstant: 120).isActive = true
+        cell.recorder = recorder
+        row.addArrangedSubview(recorder)
+
+        let actionPopup = NSPopUpButton()
+        for kind in editableHotkeyActionKinds {
+            let item = NSMenuItem(title: hotkeyActionTitle(kind), action: nil, keyEquivalent: "")
+            item.representedObject = kind.rawValue
+            actionPopup.menu?.addItem(item)
+        }
+        actionPopup.selectItem(withTitle: hotkeyActionTitle(binding.action.kind))
+        actionPopup.tag = index
+        actionPopup.target = self
+        actionPopup.action = #selector(hotkeyActionChanged(_:))
+        actionPopup.controlSize = .small
+        actionPopup.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        row.addArrangedSubview(actionPopup)
+
+        let target = hotkeyTargetControl(for: binding, index: index)
+        target.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(target)
+
+        let delete = NSButton(
+            image: NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete hotkey") ?? NSImage(),
+            target: self,
+            action: #selector(deleteHotkey(_:))
+        )
+        delete.tag = index
+        delete.isBordered = false
+        delete.contentTintColor = .secondaryLabelColor
+        delete.toolTip = "Delete this binding"
+        delete.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        delete.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        row.addArrangedSubview(delete)
+        return cell
+    }
+
+    private func reloadHotkeyTable(focusID: String? = nil) {
+        hotkeyCountLabel?.stringValue = "\(configuration.hotkeys.count) bindings"
+        if let table = hotkeyTableView {
+            hotkeyTableHeightConstraint?.constant = CGFloat(configuration.hotkeys.count) * table.rowHeight
+            table.reloadData()
+        }
+        if let focusID { focusHotkeyRow(id: focusID) }
+    }
+
+    private func focusHotkeyRow(id: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let table = self.hotkeyTableView,
+                  let index = self.configuration.hotkeys.firstIndex(where: { $0.id == id }) else { return }
+            self.contentContainer.layoutSubtreeIfNeeded()
+            let rowRect = table.rect(ofRow: index).insetBy(dx: -10, dy: -8)
+            _ = table.scrollToVisible(rowRect)
+            table.layoutSubtreeIfNeeded()
+            let cell = table.view(atColumn: 0, row: index, makeIfNecessary: true) as? HotkeyTableCellView
+            cell?.recorder?.startRecording()
+        }
+    }
+
+    private var editableHotkeyActionKinds: [HotkeyAction.Kind] {
+        [
+            .focusApplication,
+            .simulateKeystroke,
+            .runScript,
+            .translateSelection,
+            .showFocusedWindowInfo,
+            .reloadConfiguration,
+            .toggleFinder,
+            .toggleTerminal,
+            .callInterface
+        ]
+    }
+
+    private func compactColumnHeader(_ title: String, width: CGFloat) -> NSTextField {
+        let label = NSTextField(labelWithString: title.uppercased())
+        label.font = .systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = .tertiaryLabelColor
+        label.widthAnchor.constraint(equalToConstant: width).isActive = true
+        return label
+    }
+
+    private func hotkeyActionTitle(_ kind: HotkeyAction.Kind) -> String {
+        switch kind {
+        case .focusApplication: "Focus Application"
+        case .simulateKeystroke: "Simulate Keystroke"
+        case .runScript: "Run Python Script"
+        case .translateSelection: "Translate Selection"
+        case .showFocusedWindowInfo: "Focused Window Info"
+        case .reloadConfiguration: "Reload Configuration"
+        case .toggleFinder: "Toggle Finder"
+        case .toggleTerminal: "Toggle Terminal"
+        case .callInterface: "Built-in Interface"
+        }
+    }
+
+    private func defaultHotkeyAction(for kind: HotkeyAction.Kind) -> HotkeyAction {
+        switch kind {
+        case .simulateKeystroke:
+            HotkeyAction(kind: kind, modifiers: ["ctrl"], key: "Down")
+        case .runScript:
+            HotkeyAction(kind: kind, function: "main")
+        case .callInterface:
+            HotkeyAction(kind: kind, interfaceName: "focusedWindowInfo")
+        default:
+            HotkeyAction(kind: kind)
+        }
+    }
+
+    private func hotkeyTargetControl(for binding: HotkeyBinding, index: Int) -> NSView {
+        switch binding.action.kind {
+        case .focusApplication:
+            let button = NSButton(
+                title: selectedApplicationName(for: binding.action) ?? "Choose Application…",
+                target: self,
+                action: #selector(chooseHotkeyTarget(_:))
+            )
+            button.tag = index
+            button.bezelStyle = .rounded
+            button.image = applicationIcon(for: binding.action)
+            button.imagePosition = .imageLeading
+            button.imageScaling = .scaleProportionallyDown
+            button.toolTip = binding.action.path
+            button.controlSize = .small
+            button.widthAnchor.constraint(equalToConstant: 205).isActive = true
+            return button
+        case .runScript:
+            let name = binding.action.path.map { URL(fileURLWithPath: $0).lastPathComponent }
+                ?? "Choose Python Script…"
+            let button = NSButton(title: name, target: self, action: #selector(chooseHotkeyTarget(_:)))
+            button.tag = index
+            button.bezelStyle = .rounded
+            button.image = NSImage(systemSymbolName: "doc.badge.gearshape", accessibilityDescription: nil)
+            button.imagePosition = .imageLeading
+            button.toolTip = binding.action.path
+            button.controlSize = .small
+            button.widthAnchor.constraint(equalToConstant: 205).isActive = true
+            return button
+        case .simulateKeystroke:
+            let syntheticBinding = HotkeyBinding(
+                modifiers: binding.action.modifiers ?? ["ctrl"],
+                key: binding.action.key ?? "Down",
+                action: binding.action
+            )
+            let recorder = HotkeyRecorderButton(binding: syntheticBinding, allowsMouseButton: false)
             recorder.onRecordingBegan = { [weak self, weak recorder] in
                 guard let self, let recorder else { return }
                 self.beginHotkeyRecording(recorder)
@@ -388,42 +758,197 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                 guard let self, let recorder else { return }
                 self.endHotkeyRecording(recorder)
             }
-            recorder.onRecord = { [weak self] modifiers, key in
+            recorder.onRecord = { [weak self] modifiers, key, _ in
                 guard let self, self.configuration.hotkeys.indices.contains(index) else {
                     return .rejected(MutationError.hotkeyChangedExternally.localizedDescription)
                 }
-                let shortcut = HotkeyShortcut(modifiers: modifiers, key: key)
+                let original = self.configuration.hotkeys[index]
                 let result = self.persist(reportFailure: false) { latest in
                     guard let latestIndex = self.resolveHotkeyIndex(
-                        for: binding,
+                        for: original,
                         preferredIndex: index,
                         in: latest.hotkeys
-                    ) else {
-                        throw MutationError.hotkeyChangedExternally
-                    }
-                    if let conflict = latest.conflictingHotkey(for: shortcut, excluding: latestIndex) {
-                        throw MutationError.hotkeyConflict(
-                            self.hotkeyActionDescription(conflict.action)
-                        )
-                    }
-                    latest.hotkeys[latestIndex].modifiers = modifiers
-                    latest.hotkeys[latestIndex].key = key
+                    ) else { throw MutationError.hotkeyChangedExternally }
+                    latest.hotkeys[latestIndex].action.modifiers = modifiers
+                    latest.hotkeys[latestIndex].action.key = key
                 }
                 switch result {
-                case .success:
-                    return .accepted
+                case .success: return .accepted
                 case let .failure(error):
                     self.didFail(error)
                     return .rejected(error.localizedDescription)
                 }
             }
-            recorder.widthAnchor.constraint(equalToConstant: 260).isActive = true
-            row.addArrangedSubview(action)
-            row.addArrangedSubview(recorder)
-            stack.addArrangedSubview(row)
+            recorder.controlSize = .small
+            recorder.widthAnchor.constraint(equalToConstant: 205).isActive = true
+            return recorder
+        default:
+            let label = NSTextField(labelWithString: hotkeyActionDescription(binding.action))
+            label.font = .systemFont(ofSize: 12)
+            label.textColor = .secondaryLabelColor
+            label.lineBreakMode = .byTruncatingMiddle
+            label.widthAnchor.constraint(equalToConstant: 205).isActive = true
+            return label
         }
-        stack.addArrangedSubview(note("Actions and application paths remain editable in the JSONC file. Recording here changes only the selected key combination."))
-        return scrollable(stack)
+    }
+
+    private func hotkeyIconView(for action: HotkeyAction) -> NSView {
+        let container = SettingsIconWell()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.widthAnchor.constraint(equalToConstant: 38).isActive = true
+        container.heightAnchor.constraint(equalToConstant: 38).isActive = true
+
+        let imageView = NSImageView()
+        imageView.image = applicationIcon(for: action)
+            ?? NSImage(systemSymbolName: hotkeyActionSymbol(action.kind), accessibilityDescription: nil)
+        imageView.imageScaling = .scaleProportionallyDown
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(imageView)
+        NSLayoutConstraint.activate([
+            imageView.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
+            imageView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 6),
+            imageView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6),
+            imageView.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -6)
+        ])
+        return container
+    }
+
+    private func hotkeyActionSymbol(_ kind: HotkeyAction.Kind) -> String {
+        switch kind {
+        case .focusApplication: "app"
+        case .simulateKeystroke: "keyboard.badge.ellipsis"
+        case .runScript: "terminal"
+        case .translateSelection: "character.bubble"
+        case .showFocusedWindowInfo: "info.window"
+        case .reloadConfiguration: "arrow.clockwise"
+        case .toggleFinder: "folder"
+        case .toggleTerminal: "apple.terminal"
+        case .callInterface: "switch.2"
+        }
+    }
+
+    private func applicationIcon(for action: HotkeyAction) -> NSImage? {
+        guard action.kind == .focusApplication else { return nil }
+        let url = action.path.map(URL.init(fileURLWithPath:))
+            ?? action.bundleIdentifier.flatMap(NSWorkspace.shared.urlForApplication(withBundleIdentifier:))
+        guard let url else { return nil }
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        icon.size = NSSize(width: 32, height: 32)
+        return icon
+    }
+
+    private func selectedApplicationName(for action: HotkeyAction) -> String? {
+        if let path = action.path {
+            return URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+        }
+        if let bundleIdentifier = action.bundleIdentifier,
+           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
+            return url.deletingPathExtension().lastPathComponent
+        }
+        return nil
+    }
+
+    @objc private func hotkeyActionChanged(_ sender: NSPopUpButton) {
+        endActiveHotkeyRecording()
+        let index = sender.tag
+        guard configuration.hotkeys.indices.contains(index),
+              let rawValue = sender.selectedItem?.representedObject as? String,
+              let kind = HotkeyAction.Kind(rawValue: rawValue) else { return }
+        let original = configuration.hotkeys[index]
+        let action = defaultHotkeyAction(for: kind)
+        if case .success = persist({ latest in
+            guard let latestIndex = self.resolveHotkeyIndex(
+                for: original,
+                preferredIndex: index,
+                in: latest.hotkeys
+            ) else { throw MutationError.hotkeyChangedExternally }
+            latest.hotkeys[latestIndex].action = action
+        }) {
+            reloadHotkeyTable()
+        }
+    }
+
+    @objc private func chooseHotkeyTarget(_ sender: NSButton) {
+        endActiveHotkeyRecording()
+        let index = sender.tag
+        guard configuration.hotkeys.indices.contains(index), let window else { return }
+        let original = configuration.hotkeys[index]
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.resolvesAliases = true
+        switch original.action.kind {
+        case .focusApplication:
+            panel.title = "Choose an Application"
+            panel.prompt = "Choose"
+            panel.allowedContentTypes = [.application]
+            panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        case .runScript:
+            panel.title = "Choose a Python Script"
+            panel.prompt = "Choose"
+            if let python = UTType(filenameExtension: "py") { panel.allowedContentTypes = [python] }
+        default:
+            return
+        }
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let self, let url = panel.url else { return }
+            let bundleIdentifier = original.action.kind == .focusApplication
+                ? Bundle(url: url)?.bundleIdentifier
+                : nil
+            let result = self.persist { latest in
+                guard let latestIndex = self.resolveHotkeyIndex(
+                    for: original,
+                    preferredIndex: index,
+                    in: latest.hotkeys
+                ) else { throw MutationError.hotkeyChangedExternally }
+                latest.hotkeys[latestIndex].action.path = url.path
+                latest.hotkeys[latestIndex].action.bundleIdentifier = bundleIdentifier
+                if latest.hotkeys[latestIndex].action.kind == .runScript,
+                   latest.hotkeys[latestIndex].action.function == nil {
+                    latest.hotkeys[latestIndex].action.function = "main"
+                }
+            }
+            if case .success = result { self.reloadHotkeyTable() }
+        }
+    }
+
+    @objc private func deleteHotkey(_ sender: NSButton) {
+        endActiveHotkeyRecording()
+        let index = sender.tag
+        guard configuration.hotkeys.indices.contains(index) else { return }
+        let original = configuration.hotkeys[index]
+        if case .success = persist({ latest in
+            guard let latestIndex = self.resolveHotkeyIndex(
+                for: original,
+                preferredIndex: index,
+                in: latest.hotkeys
+            ) else { throw MutationError.hotkeyChangedExternally }
+            latest.hotkeys.remove(at: latestIndex)
+        }) {
+            reloadHotkeyTable()
+        }
+    }
+
+    @objc private func addHotkey() {
+        endActiveHotkeyRecording()
+        let used = Set(configuration.hotkeys.map(\.trigger))
+        let key = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ").first { candidate in
+            !used.contains(.keyboard(HotkeyShortcut(modifiers: ["ctrl", "alt", "cmd", "shift"], key: String(candidate))))
+        }.map(String.init) ?? "."
+        let binding = HotkeyBinding(
+            id: UUID().uuidString,
+            modifiers: ["ctrl", "alt", "cmd", "shift"],
+            key: key,
+            action: HotkeyAction(kind: .focusApplication)
+        )
+        if case .success = persist({ $0.hotkeys.append(binding) }) {
+            if hotkeyTableView == nil {
+                pendingHotkeyFocusID = binding.id
+                showPage(.hotkeys, rebuild: true, animated: false)
+            } else {
+                reloadHotkeyTable(focusID: binding.id)
+            }
+        }
     }
 
     private func makeScrollingPage() -> NSView {
@@ -801,7 +1326,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
         reconciliationScheduled = false
         let scrollPosition = (contentContainer.subviews.first as? NSScrollView)?.contentView.bounds.origin
-        showPage(selectedPage)
+        showPage(selectedPage, rebuild: true, animated: false)
         contentContainer.layoutSubtreeIfNeeded()
         if let scrollPosition,
            let scrollView = contentContainer.subviews.first as? NSScrollView,
@@ -1049,6 +1574,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             showPage(page)
             contentView.layoutSubtreeIfNeeded()
             try assertUnambiguousSettingsLayout(in: contentView)
+            try assertInteractivePageButtons()
+            if page == .hotkeys { try assertHotkeyTableIntegrity() }
             contentView.displayIfNeeded()
             guard let representation = contentView.bitmapImageRepForCachingDisplay(in: contentView.bounds) else {
                 throw CocoaError(.fileWriteUnknown)
@@ -1107,6 +1634,39 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
         try validate(root, path: String(describing: type(of: root)))
     }
+
+    private func assertInteractivePageButtons() throws {
+        for (page, button) in pageButtons {
+            let centerInSuperview = NSPoint(x: button.frame.midX, y: button.frame.midY)
+            guard button.hitTest(centerInSuperview) === button else {
+                throw MutationError.ambiguousLayout("\(page.title) tab does not own its center hit target")
+            }
+        }
+    }
+
+    private func assertHotkeyTableIntegrity() throws {
+        guard let table = hotkeyTableView,
+              table.selectionHighlightStyle == .none,
+              table.selectedRowIndexes.isEmpty else {
+            throw MutationError.ambiguousLayout("Hotkeys table must remain non-selecting")
+        }
+        for (index, binding) in configuration.hotkeys.enumerated() {
+            guard let cell = table.view(
+                atColumn: 0,
+                row: index,
+                makeIfNecessary: true
+            ) as? HotkeyTableCellView else {
+                throw MutationError.ambiguousLayout("Hotkeys row \(index) has no table cell")
+            }
+            let recorders = cell.descendants(ofType: HotkeyRecorderButton.self)
+            let expectedRecorderCount = binding.action.kind == .simulateKeystroke ? 2 : 1
+            guard recorders.count == expectedRecorderCount else {
+                throw MutationError.ambiguousLayout(
+                    "Hotkeys row \(index) action \(binding.action.kind.rawValue) owns \(recorders.count) recorders"
+                )
+            }
+        }
+    }
     #endif
 
     private func hotkeyActionDescription(_ action: HotkeyAction) -> String {
@@ -1122,7 +1682,44 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .reloadConfiguration: "Reload configuration"
         case .runScript: "Script · \(action.function ?? URL(fileURLWithPath: action.path ?? "Script").lastPathComponent)"
         case .callInterface: "Interface · \(action.interfaceName ?? "Unknown")"
+        case .simulateKeystroke:
+            "Simulate · \(shortcutTitle(modifiers: action.modifiers ?? [], key: action.key ?? ""))"
         }
+    }
+
+    private func shortcutTitle(modifiers: [String], key: String) -> String {
+        let symbols = modifiers.map { modifier in
+            switch modifier.lowercased() {
+            case "ctrl", "control": "⌃"
+            case "alt", "option": "⌥"
+            case "shift": "⇧"
+            case "cmd", "command": "⌘"
+            default: modifier
+            }
+        }.joined()
+        let displayed = ["UP": "↑", "DOWN": "↓", "LEFT": "←", "RIGHT": "→"][key.uppercased()]
+            ?? key.uppercased()
+        return symbols + displayed
+    }
+}
+
+@MainActor
+extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        configuration.hotkeys.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard configuration.hotkeys.indices.contains(row) else { return nil }
+        return makeHotkeyTableCell(binding: configuration.hotkeys[row], index: row)
+    }
+
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        false
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        HotkeyTableRowView()
     }
 }
 
@@ -1135,12 +1732,18 @@ private final class HotkeyRecorderButton: NSButton {
 
     var onRecordingBegan: (() -> Void)?
     var onRecordingEnded: (() -> Void)?
-    var onRecord: (([String], String) -> CommitResult)?
+    var onRecord: (([String], String, Int?) -> CommitResult)?
     private var binding: HotkeyBinding
+    private let allowsMouseButton: Bool
     private var recording = false
+    private var keyboardEventTap: HotkeyRecorderEventTap?
+    private var localKeyMonitor: Any?
+    private var localMouseMonitor: Any?
+    private var globalMouseMonitor: Any?
 
-    init(binding: HotkeyBinding) {
+    init(binding: HotkeyBinding, allowsMouseButton: Bool) {
         self.binding = binding
+        self.allowsMouseButton = allowsMouseButton
         super.init(frame: .zero)
         bezelStyle = .rounded
         target = self
@@ -1154,17 +1757,28 @@ private final class HotkeyRecorderButton: NSButton {
 
     override var acceptsFirstResponder: Bool { true }
 
+    func startRecording() {
+        beginRecording()
+    }
+
     @objc private func beginRecording() {
         guard !recording else { return }
         recording = true
         title = "Press shortcut…"
-        toolTip = "Press at least one modifier plus a letter or period. Press Escape to cancel."
+        toolTip = allowsMouseButton
+            ? "Press a modifier plus a key, or a mouse side button with optional modifiers. Escape cancels."
+            : "Press at least one modifier plus a key. Escape cancels."
+        // Suspend the existing Carbon and mouse registrations before installing any recorder.
+        // Otherwise the first candidate key can be dispatched to an old binding while capture
+        // setup is still in progress.
+        onRecordingBegan?()
         guard window?.makeFirstResponder(self) == true else {
             recording = false
             updateTitle()
+            onRecordingEnded?()
             return
         }
-        onRecordingBegan?()
+        installEventMonitorsIfNeeded()
     }
 
     override func resignFirstResponder() -> Bool {
@@ -1182,20 +1796,30 @@ private final class HotkeyRecorderButton: NSButton {
 
     override func keyDown(with event: NSEvent) {
         guard recording else { return super.keyDown(with: event) }
-        if event.keyCode == 53 {
+        recordKeyboardEvent(event)
+    }
+
+    private func recordKeyboardEvent(_ event: NSEvent) {
+        guard recording else { return }
+        recordKeyboard(keyCode: event.keyCode, modifiers: recordedModifiers(event.modifierFlags))
+    }
+
+    private func recordKeyboard(keyCode: UInt16, modifiers: [String]) {
+        guard recording else { return }
+        if keyCode == UInt16(kVK_Escape) {
             _ = window?.makeFirstResponder(nil)
             return
         }
-        let modifiers = recordedModifiers(event.modifierFlags)
         guard !modifiers.isEmpty,
-              let key = supportedKey(for: event.keyCode) else {
+              let key = supportedKey(for: keyCode) else {
             NSSound.beep()
             return
         }
-        switch onRecord?(modifiers, key) ?? .rejected("Unable to save this shortcut.") {
+        switch onRecord?(modifiers, key, nil) ?? .rejected("Unable to save this shortcut.") {
         case .accepted:
             binding.modifiers = modifiers
             binding.key = key
+            binding.mouseButton = nil
             _ = window?.makeFirstResponder(nil)
         case let .rejected(message):
             title = message
@@ -1205,15 +1829,87 @@ private final class HotkeyRecorderButton: NSButton {
     }
 
     private func updateTitle() {
-        title = shortcutTitle(modifiers: binding.modifiers, key: binding.key)
+        title = binding.mouseButton.map {
+            shortcutTitle(modifiers: binding.modifiers, key: "") + "Mouse \($0 + 1)"
+        }
+            ?? shortcutTitle(modifiers: binding.modifiers, key: binding.key)
         toolTip = nil
     }
 
     private func endRecordingIfNeeded() {
         guard recording else { return }
         recording = false
+        removeEventMonitors()
         updateTitle()
         onRecordingEnded?()
+    }
+
+    private func installEventMonitorsIfNeeded() {
+        if keyboardEventTap == nil {
+            let eventTap = HotkeyRecorderEventTap()
+            eventTap.onKeyDown = { [weak self] keyCode, flags in
+                DispatchQueue.main.async {
+                    self?.recordKeyboard(
+                        keyCode: keyCode,
+                        modifiers: self?.recordedModifiers(flags) ?? []
+                    )
+                }
+            }
+            if eventTap.install() {
+                keyboardEventTap = eventTap
+            }
+        }
+        if localKeyMonitor == nil {
+            localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, self.recording else { return event }
+                self.recordKeyboardEvent(event)
+                return nil
+            }
+        }
+        guard allowsMouseButton, localMouseMonitor == nil, globalMouseMonitor == nil else { return }
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .otherMouseDown) { [weak self] event in
+            guard let self, self.recording else { return event }
+            self.recordMouseButton(
+                Int(event.buttonNumber),
+                modifiers: self.recordedModifiers(event.modifierFlags)
+            )
+            return nil
+        }
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .otherMouseDown) { [weak self] event in
+            Task { @MainActor in
+                guard let self else { return }
+                self.recordMouseButton(
+                    Int(event.buttonNumber),
+                    modifiers: self.recordedModifiers(event.modifierFlags)
+                )
+            }
+        }
+    }
+
+    private func removeEventMonitors() {
+        keyboardEventTap?.invalidate()
+        keyboardEventTap = nil
+        if let localKeyMonitor { NSEvent.removeMonitor(localKeyMonitor) }
+        if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
+        if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor) }
+        localKeyMonitor = nil
+        localMouseMonitor = nil
+        globalMouseMonitor = nil
+    }
+
+    private func recordMouseButton(_ button: Int, modifiers: [String]) {
+        guard recording, allowsMouseButton, (2 ... 31).contains(button) else { return }
+        switch onRecord?(modifiers, "", button) ?? .rejected("Unable to save this mouse button.") {
+        case .accepted:
+            binding.modifiers = modifiers
+            binding.key = ""
+            binding.mouseButton = button
+            _ = window?.makeFirstResponder(nil)
+        case let .rejected(message):
+            title = message
+            toolTip = message
+            NSSound.beep()
+        }
     }
 
     private func recordedModifiers(_ flags: NSEvent.ModifierFlags) -> [String] {
@@ -1225,37 +1921,18 @@ private final class HotkeyRecorderButton: NSButton {
         return result
     }
 
+    private func recordedModifiers(_ flags: CGEventFlags) -> [String] {
+        var result: [String] = []
+        if flags.contains(.maskControl) { result.append("ctrl") }
+        if flags.contains(.maskAlternate) { result.append("alt") }
+        if flags.contains(.maskShift) { result.append("shift") }
+        if flags.contains(.maskCommand) { result.append("cmd") }
+        return result
+    }
+
     private func supportedKey(for keyCode: UInt16) -> String? {
-        switch Int(keyCode) {
-        case kVK_ANSI_A: "A"
-        case kVK_ANSI_B: "B"
-        case kVK_ANSI_C: "C"
-        case kVK_ANSI_D: "D"
-        case kVK_ANSI_E: "E"
-        case kVK_ANSI_F: "F"
-        case kVK_ANSI_G: "G"
-        case kVK_ANSI_H: "H"
-        case kVK_ANSI_I: "I"
-        case kVK_ANSI_J: "J"
-        case kVK_ANSI_K: "K"
-        case kVK_ANSI_L: "L"
-        case kVK_ANSI_M: "M"
-        case kVK_ANSI_N: "N"
-        case kVK_ANSI_O: "O"
-        case kVK_ANSI_P: "P"
-        case kVK_ANSI_Q: "Q"
-        case kVK_ANSI_R: "R"
-        case kVK_ANSI_S: "S"
-        case kVK_ANSI_T: "T"
-        case kVK_ANSI_U: "U"
-        case kVK_ANSI_V: "V"
-        case kVK_ANSI_W: "W"
-        case kVK_ANSI_X: "X"
-        case kVK_ANSI_Y: "Y"
-        case kVK_ANSI_Z: "Z"
-        case kVK_ANSI_Period: "."
-        default: nil
-        }
+        let key = HotkeyKey(code: keyCode)
+        return key.isModifierKey ? nil : key.configurationName
     }
 
     private func shortcutTitle(modifiers: [String], key: String) -> String {
@@ -1268,21 +1945,67 @@ private final class HotkeyRecorderButton: NSButton {
             default: modifier
             }
         }.joined()
-        return symbols + key.uppercased()
+        let displayedKey = switch key.uppercased() {
+        case "UP": "↑"
+        case "DOWN": "↓"
+        case "LEFT": "←"
+        case "RIGHT": "→"
+        case "SPACE": "Space"
+        case "RETURN": "↩"
+        case "TAB": "⇥"
+        default: key.uppercased()
+        }
+        return symbols + displayedKey
     }
 }
 
 @MainActor
 private final class SettingsPageButton: NSButton {
+    private let pageIcon = NSImageView()
+    private let pageTitle = NSTextField(labelWithString: "")
+    private var pointerInside = false
+    private var pointerTrackingArea: NSTrackingArea?
+
     var isPageSelected = false {
         didSet { needsDisplay = true }
     }
 
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
+    init(title: String, symbol: String, target: AnyObject?, action: Selector?) {
+        super.init(frame: .zero)
+        self.target = target
+        self.action = action
+        self.title = ""
         isBordered = false
         wantsLayer = true
-        layer?.cornerRadius = 9
+        layer?.cornerRadius = 8
+
+        pageIcon.image = NSImage(
+            systemSymbolName: symbol,
+            accessibilityDescription: title
+        )?.withSymbolConfiguration(.init(pointSize: 20, weight: .medium))
+        pageIcon.imageScaling = .scaleProportionallyDown
+        pageIcon.translatesAutoresizingMaskIntoConstraints = false
+        pageIcon.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        pageIcon.heightAnchor.constraint(equalToConstant: 23).isActive = true
+
+        pageTitle.stringValue = title
+        pageTitle.alignment = .center
+        pageTitle.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSStackView(views: [pageIcon, pageTitle])
+        content.orientation = .vertical
+        content.alignment = .centerX
+        content.spacing = 3
+        content.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(content)
+        NSLayoutConstraint.activate([
+            content.centerXAnchor.constraint(equalTo: centerXAnchor),
+            content.centerYAnchor.constraint(equalTo: centerYAnchor),
+            content.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 6),
+            content.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -6),
+            content.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 10),
+            content.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -10)
+        ])
     }
 
     required init?(coder: NSCoder) {
@@ -1294,17 +2017,47 @@ private final class SettingsPageButton: NSButton {
     override func updateLayer() {
         super.updateLayer()
         let accent = NSColor.controlAccentColor
-        layer?.backgroundColor = NSColor.clear.cgColor
-        layer?.borderWidth = isPageSelected ? 1.25 : 0
-        layer?.borderColor = accent.cgColor
-        contentTintColor = isPageSelected ? accent : .secondaryLabelColor
-        attributedTitle = NSAttributedString(
-            string: title,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 12, weight: isPageSelected ? .semibold : .medium),
-                .foregroundColor: isPageSelected ? accent : NSColor.secondaryLabelColor
-            ]
+        let backgroundColor: NSColor = if isPageSelected {
+            accent.withAlphaComponent(0.12)
+        } else if pointerInside {
+            NSColor.unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.34)
+        } else {
+            .clear
+        }
+        layer?.backgroundColor = backgroundColor.cgColor
+        layer?.borderWidth = 0
+        let color = isPageSelected ? accent : NSColor.secondaryLabelColor
+        pageIcon.contentTintColor = color
+        pageTitle.font = .systemFont(ofSize: 12, weight: isPageSelected ? .semibold : .medium)
+        pageTitle.textColor = color
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, isEnabled, super.hitTest(point) != nil else { return nil }
+        return self
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let pointerTrackingArea { removeTrackingArea(pointerTrackingArea) }
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeInKeyWindow, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self,
+            userInfo: nil
         )
+        addTrackingArea(trackingArea)
+        pointerTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerInside = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        needsDisplay = true
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -1382,8 +2135,71 @@ private final class SettingsCardStackView: NSStackView {
     }
 }
 
+@MainActor
+private final class HotkeyTableCellView: NSTableCellView {
+    weak var recorder: HotkeyRecorderButton?
+}
+
+@MainActor
+private final class HotkeyTableRowView: NSTableRowView {
+    private let separator = CALayer()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.addSublayer(separator)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        super.updateLayer()
+        layer?.backgroundColor = NSColor.clear.cgColor
+        separator.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
+    }
+
+    override func layout() {
+        super.layout()
+        separator.frame = CGRect(x: 12, y: 0, width: max(0, bounds.width - 24), height: 0.5)
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {}
+}
+
+@MainActor
+private final class SettingsIconWell: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 0.5
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        super.updateLayer()
+        layer?.backgroundColor = NSColor.unemphasizedSelectedContentBackgroundColor
+            .withAlphaComponent(0.28).cgColor
+        layer?.borderColor = NSColor.separatorColor.cgColor
+    }
+}
+
 private extension Comparable {
     func clamped(to range: ClosedRange<Self>) -> Self {
         min(max(self, range.lowerBound), range.upperBound)
+    }
+}
+
+private extension NSView {
+    func descendants<T: NSView>(ofType type: T.Type) -> [T] {
+        subviews.flatMap { child -> [T] in
+            let current = (child as? T).map { [$0] } ?? []
+            return current + child.descendants(ofType: type)
+        }
     }
 }
