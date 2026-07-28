@@ -1,10 +1,54 @@
 # TSMacTools
 
-TSMacTools is a Swift-first macOS automation app inspired by Hammerspoon. The project starts with typed core automation models, a Python command bridge, user configuration under `~/.config/tsmactool`, and native AppKit windows that external scripts can drive.
+<p>
+  <a href="https://github.com/Tsingv/TSMacTools/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Tsingv/TSMacTools?display_name=tag&sort=semver"></a>
+  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS-black?logo=apple">
+  <img alt="Swift" src="https://img.shields.io/badge/Swift-first-F05138?logo=swift&logoColor=white">
+</p>
 
-The current Xcode app target links `MacToolsCore` and `MacToolsScripting` as static libraries, and explicitly links `AppKit.framework` plus `ApplicationServices.framework`. This keeps the debug `.app` launchable while the architecture remains split into Swift modules.
+TSMacTools is a native, Swift-first macOS automation app inspired by Hammerspoon. It brings window switching, configurable keyboard and mouse hotkeys, display-synchronized smooth scrolling, script-driven native windows, and a Python automation boundary into one compact menu bar app.
+
+Configuration lives in comment-friendly JSONC under `~/.config/tsmactool`; the Settings UI updates owned fields without discarding comments, unknown extension fields, or unrelated edits.
+
+## Highlights
+
+- **Action-based hotkeys:** bind keyboard combinations, mouse side buttons, or modifier-plus-mouse chords to focus an application, simulate a keystroke, call a built-in interface, or run a Python script.
+- **Native window switching:** cycle real Accessibility windows across applications while retaining per-window focus behavior.
+- **Smooth mouse scrolling:** choose local curves, tune both axes, reverse direction independently, and leave trackpad or Magic Mouse gestures untouched.
+- **Script-driven native UI:** Python actions can show native plain-text, Markdown, or structured windows without embedding a browser-first runtime.
+- **Safe live configuration:** compact AppKit settings preserve JSONC structure and apply most changes immediately.
+
+## Settings at a glance
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme/settings-hotkeys-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/readme/settings-hotkeys-light.png">
+    <img alt="TSMacTools Hotkeys settings" src="docs/images/readme/settings-hotkeys-light.png" width="900">
+  </picture>
+</p>
+
+<p align="center"><sub>Build bindings from independent trigger, action, and target controls. Application targets retain their installed icon and display name.</sub></p>
+
+<table>
+  <tr>
+    <td width="50%"><img alt="TSMacTools General settings" src="docs/images/readme/settings-general.png"></td>
+    <td width="50%"><img alt="TSMacTools Scrolling settings" src="docs/images/readme/settings-scrolling.png"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>General</b><br><sub>Window switching, translation, scripting, and diagnostics.</sub></td>
+    <td align="center"><b>Scrolling</b><br><sub>Presets, per-axis behavior, gesture bypass, and bounded tuning.</sub></td>
+  </tr>
+</table>
+
+> [!NOTE]
+> TSMacTools is under active development. Current release artifacts are development-signed and are not yet notarized for broad distribution.
 
 ## Quick Start
+
+Download the current build from [GitHub Releases](https://github.com/Tsingv/TSMacTools/releases/latest), or build the app locally with Xcode.
+
+### Build from source
 
 Open the full Xcode project with:
 
