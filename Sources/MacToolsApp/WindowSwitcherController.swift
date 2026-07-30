@@ -2,6 +2,301 @@ import AppKit
 import ApplicationServices
 import Carbon
 import MacToolsCore
+import OSLog
+
+private let windowSwitcherReplayedEventMarker: Int64 = 0x5453_4D57_534B_4559
+private let windowSwitcherLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "TSMacTools",
+    category: "window-switcher"
+)
+
+private final class WindowSwitcherEventTapRunLoop: @unchecked Sendable {
+    private final class Context: @unchecked Sendable {
+        let tap: CFMachPort
+        let source: CFRunLoopSource
+        let ready = DispatchSemaphore(value: 0)
+        let stopped = DispatchSemaphore(value: 0)
+
+        private let lock = NSLock()
+        private var runLoop: CFRunLoop?
+        private var stopRequested = false
+        private var running = false
+
+        init(tap: CFMachPort, source: CFRunLoopSource) {
+            self.tap = tap
+            self.source = source
+        }
+
+        func run() {
+            autoreleasepool {
+                let currentRunLoop = CFRunLoopGetCurrent()
+                lock.lock()
+                if stopRequested {
+                    lock.unlock()
+                    ready.signal()
+                    stopped.signal()
+                    return
+                }
+                runLoop = currentRunLoop
+                running = true
+                lock.unlock()
+
+                CFRunLoopAddSource(currentRunLoop, source, .commonModes)
+                CGEvent.tapEnable(tap: tap, enable: true)
+                ready.signal()
+                CFRunLoopRun()
+                CGEvent.tapEnable(tap: tap, enable: false)
+                CFRunLoopRemoveSource(currentRunLoop, source, .commonModes)
+
+                lock.lock()
+                running = false
+                runLoop = nil
+                lock.unlock()
+                stopped.signal()
+            }
+        }
+
+        func stop() {
+            lock.lock()
+            stopRequested = true
+            let currentRunLoop = runLoop
+            lock.unlock()
+            CGEvent.tapEnable(tap: tap, enable: false)
+            if let currentRunLoop {
+                CFRunLoopStop(currentRunLoop)
+                CFRunLoopWakeUp(currentRunLoop)
+            }
+        }
+
+        func enable() {
+            lock.lock()
+            let shouldEnable = running && !stopRequested
+            lock.unlock()
+            if shouldEnable {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+        }
+
+        var isRunning: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return running && !stopRequested
+        }
+    }
+
+    private let lock = NSLock()
+    private var context: Context?
+
+    func start(mask: CGEventMask, userInfo: UnsafeMutableRawPointer) -> Bool {
+        stop()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: windowSwitcherEventTapCallback,
+            userInfo: userInfo
+        ), let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            return false
+        }
+
+        let context = Context(tap: tap, source: source)
+        lock.lock()
+        self.context = context
+        lock.unlock()
+
+        let thread = Thread {
+            context.run()
+        }
+        thread.name = "TSMacTools.WindowSwitcherEventTap"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+
+        guard context.ready.wait(timeout: .now() + 1) == .success,
+              context.isRunning else {
+            stop()
+            return false
+        }
+        return true
+    }
+
+    func stop() {
+        lock.lock()
+        let currentContext = context
+        context = nil
+        lock.unlock()
+        guard let currentContext else {
+            return
+        }
+        currentContext.stop()
+        _ = currentContext.stopped.wait(timeout: .now() + 1)
+    }
+
+    func enable() {
+        lock.lock()
+        let currentContext = context
+        lock.unlock()
+        currentContext?.enable()
+    }
+
+    var isActive: Bool {
+        lock.lock()
+        let currentContext = context
+        lock.unlock()
+        return currentContext?.isRunning == true
+    }
+}
+
+private final class WindowSwitcherInputEventQueue: @unchecked Sendable {
+    enum Event {
+        case step(sameApplication: Bool, reverse: Bool)
+        case flagsChanged(commandPressed: Bool, shiftPressed: Bool)
+    }
+
+    private let lock = NSLock()
+    private var events: [Event] = []
+    private var drainScheduled = false
+
+    func enqueue(_ event: Event) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        events.append(event)
+        guard !drainScheduled else {
+            return false
+        }
+        drainScheduled = true
+        return true
+    }
+
+    func takeBatch() -> [Event]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !events.isEmpty else {
+            drainScheduled = false
+            return nil
+        }
+        let batch = events
+        events.removeAll(keepingCapacity: true)
+        return batch
+    }
+
+    func reset() {
+        lock.lock()
+        events.removeAll(keepingCapacity: true)
+        drainScheduled = false
+        lock.unlock()
+    }
+}
+
+private final class WindowSwitcherCommandModifierGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maximumDeferral: TimeInterval = 0.20
+    private var isolation = WindowSwitcherCommandModifierIsolation()
+    private var deferredCommandDown: CGEvent?
+    private var generation: UInt64 = 0
+
+    func shouldSuppress(
+        event: CGEvent,
+        type: CGEventType,
+        keyCode: Int64,
+        commandPressed: Bool
+    ) -> Bool {
+        let commandKeyCodes = [Int64(kVK_Command), Int64(kVK_RightCommand)]
+        let input: WindowSwitcherCommandModifierIsolation.Input
+        if type == .flagsChanged, commandKeyCodes.contains(keyCode) {
+            input = commandPressed ? .commandDown : .commandUp
+        } else if type == .keyDown,
+                  commandPressed,
+                  keyCode == Int64(kVK_Tab) || keyCode == Int64(kVK_ANSI_Grave) {
+            input = .switcherKeyDown
+        } else {
+            input = .other
+        }
+
+        var eventsToPost: [CGEvent] = []
+        var scheduledGeneration: UInt64?
+        var shouldSuppress = false
+
+        lock.lock()
+        let action = isolation.handle(input)
+        switch action {
+        case .passCurrent:
+            break
+        case .deferCurrent:
+            guard let copiedEvent = event.copy() else {
+                _ = isolation.reset()
+                lock.unlock()
+                return false
+            }
+            deferredCommandDown = copiedEvent
+            generation &+= 1
+            scheduledGeneration = generation
+            shouldSuppress = true
+        case .replayDeferredAndCurrent:
+            if let deferredCommandDown,
+               let copiedCurrentEvent = event.copy() {
+                eventsToPost = [deferredCommandDown, copiedCurrentEvent]
+                shouldSuppress = true
+            } else if let deferredCommandDown {
+                eventsToPost = [deferredCommandDown]
+            }
+            self.deferredCommandDown = nil
+            generation &+= 1
+        case .suppressCurrent:
+            deferredCommandDown = nil
+            generation &+= 1
+            shouldSuppress = true
+        }
+        lock.unlock()
+
+        post(eventsToPost)
+        if let scheduledGeneration {
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + maximumDeferral) { [weak self] in
+                self?.flushDeferredCommandDown(generation: scheduledGeneration)
+            }
+        }
+        return shouldSuppress
+    }
+
+    func reset() {
+        var eventToPost: CGEvent?
+        lock.lock()
+        if isolation.reset() {
+            eventToPost = deferredCommandDown
+        }
+        deferredCommandDown = nil
+        generation &+= 1
+        lock.unlock()
+        if let eventToPost {
+            post([eventToPost])
+        }
+    }
+
+    private func flushDeferredCommandDown(generation expectedGeneration: UInt64) {
+        var eventToPost: CGEvent?
+        lock.lock()
+        if generation == expectedGeneration,
+           isolation.expireDeferredCommandDown() {
+            eventToPost = deferredCommandDown
+            deferredCommandDown = nil
+            generation &+= 1
+        }
+        lock.unlock()
+        if let eventToPost {
+            post([eventToPost])
+        }
+    }
+
+    private func post(_ events: [CGEvent]) {
+        events.forEach { event in
+            event.setIntegerValueField(
+                .eventSourceUserData,
+                value: windowSwitcherReplayedEventMarker
+            )
+            event.post(tap: .cgSessionEventTap)
+        }
+    }
+}
 
 private func windowSwitcherEventTapCallback(
     proxy: CGEventTapProxy,
@@ -14,10 +309,12 @@ private func windowSwitcherEventTapCallback(
             let controller = Unmanaged<WindowSwitcherController>
                 .fromOpaque(userInfo)
                 .takeUnretainedValue()
-            DispatchQueue.main.async {
-                controller.enableEventTap()
-            }
+            controller.reenableEventTapFromCallback()
         }
+        return Unmanaged.passUnretained(event)
+    }
+
+    if event.getIntegerValueField(.eventSourceUserData) == windowSwitcherReplayedEventMarker {
         return Unmanaged.passUnretained(event)
     }
 
@@ -36,6 +333,7 @@ private func windowSwitcherEventTapCallback(
         .takeUnretainedValue()
 
     let shouldSuppress = controller.handleEvent(
+        event: event,
         type: eventType,
         keyCode: keyCode,
         commandPressed: commandPressed,
@@ -100,6 +398,7 @@ final class WindowSwitcherController {
     }
 
     private struct PendingFocusVerification {
+        var generation: UInt64
         var key: String
         var title: String
         var processIdentifier: pid_t
@@ -119,6 +418,39 @@ final class WindowSwitcherController {
         var window: AXUIElement
     }
 
+    private struct AXWindowSnapshot {
+        var role: String?
+        var subrole: String?
+        var title: String?
+        var minimized: Bool?
+        var position: CGPoint?
+        var size: CGSize?
+        var main: Bool?
+        var focused: Bool?
+
+        var isSwitchable: Bool {
+            guard role == kAXWindowRole as String,
+                  let size,
+                  size.width >= 80,
+                  size.height >= 60 else {
+                return false
+            }
+            if let subrole,
+               subrole != kAXStandardWindowSubrole as String,
+               subrole != kAXDialogSubrole as String {
+                return false
+            }
+            return true
+        }
+
+        var bounds: CGRect? {
+            guard let position, let size else {
+                return nil
+            }
+            return CGRect(origin: position, size: size)
+        }
+    }
+
     private struct FrontmostApplicationIdentity {
         var bundleIdentifier: String?
         var processIdentifier: pid_t
@@ -126,9 +458,10 @@ final class WindowSwitcherController {
     }
 
     private let runtime: AutomationRuntime
+    private let commandModifierGate = WindowSwitcherCommandModifierGate()
+    private let eventTapRunLoop = WindowSwitcherEventTapRunLoop()
+    private let inputEventQueue = WindowSwitcherInputEventQueue()
     private var configuration: UserConfiguration
-    private var eventTap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
     private var retainedSelf: UnsafeMutableRawPointer?
     private var choices: [WindowChoice] = []
     private var recentChoices: [String: WindowChoice] = [:]
@@ -138,7 +471,6 @@ final class WindowSwitcherController {
     private var commandPressed = false
     private var shiftPressed = false
     private var overlayWindow: NSWindow?
-    private let overlayDisplayDelay: TimeInterval = 0.15
     private var overlayDisplayWorkItem: DispatchWorkItem?
     private var backwardRepeatPolicy: WindowSwitcherBackwardRepeatPolicy {
         WindowSwitcherBackwardRepeatPolicy(
@@ -151,7 +483,9 @@ final class WindowSwitcherController {
     private var workspaceObservers: [NSObjectProtocol] = []
     private var axApplicationObservers: [pid_t: AXApplicationObservation] = [:]
     private var axWindowObservers: [String: AXWindowObservation] = [:]
+    private var pendingAXObserverInstallationKeys: Set<String> = []
     private var pendingFocusVerification: PendingFocusVerification?
+    private var focusGeneration: UInt64 = 0
     private let activationCapturePolicy = WindowActivationCapturePolicy()
     private var activationCaptureGeneration: UInt64 = 0
     private var completedActivationCaptureGeneration: UInt64?
@@ -176,26 +510,13 @@ final class WindowSwitcherController {
             | (1 << CGEventType.rightMouseDown.rawValue)
             | (1 << CGEventType.otherMouseDown.rawValue)
 
-        eventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: CGEventMask(mask),
-            callback: windowSwitcherEventTapCallback,
-            userInfo: retainedSelf
-        )
-
-        guard let eventTap else {
+        guard let retainedSelf,
+              eventTapRunLoop.start(mask: CGEventMask(mask), userInfo: retainedSelf) else {
+            self.retainedSelf = nil
             showStatus("Unable to create window switcher event tap. Check Accessibility permission.")
             return
         }
-
-        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-        if let runLoopSource {
-            CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        }
         installWorkspaceObservers()
-        enableEventTap()
     }
 
     func apply(configuration: UserConfiguration) {
@@ -209,7 +530,7 @@ final class WindowSwitcherController {
             start()
         case (true, false):
             stop()
-        case (true, true) where eventTap == nil:
+        case (true, true) where !eventTapRunLoop.isActive:
             start()
         default:
             break
@@ -219,31 +540,27 @@ final class WindowSwitcherController {
     func stop() {
         activationCaptureGeneration &+= 1
         completedActivationCaptureGeneration = nil
+        focusGeneration &+= 1
+        eventTapRunLoop.stop()
+        commandModifierGate.reset()
+        inputEventQueue.reset()
         hideOverlay()
         removeWorkspaceObservers()
-        if let eventTap {
-            CGEvent.tapEnable(tap: eventTap, enable: false)
-        }
-        if let runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        }
-        runLoopSource = nil
-        eventTap = nil
         retainedSelf = nil
         removeAXObservers()
+        pendingAXObserverInstallationKeys.removeAll()
         pendingFocusVerification = nil
         choices.removeAll()
         recentChoices.removeAll()
         recentKeys.removeAll()
     }
 
-    func enableEventTap() {
-        if let eventTap {
-            CGEvent.tapEnable(tap: eventTap, enable: true)
-        }
+    nonisolated func reenableEventTapFromCallback() {
+        eventTapRunLoop.enable()
     }
 
     nonisolated func handleEvent(
+        event: CGEvent,
         type: CGEventType,
         keyCode: Int64,
         commandPressed: Bool,
@@ -251,27 +568,27 @@ final class WindowSwitcherController {
     ) -> Bool {
         let isTab = keyCode == Int64(kVK_Tab)
         let isBacktick = keyCode == Int64(kVK_ANSI_Grave)
+        let commandModifierShouldSuppress = commandModifierGate.shouldSuppress(
+            event: event,
+            type: type,
+            keyCode: keyCode,
+            commandPressed: commandPressed
+        )
 
         if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 self.recordFocusedWindow()
             }
-            return false
+            return commandModifierShouldSuppress
         }
 
         if type == .keyDown, commandPressed, isTab {
-            DispatchQueue.main.async {
-                self.log("event keyDown cmd+tab")
-                self.step(sameApplication: false, reverse: shiftPressed)
-            }
+            enqueueInputEvent(.step(sameApplication: false, reverse: shiftPressed))
             return true
         }
 
         if type == .keyDown, commandPressed, isBacktick {
-            DispatchQueue.main.async {
-                self.log("event keyDown cmd+`")
-                self.step(sameApplication: true, reverse: shiftPressed)
-            }
+            enqueueInputEvent(.step(sameApplication: true, reverse: shiftPressed))
             return true
         }
 
@@ -280,13 +597,34 @@ final class WindowSwitcherController {
         }
 
         if type == .flagsChanged {
-            DispatchQueue.main.async {
-                self.handleFlagsChanged(commandPressed: commandPressed, shiftPressed: shiftPressed)
-            }
-            return false
+            enqueueInputEvent(.flagsChanged(commandPressed: commandPressed, shiftPressed: shiftPressed))
+            return commandModifierShouldSuppress
         }
 
-        return false
+        return commandModifierShouldSuppress
+    }
+
+    nonisolated private func enqueueInputEvent(_ event: WindowSwitcherInputEventQueue.Event) {
+        guard inputEventQueue.enqueue(event) else {
+            return
+        }
+        DispatchQueue.main.async {
+            self.drainInputEvents()
+        }
+    }
+
+    private func drainInputEvents() {
+        while let batch = inputEventQueue.takeBatch() {
+            for event in batch {
+                switch event {
+                case let .step(sameApplication, reverse):
+                    log("event step sameApplication=\(sameApplication) reverse=\(reverse)")
+                    step(sameApplication: sameApplication, reverse: reverse)
+                case let .flagsChanged(commandPressed, shiftPressed):
+                    handleFlagsChanged(commandPressed: commandPressed, shiftPressed: shiftPressed)
+                }
+            }
+        }
     }
 
     private func step(sameApplication: Bool, reverse: Bool) {
@@ -417,7 +755,10 @@ final class WindowSwitcherController {
             self.startBackwardRepeatIfPossible()
         }
         overlayDisplayWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + overlayDisplayDelay, execute: workItem)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + configuration.windowSwitcher.effectiveDisplayDelay,
+            execute: workItem
+        )
     }
 
     private func cancelScheduledOverlay() {
@@ -682,19 +1023,43 @@ final class WindowSwitcherController {
         windows: [AXUIElement],
         excludingKeys: Set<String>
     ) -> AXUIElement? {
-        let realWindows = windows.filter {
-            isSwitchableAXWindow($0)
-                && !excludingKeys.contains(windowKey(processIdentifier: processIdentifier, axWindow: $0))
+        let realWindows = windows.compactMap { window -> (window: AXUIElement, snapshot: AXWindowSnapshot)? in
+            guard !excludingKeys.contains(windowKey(processIdentifier: processIdentifier, axWindow: window)) else {
+                return nil
+            }
+            if let snapshot = copyAXWindowSnapshot(window) {
+                return snapshot.isSwitchable ? (window, snapshot) : nil
+            }
+            guard isSwitchableAXWindow(window) else {
+                return nil
+            }
+            return (
+                window,
+                AXWindowSnapshot(
+                    role: kAXWindowRole as String,
+                    subrole: nil,
+                    title: axTitle(for: window),
+                    minimized: nil,
+                    position: axPosition(for: window),
+                    size: axSize(for: window),
+                    main: nil,
+                    focused: nil
+                )
+            )
         }
-        if !title.isEmpty, let exact = realWindows.first(where: { axTitle(for: $0) == title }) {
-            return exact
+        if !title.isEmpty,
+           let exact = realWindows.first(where: { $0.snapshot.title == title }) {
+            return exact.window
         }
 
-        if let bounds, let matchingBounds = realWindows.first(where: { axBounds(for: $0).map { approximatelyEqual($0, bounds) } == true }) {
-            return matchingBounds
+        if let bounds,
+           let matchingBounds = realWindows.first(where: {
+               $0.snapshot.bounds.map { approximatelyEqual($0, bounds) } == true
+           }) {
+            return matchingBounds.window
         }
 
-        return realWindows.first
+        return realWindows.first?.window
     }
 
     private func isRealWindow(info: [String: Any]) -> Bool {
@@ -920,34 +1285,51 @@ final class WindowSwitcherController {
     }
 
     private func focus(_ choice: WindowChoice) {
+        focusGeneration &+= 1
+        let generation = focusGeneration
         let started = CFAbsoluteTimeGetCurrent()
         let appElement = axApplication(processIdentifier: choice.processIdentifier)
         configureAXTimeout(choice.axWindow)
-        log("focus begin \(describe(choice)) ax=\(debugAXWindow(choice.axWindow)) frontmostBefore=\(frontmostDescription())")
+        log("focus begin \(describe(choice)) frontmostBefore=\(frontmostDescription())")
 
-        expectFocusedWindowChange(to: choice)
+        expectFocusedWindowChange(to: choice, generation: generation)
         let unminimizeResult = AXUIElementSetAttributeValue(choice.axWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
         let initialAX = applyFocus(to: choice.axWindow, appElement: appElement, raise: true)
-        log("focus ax-only elapsed=\(elapsedMilliseconds(since: started)) unminimize=\(unminimizeResult.rawValue) ax=\(initialAX) focusedAX=\(focusedAXDescription(processIdentifier: choice.processIdentifier)) frontmostNow=\(frontmostDescription())")
+        scheduleAXObserverInstallation(for: choice)
+        log("focus ax-only elapsed=\(elapsedMilliseconds(since: started)) unminimize=\(unminimizeResult.rawValue) ax=\(initialAX) frontmostNow=\(frontmostDescription())")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            guard self.focusGeneration == generation,
+                  self.pendingFocusVerification?.generation == generation else {
+                self.log("focus retry1 skipped; stale generation=\(generation) current=\(self.focusGeneration) key=\(choice.key)")
+                return
+            }
             let retryAX = self.applyFocus(to: choice.axWindow, appElement: appElement, raise: true)
             self.verifyFocusedWindowChangeIfNeeded(processIdentifier: choice.processIdentifier, source: "retry1")
-            self.log("focus retry1 ax=\(retryAX) frontmostAfter=\(self.frontmostDescription()) focusedAX=\(self.focusedAXDescription(processIdentifier: choice.processIdentifier))")
+            self.log("focus retry1 ax=\(retryAX) frontmostAfter=\(self.frontmostDescription())")
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            guard self.focusGeneration == generation,
+                  self.pendingFocusVerification?.generation == generation else {
+                self.log("focus retry2 skipped; stale generation=\(generation) current=\(self.focusGeneration) key=\(choice.key)")
+                return
+            }
             let retryAX = self.applyFocus(to: choice.axWindow, appElement: appElement, raise: true)
             self.verifyFocusedWindowChangeIfNeeded(processIdentifier: choice.processIdentifier, source: "retry2")
-            self.log("focus retry2 ax=\(retryAX) frontmostAfter=\(self.frontmostDescription()) focusedAX=\(self.focusedAXDescription(processIdentifier: choice.processIdentifier))")
+            self.log("focus retry2 ax=\(retryAX) frontmostAfter=\(self.frontmostDescription())")
             self.recordFocusedWindow()
         }
 
         if choice.bundleIdentifier == "com.apple.finder" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                guard self.focusGeneration == generation else {
+                    self.log("focus finder-workaround skipped; stale generation=\(generation) current=\(self.focusGeneration) key=\(choice.key)")
+                    return
+                }
                 let retryAX = self.applyFocus(to: choice.axWindow, appElement: appElement, raise: true)
                 self.verifyFocusedWindowChangeIfNeeded(processIdentifier: choice.processIdentifier, source: "finder-workaround")
-                self.log("focus finder-workaround ax=\(retryAX) frontmostAfter=\(self.frontmostDescription()) focusedAX=\(self.focusedAXDescription(processIdentifier: choice.processIdentifier))")
+                self.log("focus finder-workaround ax=\(retryAX) frontmostAfter=\(self.frontmostDescription())")
             }
         }
     }
@@ -1196,9 +1578,17 @@ final class WindowSwitcherController {
             return false
         }
         configureAXTimeout(window)
-        let rawTitle = axTitle(for: window)
-        guard isSwitchableAXWindow(window) else {
-            return false
+        let rawTitle: String
+        if let snapshot = copyAXWindowSnapshot(window) {
+            guard snapshot.isSwitchable else {
+                return false
+            }
+            rawTitle = snapshot.title ?? ""
+        } else {
+            rawTitle = axTitle(for: window)
+            guard isSwitchableAXWindow(window) else {
+                return false
+            }
         }
         let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let cgIdentity = visibleCGWindowIdentity(
@@ -1217,8 +1607,7 @@ final class WindowSwitcherController {
             lastKnownBounds: cgIdentity?.bounds
         )
         remember(choice)
-        installAXObserver(processIdentifier: app.processIdentifier)
-        installAXObserver(for: choice)
+        scheduleAXObserverInstallation(for: choice)
         return true
     }
 
@@ -1466,6 +1855,26 @@ final class WindowSwitcherController {
         axApplicationObservers[processIdentifier] = observation
     }
 
+    private func scheduleAXObserverInstallation(for choice: WindowChoice) {
+        guard !pendingAXObserverInstallationKeys.contains(choice.key) else {
+            return
+        }
+        pendingAXObserverInstallationKeys.insert(choice.key)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.50) { [weak self] in
+            guard let self else {
+                return
+            }
+            self.pendingAXObserverInstallationKeys.remove(choice.key)
+            guard self.configuration.windowSwitcher.enabled,
+                  self.eventTapRunLoop.isActive,
+                  NSRunningApplication(processIdentifier: choice.processIdentifier) != nil else {
+                return
+            }
+            self.installAXObserver(processIdentifier: choice.processIdentifier)
+            self.installAXObserver(for: choice)
+        }
+    }
+
     private func removeAXObserver(processIdentifier: pid_t) {
         guard let observation = axApplicationObservers.removeValue(forKey: processIdentifier) else {
             return
@@ -1670,11 +2079,9 @@ final class WindowSwitcherController {
         return true
     }
 
-    private func expectFocusedWindowChange(to choice: WindowChoice) {
-        if axApplicationObservers[choice.processIdentifier] == nil {
-            installAXObserver(processIdentifier: choice.processIdentifier)
-        }
+    private func expectFocusedWindowChange(to choice: WindowChoice, generation: UInt64) {
         pendingFocusVerification = PendingFocusVerification(
+            generation: generation,
             key: choice.key,
             title: choice.title,
             processIdentifier: choice.processIdentifier,
@@ -1685,6 +2092,7 @@ final class WindowSwitcherController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self,
                   let pending = self.pendingFocusVerification,
+                  pending.generation == generation,
                   pending.key == choice.key else {
                 return
             }
@@ -1723,11 +2131,12 @@ final class WindowSwitcherController {
         ))
     }
 
-    private func log(_ message: String) {
+    private func log(_ message: @autoclosure () -> String) {
         guard configuration.windowSwitcher.debug else {
             return
         }
-        NSLog("[window-switcher] %@", message)
+        let renderedMessage = message()
+        windowSwitcherLogger.info("\(renderedMessage, privacy: .public)")
     }
 
     private func logSlowAX(_ message: String, since started: CFAbsoluteTime) {
@@ -1765,16 +2174,67 @@ final class WindowSwitcherController {
     }
 
     private func debugAXWindow(_ window: AXUIElement) -> String {
-        let role = axStringAttribute(kAXRoleAttribute, for: window) ?? "<nil>"
-        let subrole = axStringAttribute(kAXSubroleAttribute, for: window) ?? "<nil>"
-        let title = axTitle(for: window)
-        let minimized = axBoolAttribute(kAXMinimizedAttribute, for: window).map(String.init(describing:)) ?? "<nil>"
+        guard let snapshot = copyAXWindowSnapshot(window) else {
+            return "pid=\(processIdentifier(for: window)) hash=\(CFHash(window)) snapshot=<unavailable>"
+        }
         let hidden = NSRunningApplication(processIdentifier: processIdentifier(for: window))?.isHidden.description ?? "<nil>"
-        let size = axSize(for: window).map { "\($0.width)x\($0.height)" } ?? "<nil>"
-        let position = axPosition(for: window).map { "\($0.x),\($0.y)" } ?? "<nil>"
-        let main = axBoolAttribute(kAXMainAttribute, for: window).map(String.init(describing:)) ?? "<nil>"
-        let focused = axBoolAttribute(kAXFocusedAttribute, for: window).map(String.init(describing:)) ?? "<nil>"
-        return "role=\(role) subrole=\(subrole) title=\(title) minimized=\(minimized) hidden=\(hidden) main=\(main) focused=\(focused) position=\(position) size=\(size)"
+        let size = snapshot.size.map { "\($0.width)x\($0.height)" } ?? "<nil>"
+        let position = snapshot.position.map { "\($0.x),\($0.y)" } ?? "<nil>"
+        return "role=\(snapshot.role ?? "<nil>") subrole=\(snapshot.subrole ?? "<nil>") title=\(snapshot.title ?? "") minimized=\(snapshot.minimized.map(String.init(describing:)) ?? "<nil>") hidden=\(hidden) main=\(snapshot.main.map(String.init(describing:)) ?? "<nil>") focused=\(snapshot.focused.map(String.init(describing:)) ?? "<nil>") position=\(position) size=\(size)"
+    }
+
+    private func copyAXWindowSnapshot(_ window: AXUIElement) -> AXWindowSnapshot? {
+        let attributes: [CFString] = [
+            kAXRoleAttribute as CFString,
+            kAXSubroleAttribute as CFString,
+            kAXTitleAttribute as CFString,
+            kAXMinimizedAttribute as CFString,
+            kAXPositionAttribute as CFString,
+            kAXSizeAttribute as CFString,
+            kAXMainAttribute as CFString,
+            kAXFocusedAttribute as CFString
+        ]
+        var copiedValues: CFArray?
+        let result = AXUIElementCopyMultipleAttributeValues(
+            window,
+            attributes as CFArray,
+            [],
+            &copiedValues
+        )
+        guard result == .success,
+              let values = copiedValues as? [Any],
+              values.count == attributes.count else {
+            return nil
+        }
+
+        func point(at index: Int) -> CGPoint? {
+            guard CFGetTypeID(values[index] as CFTypeRef) == AXValueGetTypeID() else {
+                return nil
+            }
+            let value = values[index] as! AXValue
+            var point = CGPoint.zero
+            return AXValueGetValue(value, .cgPoint, &point) ? point : nil
+        }
+
+        func size(at index: Int) -> CGSize? {
+            guard CFGetTypeID(values[index] as CFTypeRef) == AXValueGetTypeID() else {
+                return nil
+            }
+            let value = values[index] as! AXValue
+            var size = CGSize.zero
+            return AXValueGetValue(value, .cgSize, &size) ? size : nil
+        }
+
+        return AXWindowSnapshot(
+            role: values[0] as? String,
+            subrole: values[1] as? String,
+            title: values[2] as? String,
+            minimized: values[3] as? Bool,
+            position: point(at: 4),
+            size: size(at: 5),
+            main: values[6] as? Bool,
+            focused: values[7] as? Bool
+        )
     }
 
     private func processIdentifier(for element: AXUIElement) -> pid_t {
@@ -1823,10 +2283,4 @@ final class WindowSwitcherController {
         return window
     }
 
-    private func focusedAXDescription(processIdentifier: pid_t) -> String {
-        guard let window = focusedAXWindow(processIdentifier: processIdentifier) else {
-            return "<none>"
-        }
-        return debugAXWindow(window)
-    }
 }

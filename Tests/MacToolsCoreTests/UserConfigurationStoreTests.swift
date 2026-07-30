@@ -416,6 +416,41 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertTrue(configuration.windowSwitcher.restorePreviousApplicationWhenNoWindows)
     }
 
+    func testWindowSwitcherDisplayDelayDefaultsRoundTripsAndIsRuntimeBounded() throws {
+        let store = UserConfigurationStore()
+        let encoded = try store.encodeConfigurationAsJSONC(.migratedHammerspoonDefault())
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(String(decoding: encoded, as: UTF8.self)
+                .split(separator: "\n")
+                .dropFirst(3)
+                .joined(separator: "\n").utf8)
+        ) as? [String: Any])
+        var windowSwitcher = try XCTUnwrap(object["windowSwitcher"] as? [String: Any])
+        windowSwitcher.removeValue(forKey: "displayDelay")
+        object["windowSwitcher"] = windowSwitcher
+
+        let legacy = try store.decodeConfiguration(
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(
+            legacy.windowSwitcher.displayDelay,
+            WindowSwitcherSettings.defaultDisplayDelay,
+            accuracy: 0.0001
+        )
+
+        var expected = legacy
+        expected.windowSwitcher.displayDelay = 0.42
+        let roundTripped = try store.decodeConfiguration(
+            from: store.encodeConfigurationAsJSONC(expected)
+        )
+        XCTAssertEqual(roundTripped.windowSwitcher.displayDelay, 0.42, accuracy: 0.0001)
+
+        expected.windowSwitcher.displayDelay = -1
+        XCTAssertEqual(expected.windowSwitcher.effectiveDisplayDelay, 0, accuracy: 0.0001)
+        expected.windowSwitcher.displayDelay = 3
+        XCTAssertEqual(expected.windowSwitcher.effectiveDisplayDelay, 2, accuracy: 0.0001)
+    }
+
     func testWindowSwitcherRestorePreviousApplicationSettingRoundTripsOff() throws {
         let store = UserConfigurationStore()
         var expected = UserConfiguration.migratedHammerspoonDefault()

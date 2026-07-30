@@ -96,6 +96,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case switcherWidth = 100
         case switcherHeight
         case switcherMaxRows
+        case switcherDisplayDelay
         case pythonPath
         case finderBundleIdentifier
         case terminalBundleIdentifier
@@ -425,6 +426,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             ("Same application", readOnlyValue(configuration.windowSwitcher.sameApplicationBehavior), "Current strategy identifier; alternative strategies are not implemented yet."),
             ("Screen", followScreen, "Places the switcher on the screen containing the focused window."),
             ("Empty application", restorePreviousApplication, "Returns to the most recent window after repeated checks confirm that the frontmost application has no usable windows."),
+            ("Display delay", editableField(String(format: "%.2f", configuration.windowSwitcher.displayDelay), field: .switcherDisplayDelay, width: 150), "Seconds from the first Command-Tab press until the switcher appears; accepts 0...2."),
             ("Width", editableField(String(configuration.windowSwitcher.width), field: .switcherWidth, width: 150), "Switcher overlay width in points."),
             ("Height", editableField(String(configuration.windowSwitcher.height), field: .switcherHeight, width: 150), "Switcher overlay height in points."),
             ("Maximum rows", editableField(String(configuration.windowSwitcher.maxVisibleRows), field: .switcherMaxRows, width: 150), "Maximum number of visible window rows.")
@@ -1089,6 +1091,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             let value = try boundedInt(rawValue, name: "Maximum rows", range: 1 ... 50)
             configuration.windowSwitcher.maxVisibleRows = value
             persist { $0.windowSwitcher.maxVisibleRows = value }
+        case .switcherDisplayDelay:
+            guard let value = TimeInterval(rawValue), WindowSwitcherSettings.displayDelayRange.contains(value) else {
+                throw MutationError.invalidValue("Display delay must be between 0 and 2 seconds.")
+            }
+            configuration.windowSwitcher.displayDelay = value
+            persist { $0.windowSwitcher.displayDelay = value }
         case .pythonPath:
             let value = try requiredText(rawValue, name: "Python path")
             configuration.scripting.pythonPath = value
@@ -1180,6 +1188,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .switcherWidth: String(configuration.windowSwitcher.width)
         case .switcherHeight: String(configuration.windowSwitcher.height)
         case .switcherMaxRows: String(configuration.windowSwitcher.maxVisibleRows)
+        case .switcherDisplayDelay: String(format: "%.2f", configuration.windowSwitcher.displayDelay)
         case .pythonPath: configuration.scripting.pythonPath
         case .finderBundleIdentifier: configuration.application.finderBundleIdentifier
         case .terminalBundleIdentifier: configuration.application.terminalBundleIdentifier

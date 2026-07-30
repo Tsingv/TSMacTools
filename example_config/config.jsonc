@@ -220,6 +220,7 @@
   "windowSwitcher": {
     "commandTabBehavior": "most-recent-window", // Reserved current strategy identifier; alternate strategies are not implemented yet.
     "debug": true,
+    "displayDelay": 0.15, // Seconds from the first Command+Tab press until the overlay appears; Settings accepts 0...2.
     "enabled": true,
     "followFocusedScreen": true, // Centers the overlay on the selected Accessibility window's display.
     "height": 420, // Settings accepts 120...1200; runtime also guards malformed external values.

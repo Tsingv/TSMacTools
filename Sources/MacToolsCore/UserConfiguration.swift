@@ -371,11 +371,15 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
 }
 
 public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
+    public static let defaultDisplayDelay: TimeInterval = 0.15
+    public static let displayDelayRange: ClosedRange<TimeInterval> = 0 ... 2
+
     public var enabled: Bool
     public var commandTabBehavior: String
     public var sameApplicationBehavior: String
     public var followFocusedScreen: Bool
     public var restorePreviousApplicationWhenNoWindows: Bool
+    public var displayDelay: TimeInterval
     public var width: Int
     public var height: Int
     public var maxVisibleRows: Int
@@ -387,6 +391,7 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
         sameApplicationBehavior: String,
         followFocusedScreen: Bool,
         restorePreviousApplicationWhenNoWindows: Bool = true,
+        displayDelay: TimeInterval = WindowSwitcherSettings.defaultDisplayDelay,
         width: Int,
         height: Int,
         maxVisibleRows: Int,
@@ -397,6 +402,7 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
         self.sameApplicationBehavior = sameApplicationBehavior
         self.followFocusedScreen = followFocusedScreen
         self.restorePreviousApplicationWhenNoWindows = restorePreviousApplicationWhenNoWindows
+        self.displayDelay = displayDelay
         self.width = width
         self.height = height
         self.maxVisibleRows = maxVisibleRows
@@ -409,6 +415,7 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
         case sameApplicationBehavior
         case followFocusedScreen
         case restorePreviousApplicationWhenNoWindows
+        case displayDelay
         case width
         case height
         case maxVisibleRows
@@ -425,10 +432,18 @@ public struct WindowSwitcherSettings: Equatable, Codable, Sendable {
             Bool.self,
             forKey: .restorePreviousApplicationWhenNoWindows
         ) ?? true
+        self.displayDelay = try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .displayDelay
+        ) ?? Self.defaultDisplayDelay
         self.width = try container.decode(Int.self, forKey: .width)
         self.height = try container.decode(Int.self, forKey: .height)
         self.maxVisibleRows = try container.decode(Int.self, forKey: .maxVisibleRows)
         self.debug = try container.decodeIfPresent(Bool.self, forKey: .debug) ?? false
+    }
+
+    public var effectiveDisplayDelay: TimeInterval {
+        min(max(displayDelay, Self.displayDelayRange.lowerBound), Self.displayDelayRange.upperBound)
     }
 }
 

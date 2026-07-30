@@ -141,3 +141,38 @@ final class WindowSwitcherBackwardRepeatPolicyTests: XCTestCase {
         XCTAssertGreaterThan(policy.initialDelay, policy.repeatInterval)
     }
 }
+
+final class WindowSwitcherCommandModifierIsolationTests: XCTestCase {
+    func testQuickCommandTabHidesTheWholeCommandChord() {
+        var isolation = WindowSwitcherCommandModifierIsolation()
+
+        XCTAssertEqual(isolation.handle(.commandDown), .deferCurrent)
+        XCTAssertEqual(isolation.handle(.switcherKeyDown), .suppressCurrent)
+        XCTAssertEqual(isolation.handle(.commandUp), .suppressCurrent)
+    }
+
+    func testOrdinaryCommandShortcutReplaysCommandBeforeTheKey() {
+        var isolation = WindowSwitcherCommandModifierIsolation()
+
+        XCTAssertEqual(isolation.handle(.commandDown), .deferCurrent)
+        XCTAssertEqual(isolation.handle(.other), .replayDeferredAndCurrent)
+        XCTAssertEqual(isolation.handle(.commandUp), .passCurrent)
+    }
+
+    func testCommandTapReplaysBothModifierTransitions() {
+        var isolation = WindowSwitcherCommandModifierIsolation()
+
+        XCTAssertEqual(isolation.handle(.commandDown), .deferCurrent)
+        XCTAssertEqual(isolation.handle(.commandUp), .replayDeferredAndCurrent)
+    }
+
+    func testExpiredDeferralLeavesLaterCommandEventsUnchanged() {
+        var isolation = WindowSwitcherCommandModifierIsolation()
+
+        XCTAssertEqual(isolation.handle(.commandDown), .deferCurrent)
+        XCTAssertTrue(isolation.expireDeferredCommandDown())
+        XCTAssertFalse(isolation.expireDeferredCommandDown())
+        XCTAssertEqual(isolation.handle(.switcherKeyDown), .passCurrent)
+        XCTAssertEqual(isolation.handle(.commandUp), .passCurrent)
+    }
+}

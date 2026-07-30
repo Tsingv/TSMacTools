@@ -130,6 +130,76 @@ public struct WindowSwitcherBackwardRepeatPolicy: Equatable, Sendable {
     }
 }
 
+public struct WindowSwitcherCommandModifierIsolation: Equatable, Sendable {
+    public enum Input: Equatable, Sendable {
+        case commandDown
+        case commandUp
+        case switcherKeyDown
+        case other
+    }
+
+    public enum Action: Equatable, Sendable {
+        case passCurrent
+        case deferCurrent
+        case replayDeferredAndCurrent
+        case suppressCurrent
+    }
+
+    private var hasDeferredCommandDown = false
+    private var hidesCommandForSwitcher = false
+
+    public init() {}
+
+    public mutating func handle(_ input: Input) -> Action {
+        switch input {
+        case .commandDown:
+            guard !hidesCommandForSwitcher else {
+                return .suppressCurrent
+            }
+            hasDeferredCommandDown = true
+            return .deferCurrent
+        case .switcherKeyDown:
+            guard hasDeferredCommandDown else {
+                return .passCurrent
+            }
+            hasDeferredCommandDown = false
+            hidesCommandForSwitcher = true
+            return .suppressCurrent
+        case .commandUp:
+            if hidesCommandForSwitcher {
+                hidesCommandForSwitcher = false
+                return .suppressCurrent
+            }
+            if hasDeferredCommandDown {
+                hasDeferredCommandDown = false
+                return .replayDeferredAndCurrent
+            }
+            return .passCurrent
+        case .other:
+            guard hasDeferredCommandDown else {
+                return .passCurrent
+            }
+            hasDeferredCommandDown = false
+            return .replayDeferredAndCurrent
+        }
+    }
+
+    public mutating func expireDeferredCommandDown() -> Bool {
+        guard hasDeferredCommandDown else {
+            return false
+        }
+        hasDeferredCommandDown = false
+        return true
+    }
+
+    public mutating func reset() -> Bool {
+        let shouldReplayDeferredCommandDown = hasDeferredCommandDown
+        hasDeferredCommandDown = false
+        hidesCommandForSwitcher = false
+        return shouldReplayDeferredCommandDown
+    }
+}
+
 @MainActor
 public final class AutomationRuntime {
     private let windowManager: WindowManaging
