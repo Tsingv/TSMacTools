@@ -54,6 +54,47 @@ public struct WindowAbsenceConfirmation: Equatable, Sendable {
     }
 }
 
+public struct WindowActivationCapturePolicy: Equatable, Sendable {
+    public let retryDelays: [TimeInterval]
+
+    public init(retryDelays: [TimeInterval] = [0.05, 0.18, 0.45]) {
+        precondition(!retryDelays.isEmpty)
+        precondition(retryDelays.allSatisfy { $0 >= 0 })
+        self.retryDelays = retryDelays
+    }
+
+    public func shouldCapture(
+        expectedProcessIdentifier: Int32,
+        frontmostProcessIdentifier: Int32?,
+        generation: UInt64,
+        currentGeneration: UInt64
+    ) -> Bool {
+        generation == currentGeneration
+            && frontmostProcessIdentifier == expectedProcessIdentifier
+    }
+}
+
+public enum WindowSwitcherSelectionPolicy {
+    public static func previousIndex(currentIndex: Int, choiceCount: Int) -> Int? {
+        guard choiceCount > 0, (0..<choiceCount).contains(currentIndex) else {
+            return nil
+        }
+        return (currentIndex - 1 + choiceCount) % choiceCount
+    }
+}
+
+public struct WindowSwitcherBackwardRepeatPolicy: Equatable, Sendable {
+    public let initialDelay: TimeInterval
+    public let repeatInterval: TimeInterval
+
+    public init(initialDelay: TimeInterval, repeatInterval: TimeInterval) {
+        precondition(initialDelay >= 0)
+        precondition(repeatInterval > 0)
+        self.initialDelay = initialDelay
+        self.repeatInterval = repeatInterval
+    }
+}
+
 @MainActor
 public final class AutomationRuntime {
     private let windowManager: WindowManaging

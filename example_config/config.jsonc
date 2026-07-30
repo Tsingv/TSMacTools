@@ -216,7 +216,7 @@
     }
   },
 
-  // Native Command+Tab style window switcher settings.
+  // Native Command+Tab style window switcher settings. Finder/Dock activation refreshes Office recency; hold Command+Shift to move upward at the system key-repeat speed.
   "windowSwitcher": {
     "commandTabBehavior": "most-recent-window", // Reserved current strategy identifier; alternate strategies are not implemented yet.
     "debug": true,
