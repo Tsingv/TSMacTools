@@ -168,6 +168,8 @@ Current migrated user configuration:
 - `~/.config/tsmactool/scripts/translate_selection.py` is the user-facing translation script. It receives `config`, `input_text`, and `nativewindow` as injected globals, normalizes common PDF hard-wrapped selected text when enabled, calls the configured translation provider, and shows a native Markdown window instead of using `hs.webview`.
 - The repository template at `example_config/scripts/translate_selection.py` should not contain a real API key.
 
+Window-switcher candidate construction reuses a recent AX window only when its current on-screen `CGWindowID` matches (with bounded title/bounds fallback for legacy cache entries), so known visible windows do not repeat full `kAXWindows` enumeration on every switch. A transient AX timeout while checking a cached window is indeterminate rather than proof that the window was destroyed; indeterminate windows retain their recency, while invalid AX elements and terminated processes are removed. A successful activation capture completes that activation generation so the later 180/450 ms retries do not repeat observer and attribute work.
+
 ## Testing Strategy
 
 Build, test, and run through the Xcode project. Do not use `swift test` or `swift run` for normal validation, because they do not exercise the same app target, signing, bundle, and runtime wiring as Xcode:

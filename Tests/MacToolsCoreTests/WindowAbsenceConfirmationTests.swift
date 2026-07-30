@@ -59,6 +59,63 @@ final class WindowActivationCapturePolicyTests: XCTestCase {
             currentGeneration: 7
         ))
     }
+
+    func testRejectsRepeatedCaptureAfterGenerationCompleted() {
+        XCTAssertFalse(WindowActivationCapturePolicy().shouldCapture(
+            expectedProcessIdentifier: 42,
+            frontmostProcessIdentifier: 42,
+            generation: 7,
+            currentGeneration: 7,
+            completedGeneration: 7
+        ))
+    }
+}
+
+final class WindowSwitcherCandidateOrderingPolicyTests: XCTestCase {
+    func testIndeterminateRecentWindowKeepsItsRecency() {
+        XCTAssertEqual(
+            WindowSwitcherCandidateOrderingPolicy.orderedKeys(
+                recentKeys: ["chatgpt", "finder"],
+                enumeratedKeys: ["finder", "new-window", "chatgpt"],
+                stateByKey: [
+                    "chatgpt": .indeterminate,
+                    "finder": .active,
+                    "new-window": .active
+                ],
+                frontmostKey: nil
+            ),
+            ["chatgpt", "finder", "new-window"]
+        )
+    }
+
+    func testDestroyedRecentWindowIsDroppedAndDormantWindowMovesLast() {
+        XCTAssertEqual(
+            WindowSwitcherCandidateOrderingPolicy.orderedKeys(
+                recentKeys: ["destroyed", "hidden", "active"],
+                enumeratedKeys: ["new-window", "active"],
+                stateByKey: [
+                    "destroyed": .destroyed,
+                    "hidden": .dormant,
+                    "active": .active,
+                    "new-window": .active
+                ],
+                frontmostKey: nil
+            ),
+            ["active", "new-window", "hidden"]
+        )
+    }
+
+    func testFrontmostEnumeratedWindowIsPromoted() {
+        XCTAssertEqual(
+            WindowSwitcherCandidateOrderingPolicy.orderedKeys(
+                recentKeys: ["recent"],
+                enumeratedKeys: ["recent", "frontmost"],
+                stateByKey: ["recent": .active, "frontmost": .active],
+                frontmostKey: "frontmost"
+            ),
+            ["frontmost", "recent"]
+        )
+    }
 }
 
 final class WindowSwitcherSelectionPolicyTests: XCTestCase {

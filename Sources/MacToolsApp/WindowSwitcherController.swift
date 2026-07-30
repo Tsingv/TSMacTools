@@ -76,6 +76,14 @@ final class WindowSwitcherController {
     private enum WindowLifecycleState {
         case active
         case dormant
+        case indeterminate
+        case destroyed
+    }
+
+    private enum AXWindowValidity {
+        case switchable
+        case notSwitchable
+        case indeterminate
         case destroyed
     }
 
@@ -87,6 +95,8 @@ final class WindowSwitcherController {
         var processIdentifier: pid_t
         var icon: NSImage?
         var axWindow: AXUIElement
+        var cgWindowIdentifier: CGWindowID?
+        var lastKnownBounds: CGRect?
     }
 
     private struct PendingFocusVerification {
@@ -144,6 +154,7 @@ final class WindowSwitcherController {
     private var pendingFocusVerification: PendingFocusVerification?
     private let activationCapturePolicy = WindowActivationCapturePolicy()
     private var activationCaptureGeneration: UInt64 = 0
+    private var completedActivationCaptureGeneration: UInt64?
     private let axMessagingTimeout: Float = 0.08
     private let axWindowEnumerationRetryTimeout: Float = 0.30
 
@@ -207,6 +218,7 @@ final class WindowSwitcherController {
 
     func stop() {
         activationCaptureGeneration &+= 1
+        completedActivationCaptureGeneration = nil
         hideOverlay()
         removeWorkspaceObservers()
         if let eventTap {
@@ -421,7 +433,7 @@ final class WindowSwitcherController {
             log("buildChoices elapsed=\(elapsedMilliseconds(since: started)) sameApplication=\(sameApplication) cgWindows=\(cgCount) enumerated=\(enumeratedCount)")
         }
 
-        pruneRecentWindows()
+        pruneRecentWindows(validateAccessibility: false)
         let frontmostBundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let ignoredNames = Set(configuration.application.ignoredWindowApplicationNames)
@@ -431,6 +443,17 @@ final class WindowSwitcherController {
             return []
         }
         cgCount = windowInfo.count
+
+        let visibleWindowCountByProcessIdentifier = windowInfo.reduce(into: [pid_t: Int]()) { counts, info in
+            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let ownerName = info[kCGWindowOwnerName as String] as? String,
+                  !ignoredNames.contains(ownerName),
+                  isRealWindow(info: info) else {
+                return
+            }
+            counts[pid, default: 0] += 1
+        }
 
         var seen = Set<String>()
         var axWindowsByProcessIdentifier: [pid_t: [AXUIElement]] = [:]
@@ -461,6 +484,23 @@ final class WindowSwitcherController {
             }
 
             let cgTitle = cgTitle(from: info)
+            let bounds = cgBounds(from: info)
+            let cgWindowIdentifier = info[kCGWindowNumber as String] as? CGWindowID
+            if var cachedChoice = cachedRecentChoice(
+                processIdentifier: pid,
+                title: cgTitle,
+                bounds: bounds,
+                cgWindowIdentifier: cgWindowIdentifier,
+                visibleWindowCount: visibleWindowCountByProcessIdentifier[pid] ?? 0,
+                excludingKeys: seen
+            ) {
+                cachedChoice.cgWindowIdentifier = cgWindowIdentifier ?? cachedChoice.cgWindowIdentifier
+                cachedChoice.lastKnownBounds = bounds ?? cachedChoice.lastKnownBounds
+                recentChoices[cachedChoice.key] = cachedChoice
+                seen.insert(cachedChoice.key)
+                return cachedChoice
+            }
+
             let axWindows: [AXUIElement]
             if let cached = axWindowsByProcessIdentifier[pid] {
                 axWindows = cached
@@ -477,7 +517,7 @@ final class WindowSwitcherController {
             guard let axWindow = findAXWindow(
                 processIdentifier: pid,
                 title: cgTitle,
-                bounds: cgBounds(from: info),
+                bounds: bounds,
                 windows: axWindows,
                 excludingKeys: seen
             ) else {
@@ -504,36 +544,52 @@ final class WindowSwitcherController {
                 bundleIdentifier: bundleIdentifier,
                 processIdentifier: pid,
                 icon: app?.icon,
-                axWindow: axWindow
+                axWindow: axWindow,
+                cgWindowIdentifier: cgWindowIdentifier,
+                lastKnownBounds: bounds
             )
         }
         enumeratedCount = enumerated.count
 
         let byKey = Dictionary(uniqueKeysWithValues: enumerated.map { ($0.key, $0) })
-        let recent = recentKeys.compactMap { key -> (WindowChoice, WindowLifecycleState)? in
+        var choicesByKey = byKey
+        var stateByKey = Dictionary(uniqueKeysWithValues: enumerated.map {
+            ($0.key, WindowSwitcherWindowState.active)
+        })
+        for key in recentKeys {
             guard let choice = byKey[key] ?? recentChoices[key] else {
-                return nil
+                continue
             }
             if sameApplication,
                choice.processIdentifier != frontmostPID,
                choice.bundleIdentifier != frontmostBundleIdentifier {
-                return nil
+                continue
             }
-            let state = lifecycleState(for: choice)
-            guard state != .destroyed else {
-                return nil
+            choicesByKey[key] = choice
+            let state = byKey[key] == nil ? lifecycleState(for: choice) : .active
+            switch state {
+            case .active:
+                stateByKey[key] = .active
+            case .dormant:
+                stateByKey[key] = .dormant
+            case .indeterminate:
+                stateByKey[key] = .indeterminate
+            case .destroyed:
+                stateByKey[key] = .destroyed
             }
-            return (choice, state)
         }
-        let recentSet = Set(recent.map { $0.0.key })
-        let activeRecent = recent.filter { $0.1 == .active }.map(\.0)
-        let dormantRecent = recent.filter { $0.1 == .dormant }.map(\.0)
-        var result = activeRecent + enumerated.filter { !recentSet.contains($0.key) } + dormantRecent
-        if let frontmostPID,
-           let currentFrontmostWindow = enumerated.first(where: { $0.processIdentifier == frontmostPID }),
-           let currentIndex = result.firstIndex(where: { $0.key == currentFrontmostWindow.key }) {
-            result.remove(at: currentIndex)
-            result.insert(currentFrontmostWindow, at: 0)
+
+        let currentFrontmostWindow = frontmostPID.flatMap { frontmostPID in
+            enumerated.first(where: { $0.processIdentifier == frontmostPID })
+        }
+        let orderedKeys = WindowSwitcherCandidateOrderingPolicy.orderedKeys(
+            recentKeys: recentKeys,
+            enumeratedKeys: enumerated.map(\.key),
+            stateByKey: stateByKey,
+            frontmostKey: currentFrontmostWindow?.key
+        )
+        let result = orderedKeys.compactMap { choicesByKey[$0] }
+        if let currentFrontmostWindow {
             remember(currentFrontmostWindow)
         }
         let orderedDescription = result.enumerated()
@@ -541,6 +597,50 @@ final class WindowSwitcherController {
             .joined(separator: " | ")
         log("choices ordered=\(orderedDescription)")
         return result
+    }
+
+    private func cachedRecentChoice(
+        processIdentifier: pid_t,
+        title: String,
+        bounds: CGRect?,
+        cgWindowIdentifier: CGWindowID?,
+        visibleWindowCount: Int,
+        excludingKeys: Set<String>
+    ) -> WindowChoice? {
+        let candidates = recentKeys.compactMap { key -> WindowChoice? in
+            guard !excludingKeys.contains(key),
+                  let choice = recentChoices[key],
+                  choice.processIdentifier == processIdentifier else {
+                return nil
+            }
+            return choice
+        }
+        guard !candidates.isEmpty else {
+            return nil
+        }
+
+        if let cgWindowIdentifier,
+           let identifierMatch = candidates.first(where: {
+               $0.cgWindowIdentifier == cgWindowIdentifier
+           }) {
+            return identifierMatch
+        }
+        if !title.isEmpty,
+           let titleMatch = candidates.first(where: { $0.title == title }) {
+            return titleMatch
+        }
+        if let bounds,
+           let boundsMatch = candidates.first(where: {
+               $0.lastKnownBounds.map { approximatelyEqual($0, bounds) } == true
+           }) {
+            return boundsMatch
+        }
+        if visibleWindowCount == 1,
+           candidates.count == 1,
+           candidates[0].cgWindowIdentifier == nil {
+            return candidates[0]
+        }
+        return nil
     }
 
     private func copyAXWindows(processIdentifier: pid_t) -> [AXUIElement]? {
@@ -630,6 +730,50 @@ final class WindowSwitcherController {
         return true
     }
 
+    private func cachedAXWindowValidity(_ window: AXUIElement) -> AXWindowValidity {
+        let (roleResult, roleValue) = copyAXAttribute(kAXRoleAttribute, from: window)
+        if roleResult == .invalidUIElement {
+            return .destroyed
+        }
+        guard roleResult == .success else {
+            return .indeterminate
+        }
+        guard roleValue as? String == kAXWindowRole as String else {
+            return .notSwitchable
+        }
+
+        let (subroleResult, subroleValue) = copyAXAttribute(kAXSubroleAttribute, from: window)
+        if subroleResult == .invalidUIElement {
+            return .destroyed
+        }
+        if subroleResult == .success,
+           let subrole = subroleValue as? String,
+           subrole != kAXStandardWindowSubrole as String,
+           subrole != kAXDialogSubrole as String {
+            return .notSwitchable
+        }
+        if subroleResult != .success && subroleResult != .attributeUnsupported {
+            return .indeterminate
+        }
+
+        let (sizeResult, sizeValue) = copyAXAttribute(kAXSizeAttribute, from: window)
+        if sizeResult == .invalidUIElement {
+            return .destroyed
+        }
+        guard sizeResult == .success,
+              let sizeValue,
+              CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
+            return sizeResult == .success ? .notSwitchable : .indeterminate
+        }
+        var size = CGSize.zero
+        guard AXValueGetValue((sizeValue as! AXValue), .cgSize, &size),
+              size.width >= 80,
+              size.height >= 60 else {
+            return .notSwitchable
+        }
+        return .switchable
+    }
+
     private func isSubstantialAXWindow(_ window: AXUIElement) -> Bool {
         guard axStringAttribute(kAXRoleAttribute, for: window) == kAXWindowRole as String,
               let size = axSize(for: window),
@@ -641,17 +785,44 @@ final class WindowSwitcherController {
     }
 
     private func lifecycleState(for choice: WindowChoice) -> WindowLifecycleState {
-        guard NSRunningApplication(processIdentifier: choice.processIdentifier) != nil,
-              isSwitchableAXWindow(choice.axWindow) else {
+        guard let application = NSRunningApplication(processIdentifier: choice.processIdentifier) else {
             return .destroyed
         }
 
-        if NSRunningApplication(processIdentifier: choice.processIdentifier)?.isHidden == true
-            || axBoolAttribute(kAXMinimizedAttribute, for: choice.axWindow) == true {
+        switch cachedAXWindowValidity(choice.axWindow) {
+        case .destroyed, .notSwitchable:
+            return .destroyed
+        case .indeterminate:
+            return .indeterminate
+        case .switchable:
+            break
+        }
+
+        if application.isHidden {
             return .dormant
         }
 
+        let (minimizedResult, minimizedValue) = copyAXAttribute(kAXMinimizedAttribute, from: choice.axWindow)
+        if minimizedResult == .invalidUIElement {
+            return .destroyed
+        }
+        if minimizedResult == .success, minimizedValue as? Bool == true {
+            return .dormant
+        }
+        if minimizedResult != .success && minimizedResult != .attributeUnsupported {
+            return .indeterminate
+        }
+
         return .active
+    }
+
+    private func copyAXAttribute(
+        _ attribute: String,
+        from element: AXUIElement
+    ) -> (AXError, CFTypeRef?) {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        return (result, value)
     }
 
     private func axStringAttribute(_ attribute: String, for element: AXUIElement) -> String? {
@@ -1017,7 +1188,6 @@ final class WindowSwitcherController {
             return false
         }
 
-        installAXObserver(processIdentifier: app.processIdentifier)
         let appElement = axApplication(processIdentifier: app.processIdentifier)
         let preferredAttribute = preferMainWindow ? kAXMainWindowAttribute : kAXFocusedWindowAttribute
         let fallbackAttribute = preferMainWindow ? kAXFocusedWindowAttribute : kAXMainWindowAttribute
@@ -1031,6 +1201,10 @@ final class WindowSwitcherController {
             return false
         }
         let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cgIdentity = visibleCGWindowIdentity(
+            processIdentifier: app.processIdentifier,
+            title: title
+        )
         let choice = WindowChoice(
             key: windowKey(processIdentifier: app.processIdentifier, axWindow: window),
             title: title.isEmpty ? "\(app.localizedName ?? "Application") Window" : title,
@@ -1038,11 +1212,45 @@ final class WindowSwitcherController {
             bundleIdentifier: app.bundleIdentifier ?? "",
             processIdentifier: app.processIdentifier,
             icon: app.icon,
-            axWindow: window
+            axWindow: window,
+            cgWindowIdentifier: cgIdentity?.identifier,
+            lastKnownBounds: cgIdentity?.bounds
         )
         remember(choice)
+        installAXObserver(processIdentifier: app.processIdentifier)
         installAXObserver(for: choice)
         return true
+    }
+
+    private func visibleCGWindowIdentity(
+        processIdentifier: pid_t,
+        title: String
+    ) -> (identifier: CGWindowID?, bounds: CGRect?)? {
+        guard let windowInfo = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+        let candidates = windowInfo.filter { info in
+            (info[kCGWindowLayer as String] as? Int) == 0
+                && (info[kCGWindowOwnerPID as String] as? pid_t) == processIdentifier
+                && isRealWindow(info: info)
+        }
+        if !title.isEmpty,
+           let titleMatch = candidates.first(where: { cgTitle(from: $0) == title }) {
+            return (
+                titleMatch[kCGWindowNumber as String] as? CGWindowID,
+                cgBounds(from: titleMatch)
+            )
+        }
+        if candidates.count == 1 {
+            return (
+                candidates[0][kCGWindowNumber as String] as? CGWindowID,
+                cgBounds(from: candidates[0])
+            )
+        }
+        return nil
     }
 
     private func copySwitchableWindow(attribute: String, from appElement: AXUIElement) -> AXUIElement? {
@@ -1138,6 +1346,7 @@ final class WindowSwitcherController {
     private func scheduleActivatedWindowCaptures(for application: NSRunningApplication) {
         activationCaptureGeneration &+= 1
         let generation = activationCaptureGeneration
+        completedActivationCaptureGeneration = nil
         let processIdentifier = application.processIdentifier
         for delay in activationCapturePolicy.retryDelays {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -1149,7 +1358,8 @@ final class WindowSwitcherController {
                     expectedProcessIdentifier: processIdentifier,
                     frontmostProcessIdentifier: frontmostPID,
                     generation: generation,
-                    currentGeneration: self.activationCaptureGeneration
+                    currentGeneration: self.activationCaptureGeneration,
+                    completedGeneration: self.completedActivationCaptureGeneration
                 ) else {
                     return
                 }
@@ -1157,6 +1367,9 @@ final class WindowSwitcherController {
                     expectedProcessIdentifier: processIdentifier,
                     preferMainWindow: true
                 )
+                if captured {
+                    self.completedActivationCaptureGeneration = generation
+                }
                 self.log("activation capture pid=\(processIdentifier) delay=\(delay)s captured=\(captured)")
             }
         }
@@ -1168,14 +1381,14 @@ final class WindowSwitcherController {
         workspaceObservers.removeAll()
     }
 
-    private func pruneRecentWindows() {
+    private func pruneRecentWindows(validateAccessibility: Bool = true) {
         let runningPIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
         recentKeys.removeAll { key in
             guard let choice = recentChoices[key] else {
                 return true
             }
             let keep = runningPIDs.contains(choice.processIdentifier)
-                && lifecycleState(for: choice) != .destroyed
+                && (!validateAccessibility || lifecycleState(for: choice) != .destroyed)
             if !keep {
                 recentChoices[key] = nil
                 removeAXObserver(forWindowKey: key)
@@ -1186,9 +1399,12 @@ final class WindowSwitcherController {
 
     private func moveDormantWindowsToEnd() {
         pruneRecentWindows()
+        let stateByKey = Dictionary(uniqueKeysWithValues: recentKeys.map { key in
+            (key, recentChoices[key].map(lifecycleState(for:)) ?? .destroyed)
+        })
         recentKeys.sort { lhs, rhs in
-            let lhsDormant = recentChoices[lhs].map { lifecycleState(for: $0) == .dormant } ?? true
-            let rhsDormant = recentChoices[rhs].map { lifecycleState(for: $0) == .dormant } ?? true
+            let lhsDormant = stateByKey[lhs] == .dormant
+            let rhsDormant = stateByKey[rhs] == .dormant
             if lhsDormant != rhsDormant {
                 return !lhsDormant && rhsDormant
             }

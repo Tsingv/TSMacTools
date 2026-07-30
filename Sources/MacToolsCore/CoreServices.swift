@@ -67,10 +67,45 @@ public struct WindowActivationCapturePolicy: Equatable, Sendable {
         expectedProcessIdentifier: Int32,
         frontmostProcessIdentifier: Int32?,
         generation: UInt64,
-        currentGeneration: UInt64
+        currentGeneration: UInt64,
+        completedGeneration: UInt64? = nil
     ) -> Bool {
         generation == currentGeneration
+            && completedGeneration != generation
             && frontmostProcessIdentifier == expectedProcessIdentifier
+    }
+}
+
+public enum WindowSwitcherWindowState: Equatable, Sendable {
+    case active
+    case dormant
+    case indeterminate
+    case destroyed
+}
+
+public enum WindowSwitcherCandidateOrderingPolicy {
+    public static func orderedKeys(
+        recentKeys: [String],
+        enumeratedKeys: [String],
+        stateByKey: [String: WindowSwitcherWindowState],
+        frontmostKey: String?
+    ) -> [String] {
+        let viableRecentKeys = recentKeys.filter {
+            stateByKey[$0] != nil && stateByKey[$0] != .destroyed
+        }
+        let recentSet = Set(viableRecentKeys)
+        let activeRecentKeys = viableRecentKeys.filter { stateByKey[$0] != .dormant }
+        let dormantRecentKeys = viableRecentKeys.filter { stateByKey[$0] == .dormant }
+        var result = activeRecentKeys
+            + enumeratedKeys.filter { !recentSet.contains($0) }
+            + dormantRecentKeys
+
+        if let frontmostKey,
+           let currentIndex = result.firstIndex(of: frontmostKey) {
+            result.remove(at: currentIndex)
+            result.insert(frontmostKey, at: 0)
+        }
+        return result
     }
 }
 
