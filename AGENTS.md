@@ -212,9 +212,15 @@ Future test layers:
 - Parity checklist against `references/hammerspoon/Hammerspoon Tests`.
 - Mos scrolling parity and permission/device verification checklist in `docs/parity/mos-scroll.md`; fake-adapter and live-driver tests cover exact phase transitions and interruption, prepare/start/unavailable fallback, nonblocking display stop with stalled controller frame work, recovery limiting, screen debounce/disabled suppression, concurrent and late callbacks, background teardown, PID switching/idle clearing, generation/TTL, source classification, mixed-axis fields, recursion prevention, legacy Dock bypass, and mouse-down cancellation. Real Accessibility/TCC transitions, physical device classification, display hot-plug behavior, third-party application delivery, and Instruments handle/latency measurements remain manual release checks.
 
+## Documentation Responsibilities
+
+- `README.md` is the public product page. Keep it concise, inviting, and user-oriented: explain what TSMacTools does, why it is useful, its main workflows, screenshots, installation and first-run steps, user-visible permissions, basic configuration entry points, compatibility, and release status.
+- `AGENTS.md` is the canonical engineering guide. Keep architecture, source ownership, runtime and protocol details, implementation invariants, signing and TCC behavior, build and test commands, manual verification, migration notes, parity evidence, and reference-checkout guidance here rather than in `README.md`.
+- Do not duplicate detailed technical descriptions across both files. When technical material is found in `README.md`, merge any enduring engineering constraint or verification requirement into the appropriate `AGENTS.md` section, then remove the implementation detail from the README.
+- Update `README.md` only when a change affects the user-visible feature set, setup, compatibility, required permissions, basic configuration entry points, screenshots, or release status. Update `AGENTS.md` when architecture, implementation behavior, build settings, scripting protocols, tests, verification, or developer workflows change. Update both only when a change genuinely affects both audiences; ordinary code changes do not require README churn.
+
 ## Engineering Rules
 
-- Any code, build configuration, permission behavior, scripting protocol, or test workflow change must update both `AGENTS.md` and `README.md` in the same commit. Pure documentation-only edits are the only exception.
 - Any config field, script entrypoint, or user-facing automation behavior change must also update tracked `example_config/config.jsonc` and relevant files under `example_config/scripts`.
 - Keep `references/hammerspoon` read-only.
 - Keep `references/Mos` read-only; use it as behavioral source material, not as code to transplant.
