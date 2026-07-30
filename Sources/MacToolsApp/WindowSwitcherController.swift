@@ -185,9 +185,6 @@ final class WindowSwitcherController {
         }
         installWorkspaceObservers()
         enableEventTap()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.recordFocusedWindow()
-        }
     }
 
     func apply(configuration: UserConfiguration) {
@@ -428,8 +425,6 @@ final class WindowSwitcherController {
         let frontmostBundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let ignoredNames = Set(configuration.application.ignoredWindowApplicationNames)
-
-        installAXObserversForRunningApplications()
 
         guard let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] else {
@@ -820,7 +815,7 @@ final class WindowSwitcherController {
         if recordCurrentFocus {
             recordFocusedWindow()
         }
-        guard let candidate = recentKeys.lazy.compactMap({ self.recentChoices[$0] }).first(where: { choice in
+        guard let candidate = recentKeys.compactMap({ self.recentChoices[$0] }).first(where: { choice in
             if let excludedBundleIdentifier, choice.bundleIdentifier == excludedBundleIdentifier {
                 return false
             }
@@ -836,7 +831,7 @@ final class WindowSwitcherController {
     @discardableResult
     func focusMostRecentWindow(matching bundleIdentifier: String) -> Bool {
         recordFocusedWindow()
-        guard let candidate = recentKeys.lazy.compactMap({ self.recentChoices[$0] }).first(where: { $0.bundleIdentifier == bundleIdentifier }) else {
+        guard let candidate = recentKeys.compactMap({ self.recentChoices[$0] }).first(where: { $0.bundleIdentifier == bundleIdentifier }) else {
             return false
         }
         focus(candidate)
@@ -1024,12 +1019,10 @@ final class WindowSwitcherController {
 
         installAXObserver(processIdentifier: app.processIdentifier)
         let appElement = axApplication(processIdentifier: app.processIdentifier)
-        let preferredAttributes = preferMainWindow
-            ? [kAXMainWindowAttribute, kAXFocusedWindowAttribute]
-            : [kAXFocusedWindowAttribute, kAXMainWindowAttribute]
-        guard let window = preferredAttributes.lazy.compactMap({ attribute in
-            self.copySwitchableWindow(attribute: attribute, from: appElement)
-        }).first else {
+        let preferredAttribute = preferMainWindow ? kAXMainWindowAttribute : kAXFocusedWindowAttribute
+        let fallbackAttribute = preferMainWindow ? kAXFocusedWindowAttribute : kAXMainWindowAttribute
+        guard let window = copySwitchableWindow(attribute: preferredAttribute, from: appElement)
+            ?? copySwitchableWindow(attribute: fallbackAttribute, from: appElement) else {
             return false
         }
         configureAXTimeout(window)
@@ -1205,20 +1198,6 @@ final class WindowSwitcherController {
             choices = buildChoices(sameApplication: sameApplicationMode)
             selectedIndex = min(selectedIndex, max(choices.count - 1, 0))
             renderOverlay()
-        }
-    }
-
-    private func installAXObserversForRunningApplications() {
-        let runningApplications = NSWorkspace.shared.runningApplications
-            .filter { $0.bundleIdentifier != Bundle.main.bundleIdentifier }
-        let runningPIDs = Set(runningApplications.map(\.processIdentifier))
-        for pid in runningPIDs where axApplicationObservers[pid] == nil {
-            installAXObserver(processIdentifier: pid)
-        }
-
-        let removedPIDs = axApplicationObservers.keys.filter { !runningPIDs.contains($0) }
-        for pid in removedPIDs {
-            removeAXObserver(processIdentifier: pid)
         }
     }
 
