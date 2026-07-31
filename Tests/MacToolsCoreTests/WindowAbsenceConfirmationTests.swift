@@ -151,11 +151,11 @@ final class WindowSwitcherCommandModifierIsolationTests: XCTestCase {
         XCTAssertEqual(isolation.handle(.commandUp), .suppressCurrent)
     }
 
-    func testOrdinaryCommandShortcutReplaysCommandBeforeTheKey() {
+    func testOrdinaryCommandShortcutReplaysCommandAndPassesOriginalKey() {
         var isolation = WindowSwitcherCommandModifierIsolation()
 
         XCTAssertEqual(isolation.handle(.commandDown), .deferCurrent)
-        XCTAssertEqual(isolation.handle(.other), .replayDeferredAndCurrent)
+        XCTAssertEqual(isolation.handle(.other), .replayDeferredAndPassCurrent)
         XCTAssertEqual(isolation.handle(.commandUp), .passCurrent)
     }
 

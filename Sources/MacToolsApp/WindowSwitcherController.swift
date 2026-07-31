@@ -232,6 +232,13 @@ private final class WindowSwitcherCommandModifierGate: @unchecked Sendable {
             generation &+= 1
             scheduledGeneration = generation
             shouldSuppress = true
+        case .replayDeferredAndPassCurrent:
+            // Preserve the physical shortcut key so Carbon can match it reliably.
+            if let deferredCommandDown {
+                eventsToPost = [deferredCommandDown]
+            }
+            self.deferredCommandDown = nil
+            generation &+= 1
         case .replayDeferredAndCurrent:
             if let deferredCommandDown,
                let copiedCurrentEvent = event.copy() {
@@ -293,7 +300,9 @@ private final class WindowSwitcherCommandModifierGate: @unchecked Sendable {
                 .eventSourceUserData,
                 value: windowSwitcherReplayedEventMarker
             )
-            event.post(tap: .cgSessionEventTap)
+            // Re-enter before Carbon hotkey matching so replayed Command shortcuts still
+            // reach RegisterEventHotKey. The marker bypasses this controller's session tap.
+            event.post(tap: .cghidEventTap)
         }
     }
 }

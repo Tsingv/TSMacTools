@@ -141,6 +141,7 @@ public struct WindowSwitcherCommandModifierIsolation: Equatable, Sendable {
     public enum Action: Equatable, Sendable {
         case passCurrent
         case deferCurrent
+        case replayDeferredAndPassCurrent
         case replayDeferredAndCurrent
         case suppressCurrent
     }
@@ -180,7 +181,7 @@ public struct WindowSwitcherCommandModifierIsolation: Equatable, Sendable {
                 return .passCurrent
             }
             hasDeferredCommandDown = false
-            return .replayDeferredAndCurrent
+            return .replayDeferredAndPassCurrent
         }
     }
 
