@@ -181,7 +181,9 @@ xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Debug -de
 open DerivedData/Build/Products/Debug/TSMacTools.app
 ```
 
-`DerivedData`, `DerivedDataCore`, `.build`, and `build` are ignored local output directories and must not be committed.
+Release packaging uses the same single derived-data root, switching only the configuration: `xcodebuild -project MacTools.xcodeproj -scheme MacTools -configuration Release -derivedDataPath DerivedData build` produces `DerivedData/Build/Products/Release/TSMacTools.app`. Never introduce per-configuration or ad-hoc derived-data directories (a legacy `DerivedDataRelease/` folder was removed on 2026-09-03; its last archive is kept at `dist/TSMacTools-2026-07-30.zip`). Distributable archives such as zipped `.app` bundles go under the ignored `dist/` directory, not inside derived-data roots, so they survive later `xcodebuild` clean rebuilds.
+
+`DerivedData`, `DerivedDataCore`, `dist`, `.build`, and `build` are ignored local output directories and must not be committed.
 
 Check the built app's own Accessibility state:
 

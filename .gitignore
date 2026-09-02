@@ -10,3 +10,4 @@ xcuserdata/
 /my_config/
 __pycache__/
 *.pyc
+/dist/
