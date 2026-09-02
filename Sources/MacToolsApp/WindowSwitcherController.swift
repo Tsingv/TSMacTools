@@ -929,8 +929,21 @@ final class WindowSwitcherController {
             }
         }
 
-        let currentFrontmostWindow = frontmostPID.flatMap { frontmostPID in
-            enumerated.first(where: { $0.processIdentifier == frontmostPID })
+        var currentChoiceSource = "none"
+        var currentFrontmostWindow: WindowChoice? = nil
+        if let frontmostPID {
+            if let focusedChoice = sameAppCurrentChoice(
+                processIdentifier: frontmostPID,
+                enumerated: enumerated
+            ) {
+                currentChoiceSource = "ax-focused"
+                currentFrontmostWindow = focusedChoice
+            } else {
+                currentFrontmostWindow = enumerated.first(where: { $0.processIdentifier == frontmostPID })
+                if currentFrontmostWindow != nil {
+                    currentChoiceSource = "cg-zorder"
+                }
+            }
         }
         let orderedKeys = WindowSwitcherCandidateOrderingPolicy.orderedKeys(
             recentKeys: recentKeys,
@@ -946,7 +959,32 @@ final class WindowSwitcherController {
             .map { "#\($0.offset):\(describe($0.element))" }
             .joined(separator: " | ")
         log("choices ordered=\(orderedDescription)")
+        if let firstEnumerated = enumerated.first(where: { $0.processIdentifier == frontmostPID }),
+           let currentFrontmostWindow,
+           firstEnumerated.key != currentFrontmostWindow.key {
+            log("choices current-window corrected source=\(currentChoiceSource) cgTop=\(describe(firstEnumerated)) current=\(describe(currentFrontmostWindow))")
+        }
         return result
+    }
+
+    /// Identifies the frontmost application's actual current window so the switcher
+    /// lists it first even when a non-focused auxiliary window sits above it in CG
+    /// z-order. Without this, cycling selects the real current window at index 1
+    /// and the switch appears to do nothing.
+    private func sameAppCurrentChoice(
+        processIdentifier: pid_t,
+        enumerated: [WindowChoice]
+    ) -> WindowChoice? {
+        let appElement = axApplication(processIdentifier: processIdentifier)
+        guard let currentWindow = copySwitchableWindow(attribute: kAXFocusedWindowAttribute, from: appElement)
+            ?? copySwitchableWindow(attribute: kAXMainWindowAttribute, from: appElement) else {
+            return nil
+        }
+        let key = windowKey(processIdentifier: processIdentifier, axWindow: currentWindow)
+        if let match = enumerated.first(where: { $0.key == key }) {
+            return match
+        }
+        return enumerated.first(where: { CFEqual($0.axWindow, currentWindow) })
     }
 
     private func cachedRecentChoice(
