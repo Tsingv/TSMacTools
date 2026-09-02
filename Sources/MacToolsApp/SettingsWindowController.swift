@@ -147,19 +147,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private var pageButtons: [Page: NSButton] = [:]
     private var cachedPageViews: [Page: NSView] = [:]
 
-    private var windowSwitcherToggle: NSButton?
-    private var translationToggle: NSButton?
-    private var debugToggle: NSButton?
     private var providerPopup: NSPopUpButton?
 
-    private var scrollEnabledToggle: NSButton?
     private var presetPopup: NSPopUpButton?
     private var presetSummary: NSTextField?
-    private var smoothVerticalToggle: NSButton?
-    private var smoothHorizontalToggle: NSButton?
-    private var reverseVerticalToggle: NSButton?
-    private var reverseHorizontalToggle: NSButton?
-    private var excludeTrackpadToggle: NSButton?
     private var stepSlider: NSSlider?
     private var speedSlider: NSSlider?
     private var durationSlider: NSSlider?
@@ -171,6 +162,19 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private var accelerationValue: NSTextField?
     private var deadZoneValue: NSTextField?
     private var pendingTuningChanges: [Int: Double] = [:]
+    private struct RowSpec {
+        let title: String
+        let hint: String?
+        let control: NSView?
+        let hintLabel: ((NSTextField) -> Void)?
+    }
+
+    private struct ConditionalRow {
+        let condition: (UserConfiguration) -> Bool
+        let setHidden: (Bool) -> Void
+    }
+
+    private var conditionalRows: [Page: [ConditionalRow]] = [:]
     private var reconciliationScheduled = false
     private weak var activeHotkeyRecorder: HotkeyRecorderButton?
     private weak var hotkeyTableView: NSTableView?
@@ -242,6 +246,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         lastKnownGoodConfiguration = configuration
         self.configURL = configURL
         cachedPageViews.removeAll()
+        conditionalRows.removeAll()
         showPage(selectedPage, animated: false)
     }
 
@@ -316,6 +321,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
         let pageView = cachedPageViews[page] ?? makePage(page)
         cachedPageViews[page] = pageView
+        applyConditionalVisibility(for: page)
         if contentContainer.subviews.first === pageView { return }
 
         let previousView = contentContainer.subviews.first
@@ -337,6 +343,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             context.duration = 0.16
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             pageView.animator().alphaValue = 1
+        }
+    }
+
+    private func applyConditionalVisibility(for page: Page) {
+        guard let entries = conditionalRows[page] else { return }
+        for entry in entries {
+            entry.setHidden(!entry.condition(configuration))
         }
     }
 
@@ -385,91 +398,124 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     }
 
     private func makeGeneralPage() -> NSView {
-        let stack = pageStack(title: "General", subtitle: "Common settings are applied immediately while JSONC comments, unknown fields, and unrelated edits are preserved.")
-        let switcher = checkbox("Enable window switcher", action: #selector(generalControlChanged(_:)))
-        switcher.state = configuration.windowSwitcher.enabled ? .on : .off
-        switcher.tag = 1
-        windowSwitcherToggle = switcher
+        let stack = pageStack()
+        var deps: [ConditionalRow] = []
 
-        let translation = checkbox("Enable selected-text translation", action: #selector(generalControlChanged(_:)))
-        translation.state = configuration.translation.enabled ? .on : .off
-        translation.tag = 2
-        translationToggle = translation
-
-        let debug = checkbox("Enable timing and event diagnostics", action: #selector(generalControlChanged(_:)))
-        debug.state = configuration.windowSwitcher.debug ? .on : .off
-        debug.tag = 3
-        debugToggle = debug
+        let switcherOn: (UserConfiguration) -> Bool = { $0.windowSwitcher.enabled }
+        let translationOn: (UserConfiguration) -> Bool = { $0.translation.enabled }
+        func translationProviders(_ names: [String]) -> (UserConfiguration) -> Bool {
+            { $0.translation.enabled && names.contains($0.translation.provider) }
+        }
 
         let provider = NSPopUpButton()
         provider.addItems(withTitles: ["Google Web", "Google Cloud", "LLM"])
         provider.selectItem(at: ["google_web", "google", "llm"].firstIndex(of: configuration.translation.provider) ?? 0)
         provider.target = self
         provider.action = #selector(providerChanged(_:))
+        provider.controlSize = .small
+        provider.widthAnchor.constraint(equalToConstant: 170).isActive = true
         providerPopup = provider
 
-        stack.addArrangedSubview(formSection(rows: [
-            ("Window switching", switcher, "Command-Tab window cycling and Accessibility focus."),
-            ("Translation", translation, "Runs the configured native or Python translation action."),
-            ("Provider", provider, "Selects the configured translation backend."),
-            ("Diagnostics", debug, "Writes compact hotkey and window timing logs.")
-        ]))
-
-        let followScreen = checkbox("Follow the focused screen", action: #selector(generalControlChanged(_:)))
-        followScreen.state = configuration.windowSwitcher.followFocusedScreen ? .on : .off
-        followScreen.tag = 4
-        let restorePreviousApplication = checkbox("Switch to the previous app when no windows remain", action: #selector(generalControlChanged(_:)))
-        restorePreviousApplication.state = configuration.windowSwitcher.restorePreviousApplicationWhenNoWindows ? .on : .off
-        restorePreviousApplication.tag = 6
-        stack.addArrangedSubview(formSection(rows: [
-            ("Command-Tab", readOnlyValue(configuration.windowSwitcher.commandTabBehavior), "Current strategy identifier; alternative strategies are not implemented yet."),
-            ("Same application", readOnlyValue(configuration.windowSwitcher.sameApplicationBehavior), "Current strategy identifier; alternative strategies are not implemented yet."),
-            ("Screen", followScreen, "Places the switcher on the screen containing the focused window."),
-            ("Empty application", restorePreviousApplication, "Returns to the most recent window after repeated checks confirm that the frontmost application has no usable windows."),
-            ("Display delay", editableField(String(format: "%.2f", configuration.windowSwitcher.displayDelay), field: .switcherDisplayDelay, width: 150), "Seconds from the first Command-Tab press until the switcher appears; accepts 0...2."),
-            ("Width", editableField(String(configuration.windowSwitcher.width), field: .switcherWidth, width: 150), "Switcher overlay width in points."),
-            ("Height", editableField(String(configuration.windowSwitcher.height), field: .switcherHeight, width: 150), "Switcher overlay height in points."),
-            ("Maximum rows", editableField(String(configuration.windowSwitcher.maxVisibleRows), field: .switcherMaxRows, width: 150), "Maximum number of visible window rows.")
-        ]))
-
-        stack.addArrangedSubview(formSection(rows: [
-            ("Python", editableField(configuration.scripting.pythonPath, field: .pythonPath), "Executable used for script-backed actions."),
-            ("Finder bundle ID", editableField(configuration.application.finderBundleIdentifier, field: .finderBundleIdentifier), "Bundle identifier used by the Finder toggle."),
-            ("Terminal bundle ID", editableField(configuration.application.terminalBundleIdentifier, field: .terminalBundleIdentifier), "Bundle identifier used by the terminal toggle."),
-            ("Ignored apps", editableField(configuration.application.ignoredWindowApplicationNames.joined(separator: ", "), field: .ignoredApplicationNames), "Comma-separated application names omitted from the window switcher.")
-        ]))
-
-        let normalizePDF = checkbox("Join common PDF hard-wrapped lines", action: #selector(generalControlChanged(_:)))
-        normalizePDF.state = configuration.translation.normalizePDFLineBreaks ? .on : .off
-        normalizePDF.tag = 5
-        stack.addArrangedSubview(formSection(rows: [
-            ("Source language", editableField(configuration.translation.googleSourceLanguage, field: .googleSourceLanguage, width: 180), "Use auto for source-language detection."),
-            ("Target language", editableField(configuration.translation.googleTargetLanguage, field: .googleTargetLanguage, width: 180), "Language used when the selected text is not Chinese."),
-            ("Chinese target", editableField(configuration.translation.googleTargetLanguageForChinese, field: .googleTargetLanguageForChinese, width: 180), "Language used when the selected text is Chinese."),
-            ("PDF text", normalizePDF, "Preserves paragraphs and structural lines while joining common hard wraps."),
-            ("Copy delay", editableField(String(format: "%.2f", configuration.translation.copyKeystrokeDelay), field: .copyKeystrokeDelay, width: 150), "Seconds to wait after requesting the selected text."),
-            ("LLM model", editableField(configuration.translation.model, field: .model), "Provider model identifier."),
-            ("Context tokens", editableField(String(configuration.translation.contextWindowTokens), field: .contextWindowTokens, width: 150), "Total context-window budget."),
-            ("Output tokens", editableField(String(configuration.translation.outputTokenLimit), field: .outputTokenLimit, width: 150), "Requested maximum completion budget."),
-            ("Request tokens", editableField(String(configuration.translation.requestTokenLimit), field: .requestTokenLimit, width: 150), "On-demand request budget; zero disables this clamp."),
-            ("LLM API key", editableField(configuration.translation.apiKey, field: .apiKey, secure: true), "Stored in your local JSONC configuration and masked in this window."),
-            ("Google API key", editableField(configuration.translation.googleApiKey, field: .googleAPIKey, secure: true), "Used only by the Google Cloud provider and masked in this window.")
-        ]))
-
-        let openConfig = NSButton(title: "Open config.jsonc…", target: self, action: #selector(openConfigFile))
+        let openConfig = NSButton(title: "Open…", target: self, action: #selector(openConfigFile))
         openConfig.bezelStyle = .rounded
-        stack.addArrangedSubview(formSection(rows: [
-            ("Advanced", openConfig, "Edit translation.endpoint, translation.googleEndpoint, translation.googleWebEndpoint, translation.googleWebClient, translation.thinkingEnabled, translation.thinkingParameter, translation.temperature, translation.promptTemplate, translation.systemPrompt, translation.nativeWindow, and hotkey action/path fields in JSONC.")
-        ]))
+        openConfig.controlSize = .small
+
+        stack.addArrangedSubview(section(header: "Window switching", rows: [
+            (formRow(title: "Enable Command-Tab window switcher",
+                     control: boolSwitch(tag: 1, on: configuration.windowSwitcher.enabled)), nil),
+            (formRow(title: "Follow the focused screen",
+                     hint: "Centers the overlay on the display of the focused window.",
+                     control: boolSwitch(tag: 4, on: configuration.windowSwitcher.followFocusedScreen)), switcherOn),
+            (formRow(title: "Restore previous app when empty",
+                     hint: "Returns to the last application once the frontmost one has no usable windows.",
+                     control: boolSwitch(tag: 6, on: configuration.windowSwitcher.restorePreviousApplicationWhenNoWindows)), switcherOn),
+            (formRow(title: "Overlay delay",
+                     hint: "Seconds before the overlay appears (0…2).",
+                     control: editableField(String(format: "%.2f", configuration.windowSwitcher.displayDelay), field: .switcherDisplayDelay, width: 90)), switcherOn),
+            (formRow(title: "Overlay width",
+                     hint: "Points (320–1600).",
+                     control: editableField(String(configuration.windowSwitcher.width), field: .switcherWidth, width: 90)), switcherOn),
+            (formRow(title: "Overlay height",
+                     hint: "Points (120–1200).",
+                     control: editableField(String(configuration.windowSwitcher.height), field: .switcherHeight, width: 90)), switcherOn),
+            (formRow(title: "Maximum visible rows",
+                     hint: "Rows before the list scrolls (1–50).",
+                     control: editableField(String(configuration.windowSwitcher.maxVisibleRows), field: .switcherMaxRows, width: 90)), switcherOn),
+            (formRow(title: "Ignored applications",
+                     hint: "Comma-separated names omitted from the candidate list.",
+                     control: editableField(configuration.application.ignoredWindowApplicationNames.joined(separator: ", "), field: .ignoredApplicationNames, width: 320)), switcherOn)
+        ], into: &deps))
+
+        stack.addArrangedSubview(section(header: "Translation", rows: [
+            (formRow(title: "Enable selected-text translation",
+                     control: boolSwitch(tag: 2, on: configuration.translation.enabled)), nil),
+            (formRow(title: "Provider",
+                     hint: "Selects the translation backend.",
+                     control: provider), translationOn),
+            (formRow(title: "LLM model",
+                     hint: "Provider model identifier.",
+                     control: editableField(configuration.translation.model, field: .model, width: 320)), translationProviders(["llm"])),
+            (formRow(title: "Context tokens",
+                     hint: "Total context-window budget.",
+                     control: editableField(String(configuration.translation.contextWindowTokens), field: .contextWindowTokens, width: 110)), translationProviders(["llm"])),
+            (formRow(title: "Output tokens",
+                     hint: "Maximum completion budget.",
+                     control: editableField(String(configuration.translation.outputTokenLimit), field: .outputTokenLimit, width: 110)), translationProviders(["llm"])),
+            (formRow(title: "Request tokens",
+                     hint: "On-demand request budget; 0 disables the clamp.",
+                     control: editableField(String(configuration.translation.requestTokenLimit), field: .requestTokenLimit, width: 110)), translationProviders(["llm"])),
+            (formRow(title: "LLM API key",
+                     hint: "Stored in your local JSONC file and masked here.",
+                     control: editableField(configuration.translation.apiKey, field: .apiKey, width: 320, secure: true)), translationProviders(["llm"])),
+            (formRow(title: "Google API key",
+                     hint: "Required only by the Google Cloud provider.",
+                     control: editableField(configuration.translation.googleApiKey, field: .googleAPIKey, width: 320, secure: true)), translationProviders(["google"])),
+            (formRow(title: "Source language",
+                     hint: "Use auto for detection.",
+                     control: editableField(configuration.translation.googleSourceLanguage, field: .googleSourceLanguage, width: 120)), translationProviders(["google_web", "google"])),
+            (formRow(title: "Target language",
+                     hint: "Used when the selection is not Chinese.",
+                     control: editableField(configuration.translation.googleTargetLanguage, field: .googleTargetLanguage, width: 120)), translationProviders(["google_web", "google"])),
+            (formRow(title: "Chinese target language",
+                     hint: "Used when the selection is Chinese.",
+                     control: editableField(configuration.translation.googleTargetLanguageForChinese, field: .googleTargetLanguageForChinese, width: 120)), translationProviders(["google_web", "google"])),
+            (formRow(title: "Join PDF hard-wrapped lines",
+                     hint: "Keeps paragraphs and structural lines intact.",
+                     control: boolSwitch(tag: 5, on: configuration.translation.normalizePDFLineBreaks)), translationOn),
+            (formRow(title: "Copy delay",
+                     hint: "Seconds to wait for the selected text.",
+                     control: editableField(String(format: "%.2f", configuration.translation.copyKeystrokeDelay), field: .copyKeystrokeDelay, width: 90)), translationOn)
+        ], into: &deps))
+
+        stack.addArrangedSubview(section(header: "Scripting & applications", rows: [
+            (formRow(title: "Python executable",
+                     hint: "Runs script-backed hotkey actions.",
+                     control: editableField(configuration.scripting.pythonPath, field: .pythonPath, width: 320)), nil),
+            (formRow(title: "Finder bundle ID",
+                     control: editableField(configuration.application.finderBundleIdentifier, field: .finderBundleIdentifier, width: 320)), nil),
+            (formRow(title: "Terminal bundle ID",
+                     control: editableField(configuration.application.terminalBundleIdentifier, field: .terminalBundleIdentifier, width: 320)), nil)
+        ], into: &deps))
+
+        stack.addArrangedSubview(section(header: "Diagnostics", rows: [
+            (formRow(title: "Timing and event diagnostics",
+                     hint: "Writes compact hotkey and window timing logs.",
+                     control: boolSwitch(tag: 3, on: configuration.windowSwitcher.debug)), nil)
+        ], into: &deps))
+
+        stack.addArrangedSubview(section(header: "Advanced", rows: [
+            (formRow(title: "Configuration file",
+                     hint: "Endpoints, prompts, native windows, and switcher strategies stay JSONC-only.",
+                     control: openConfig), nil)
+        ], into: &deps))
+
         stack.addArrangedSubview(note("Accessibility permission is shared by window, hotkey, and mouse automation. TSMacTools never enables a disabled event tap after permission is revoked."))
+        conditionalRows[.general] = deps
         return scrollable(stack)
     }
 
     private func makeHotkeysPage() -> NSView {
-        let stack = pageStack(
-            title: "Hotkeys",
-            subtitle: "Create a binding, then record a keyboard shortcut or a mouse side button with optional modifiers."
-        )
+        let stack = pageStack()
         let focusID = pendingHotkeyFocusID
         pendingHotkeyFocusID = nil
 
@@ -549,7 +595,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         ])
 
         stack.addArrangedSubview(list)
-        stack.addArrangedSubview(note("Select a trigger to record. Mouse buttons use Accessibility; simulated shortcuts post one key-down/key-up pair."))
+        stack.addArrangedSubview(note("Select a trigger to record a keyboard shortcut or mouse side button (optionally with modifiers). Simulated shortcuts post one key-down/key-up pair, and duplicate triggers are rejected."))
         let page = scrollable(stack)
         if let focusID {
             focusHotkeyRow(id: focusID)
@@ -958,11 +1004,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     }
 
     private func makeScrollingPage() -> NSView {
-        let stack = pageStack(title: "Smooth Scrolling", subtitle: "Mouse-wheel events use a display-synchronized curve; trackpad gestures pass through by default.")
-        let enabled = checkbox("Enable smooth mouse scrolling", action: #selector(scrollToggleChanged(_:)))
-        enabled.tag = 10
-        enabled.state = configuration.scroll.enabled ? .on : .off
-        scrollEnabledToggle = enabled
+        let stack = pageStack()
+        var deps: [ConditionalRow] = []
+
+        let scrollOn: (UserConfiguration) -> Bool = { $0.scroll.enabled }
+        let customTuning: (UserConfiguration) -> Bool = { $0.scroll.enabled && $0.scroll.preset == .custom }
 
         let preset = NSPopUpButton()
         let selectablePresets = ScrollPreset.allCases
@@ -970,45 +1016,29 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         preset.selectItem(at: selectablePresets.firstIndex(of: configuration.scroll.preset) ?? 0)
         preset.target = self
         preset.action = #selector(presetChanged(_:))
+        preset.controlSize = .small
+        preset.widthAnchor.constraint(equalToConstant: 140).isActive = true
         presetPopup = preset
 
-        let summary = NSTextField(wrappingLabelWithString: configuration.scroll.preset.summary)
-        summary.textColor = .secondaryLabelColor
-        summary.font = .systemFont(ofSize: 12)
-        presetSummary = summary
-
-        let basic = formSection(rows: [
-            ("Optimization", enabled, "The original event passes through if the display clock is unavailable."),
-            ("Mode", preset, "Precise, Balanced, Fluid, and Glide are built-in TSMacTools curves."),
-            ("", summary, "")
-        ])
-        stack.addArrangedSubview(basic)
-
-        let smoothV = checkbox("Vertical", action: #selector(scrollToggleChanged(_:)))
-        smoothV.tag = 11
-        smoothV.state = configuration.scroll.smoothVertical ? .on : .off
-        smoothVerticalToggle = smoothV
-        let smoothH = checkbox("Horizontal", action: #selector(scrollToggleChanged(_:)))
-        smoothH.tag = 12
-        smoothH.state = configuration.scroll.smoothHorizontal ? .on : .off
-        smoothHorizontalToggle = smoothH
-        let reverseV = checkbox("Vertical", action: #selector(scrollToggleChanged(_:)))
-        reverseV.tag = 13
-        reverseV.state = configuration.scroll.reverseVertical ? .on : .off
-        reverseVerticalToggle = reverseV
-        let reverseH = checkbox("Horizontal", action: #selector(scrollToggleChanged(_:)))
-        reverseH.tag = 14
-        reverseH.state = configuration.scroll.reverseHorizontal ? .on : .off
-        reverseHorizontalToggle = reverseH
-        let trackpad = checkbox("Leave trackpad and Magic Mouse gestures untouched", action: #selector(scrollToggleChanged(_:)))
-        trackpad.tag = 15
-        trackpad.state = configuration.scroll.excludeTrackpad ? .on : .off
-        excludeTrackpadToggle = trackpad
-        stack.addArrangedSubview(formSection(rows: [
-            ("Smooth axes", horizontalControls([smoothV, smoothH]), "An unsmoothed axis continues through the original event."),
-            ("Reverse axes", horizontalControls([reverseV, reverseH]), "Direction reversal works with or without smoothing."),
-            ("Gesture devices", trackpad, "Phase-bearing native gestures bypass the mouse engine.")
-        ]))
+        stack.addArrangedSubview(section(header: "Smooth scrolling", rows: [
+            (formRow(title: "Enable smooth mouse scrolling",
+                     control: boolSwitch(tag: 10, on: configuration.scroll.enabled, action: #selector(scrollToggleChanged(_:)))), nil),
+            (formRow(title: "Curve",
+                     hint: configuration.scroll.preset.summary,
+                     control: preset,
+                     hintLabel: { self.presetSummary = $0 }), scrollOn),
+            (formRow(title: "Smooth vertical wheel",
+                     control: boolSwitch(tag: 11, on: configuration.scroll.smoothVertical, action: #selector(scrollToggleChanged(_:)))), scrollOn),
+            (formRow(title: "Smooth horizontal wheel",
+                     control: boolSwitch(tag: 12, on: configuration.scroll.smoothHorizontal, action: #selector(scrollToggleChanged(_:)))), scrollOn),
+            (formRow(title: "Reverse vertical direction",
+                     control: boolSwitch(tag: 13, on: configuration.scroll.reverseVertical, action: #selector(scrollToggleChanged(_:)))), scrollOn),
+            (formRow(title: "Reverse horizontal direction",
+                     control: boolSwitch(tag: 14, on: configuration.scroll.reverseHorizontal, action: #selector(scrollToggleChanged(_:)))), scrollOn),
+            (formRow(title: "Leave trackpad gestures untouched",
+                     hint: "Native trackpad and Magic Mouse gestures bypass the mouse engine.",
+                     control: boolSwitch(tag: 15, on: configuration.scroll.excludeTrackpad, action: #selector(scrollToggleChanged(_:)))), scrollOn)
+        ], into: &deps))
 
         let step = tuningSlider(value: configuration.scroll.tuning.step, range: 1 ... 120, tag: 20)
         let speed = tuningSlider(value: configuration.scroll.tuning.speed, range: 0.2 ... 6, tag: 21)
@@ -1021,17 +1051,33 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         accelerationSlider = acceleration.slider; accelerationValue = acceleration.value
         deadZoneSlider = deadZone.slider; deadZoneValue = deadZone.value
         updateTuningLabels()
-        stack.addArrangedSubview(formSection(rows: [
-            ("Step", step.view, "Minimum distance produced by a mechanical wheel notch."),
-            ("Speed", speed.view, "Overall distance multiplier."),
-            ("Duration", duration.view, "Time for approximately 99% of the momentum tail."),
-            ("Acceleration", acceleration.view, "Adds bounded speed during a rapid wheel burst."),
-            ("Stop threshold", deadZone.view, "Ends a tail once its remaining movement is visually negligible.")
-        ]))
+
+        let tuning = section(header: "Curve tuning", rows: [
+            (formRow(title: "Step",
+                     hint: "Minimum distance produced by one wheel notch.",
+                     control: step.view), nil),
+            (formRow(title: "Speed",
+                     hint: "Overall distance multiplier.",
+                     control: speed.view), nil),
+            (formRow(title: "Duration",
+                     hint: "Time for approximately 99% of the momentum tail.",
+                     control: duration.view), nil),
+            (formRow(title: "Acceleration",
+                     hint: "Adds bounded speed during a rapid wheel burst.",
+                     control: acceleration.view), nil),
+            (formRow(title: "Stop threshold",
+                     hint: "Ends a tail once remaining movement is visually negligible.",
+                     control: deadZone.view), nil)
+        ], into: &deps)
+        deps.append(ConditionalRow(condition: customTuning, setHidden: { hidden in tuning.isHidden = hidden }))
+        stack.addArrangedSubview(tuning)
+
+        stack.addArrangedSubview(note("Select Custom to fine-tune individual curve values. Precise, Balanced, Fluid, and Glide are TSMacTools presets, not Mos or Smooze compatibility claims."))
+        conditionalRows[.scrolling] = deps
         return scrollable(stack)
     }
 
-    @objc private func generalControlChanged(_ sender: NSButton) {
+    @objc private func generalControlChanged(_ sender: NSSwitch) {
         let value = sender.state == .on
         switch sender.tag {
         case 1:
@@ -1054,12 +1100,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             persist { $0.windowSwitcher.restorePreviousApplicationWhenNoWindows = value }
         default: return
         }
+        applyConditionalVisibility(for: selectedPage)
     }
 
     @objc private func providerChanged(_ sender: NSPopUpButton) {
         let provider = ["google_web", "google", "llm"][sender.indexOfSelectedItem.clamped(to: 0 ... 2)]
         configuration.translation.provider = provider
         persist { $0.translation.provider = provider }
+        applyConditionalVisibility(for: selectedPage)
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
@@ -1206,7 +1254,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
     }
 
-    @objc private func scrollToggleChanged(_ sender: NSButton) {
+    @objc private func scrollToggleChanged(_ sender: NSSwitch) {
         let value = sender.state == .on
         switch sender.tag {
         case 10:
@@ -1229,6 +1277,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             persist { $0.scroll.excludeTrackpad = value }
         default: return
         }
+        applyConditionalVisibility(for: selectedPage)
     }
 
     @objc private func presetChanged(_ sender: NSPopUpButton) {
@@ -1245,6 +1294,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         syncTuningControls()
         persist { $0.scroll.applyPreset(preset) }
         syncTuningControls()
+        applyConditionalVisibility(for: selectedPage)
     }
 
     @objc private func tuningChanged(_ sender: NSSlider) {
@@ -1401,69 +1451,120 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         deadZoneValue?.stringValue = String(format: "%.2f pt", configuration.scroll.tuning.deadZone)
     }
 
-    private func pageStack(title: String, subtitle: String) -> NSStackView {
+    private func pageStack() -> NSStackView {
         let stack = SettingsPageStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 16
-        stack.edgeInsets = NSEdgeInsets(top: 24, left: 34, bottom: 30, right: 34)
-
-        let heading = NSTextField(labelWithString: title)
-        heading.font = .systemFont(ofSize: 21, weight: .semibold)
-        let subheading = NSTextField(wrappingLabelWithString: subtitle)
-        subheading.font = .systemFont(ofSize: 12)
-        subheading.textColor = .secondaryLabelColor
-        subheading.maximumNumberOfLines = 0
-        subheading.widthAnchor.constraint(equalToConstant: 680).isActive = true
-        stack.addArrangedSubview(heading)
-        stack.addArrangedSubview(subheading)
+        stack.spacing = 20
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 34, bottom: 30, right: 34)
         return stack
     }
 
-    private func formSection(rows: [(String, NSView, String)]) -> NSView {
+    /// Builds a titled card section on the proven NSGridView layout used by the settings
+    /// previews. Rows whose condition is registered collapse via NSGridRow.isHidden, giving
+    /// dependent settings proper progressive disclosure instead of a permanently visible
+    /// wall of controls.
+    private func section(
+        header: String,
+        rows: [(view: RowSpec, condition: ((UserConfiguration) -> Bool)?)],
+        into deps: inout [ConditionalRow]
+    ) -> NSView {
         let grid = NSGridView()
-        grid.rowSpacing = 13
+        grid.rowSpacing = 11
         grid.columnSpacing = 14
         grid.xPlacement = .fill
         grid.yPlacement = .center
-        for (title, control, help) in rows {
-            let label = NSTextField(labelWithString: title)
-            label.font = .systemFont(ofSize: 13, weight: .medium)
-            label.textColor = .secondaryLabelColor
-            label.alignment = .right
 
-            let valueStack = NSStackView()
-            valueStack.orientation = .vertical
-            valueStack.alignment = .leading
-            valueStack.spacing = 3
-            valueStack.addArrangedSubview(control)
-            if !help.isEmpty {
-                let helpLabel = NSTextField(wrappingLabelWithString: help)
-                helpLabel.font = .systemFont(ofSize: 11)
-                helpLabel.textColor = .tertiaryLabelColor
-                valueStack.addArrangedSubview(helpLabel)
+        let headerLabel = NSTextField(labelWithString: header)
+        headerLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        headerLabel.textColor = .secondaryLabelColor
+        grid.addRow(with: [headerLabel, NSView()])
+
+        for (spec, condition) in rows {
+            let titleLabel = NSTextField(labelWithString: spec.title)
+            titleLabel.font = .systemFont(ofSize: 13)
+            titleLabel.textColor = .labelColor
+            titleLabel.lineBreakMode = .byTruncatingTail
+            titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+            let textStack = NSStackView()
+            textStack.orientation = .vertical
+            textStack.alignment = .leading
+            textStack.spacing = 2
+            textStack.addArrangedSubview(titleLabel)
+            if let hint = spec.hint {
+                let hintField = NSTextField(wrappingLabelWithString: hint)
+                hintField.font = .systemFont(ofSize: 11)
+                hintField.textColor = .secondaryLabelColor
+                hintField.maximumNumberOfLines = 2
+                hintField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                hintField.widthAnchor.constraint(lessThanOrEqualToConstant: 244).isActive = true
+                textStack.addArrangedSubview(hintField)
+                titleLabel.toolTip = hint
+                spec.hintLabel?(hintField)
             }
-            grid.addRow(with: [label, valueStack])
+
+            if let control = spec.control {
+                control.toolTip = control.toolTip ?? spec.hint
+            }
+            let gridRow = grid.addRow(with: [textStack, trailingCell(spec.control)])
+            if let condition {
+                deps.append(ConditionalRow(condition: condition, setHidden: { hidden in
+                    gridRow.isHidden = hidden
+                }))
+            }
         }
-        grid.column(at: 0).width = 122
+        grid.column(at: 0).width = 260
 
         let card = SettingsCardView(cornerRadius: 10)
         grid.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(grid)
         NSLayoutConstraint.activate([
-            grid.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
-            grid.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
-            grid.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
-            grid.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -16),
+            grid.topAnchor.constraint(equalTo: card.topAnchor, constant: 13),
+            grid.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            grid.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            grid.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -13),
             card.widthAnchor.constraint(equalToConstant: 680)
         ])
         return card
     }
 
-    private func checkbox(_ title: String, action: Selector) -> NSButton {
-        let button = NSButton(checkboxWithTitle: title, target: self, action: action)
-        button.font = .systemFont(ofSize: 13)
-        return button
+    /// Wraps a trailing-aligned control so the grid's fill placement never stretches switches,
+    /// popups, or fields across the whole control column.
+    private func trailingCell(_ control: NSView?) -> NSView {
+        let container = NSView()
+        guard let control else { return container }
+        control.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(control)
+        NSLayoutConstraint.activate([
+            control.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            control.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            container.heightAnchor.constraint(equalTo: control.heightAnchor)
+        ])
+        return container
+    }
+
+    private func formRow(
+        title: String,
+        hint: String? = nil,
+        control: NSView?,
+        hintLabel: ((NSTextField) -> Void)? = nil
+    ) -> RowSpec {
+        RowSpec(title: title, hint: hint, control: control, hintLabel: hintLabel)
+    }
+
+    private func boolSwitch(
+        tag: Int,
+        on: Bool,
+        action: Selector = #selector(generalControlChanged(_:))
+    ) -> NSSwitch {
+        let toggle = NSSwitch()
+        toggle.controlSize = .mini
+        toggle.state = on ? .on : .off
+        toggle.tag = tag
+        toggle.target = self
+        toggle.action = action
+        return toggle
     }
 
     private func editableField(
@@ -1496,26 +1597,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         return field
     }
 
-    private func readOnlyValue(_ value: String) -> NSTextField {
-        let field = NSTextField(labelWithString: value)
-        field.font = .systemFont(ofSize: 13, weight: .medium)
-        field.textColor = .labelColor
-        field.lineBreakMode = .byTruncatingMiddle
-        return field
-    }
-
-    private func horizontalControls(_ controls: [NSView]) -> NSStackView {
-        let stack = NSStackView(views: controls)
-        stack.orientation = .horizontal
-        stack.spacing = 18
-        return stack
-    }
-
     private func tuningSlider(value: Double, range: ClosedRange<Double>, tag: Int) -> (view: NSView, slider: NSSlider, value: NSTextField) {
         let slider = NSSlider(value: value, minValue: range.lowerBound, maxValue: range.upperBound, target: self, action: #selector(tuningChanged(_:)))
         slider.tag = tag
         slider.isContinuous = true
-        slider.widthAnchor.constraint(equalToConstant: 330).isActive = true
+        slider.widthAnchor.constraint(equalToConstant: 280).isActive = true
         let valueLabel = NSTextField(labelWithString: "")
         valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         valueLabel.alignment = .right
@@ -1523,10 +1609,19 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         let row = NSStackView(views: [slider, valueLabel])
         row.orientation = .horizontal
         row.spacing = 12
+        row.widthAnchor.constraint(equalToConstant: 280 + 12 + 62).isActive = true
         return (row, slider, valueLabel)
     }
 
     private func scrollable(_ stack: NSStackView) -> NSView {
+        // The document view is pinned to at least the viewport height, so a short page must
+        // not stretch cards or grid cells to absorb the difference. This trailing filler
+        // offers zero vertical resistance and takes all leftover space instead.
+        let filler = NSView()
+        filler.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .vertical)
+        filler.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .vertical)
+        stack.addArrangedSubview(filler)
+
         let document = FlippedSettingsDocumentView()
         stack.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(stack)
@@ -1573,9 +1668,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         let originalAppearance = window.appearance
         let originalContentSize = contentView.bounds.size
         let originalPage = selectedPage
+        let originalConfiguration = configuration
         defer {
             window.appearance = originalAppearance
             window.setContentSize(originalContentSize)
+            configuration = originalConfiguration
+            cachedPageViews.removeAll()
+            conditionalRows.removeAll()
             showPage(originalPage)
         }
 
@@ -1620,6 +1719,42 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             }
             for page in [Page.hotkeys, .scrolling] {
                 try render(page: page, appearanceSuffix: appearance.suffix, compact: true)
+            }
+        }
+
+        // Dependency-state variants prove progressive disclosure renders both directions:
+        // provider-dependent translation rows, collapsed master switches, and the custom-only
+        // tuning card. Light appearance only; the toggles are orthogonal to colors.
+        let variants: [(name: String, page: Page, mutate: (inout UserConfiguration) -> Void)] = [
+            ("llm-light", .general, { config in
+                config.translation.enabled = true
+                config.translation.provider = "llm"
+            }),
+            ("collapsed-light", .general, { config in
+                config.windowSwitcher.enabled = false
+                config.translation.enabled = false
+            }),
+            ("custom-light", .scrolling, { config in
+                config.scroll.enabled = true
+                config.scroll.preset = .custom
+            }),
+            ("disabled-light", .scrolling, { config in
+                config.scroll.enabled = false
+            })
+        ]
+        if let aqua = NSAppearance(named: .aqua) {
+            window.appearance = aqua
+            contentView.wantsLayer = true
+            aqua.performAsCurrentDrawingAppearance {
+                contentView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            }
+            for variant in variants {
+                var mutated = originalConfiguration
+                variant.mutate(&mutated)
+                configuration = mutated
+                cachedPageViews.removeAll()
+                conditionalRows.removeAll()
+                try render(page: variant.page, appearanceSuffix: variant.name, compact: false)
             }
         }
         return outputURLs
