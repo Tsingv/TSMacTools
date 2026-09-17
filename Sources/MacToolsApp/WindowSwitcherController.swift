@@ -1301,7 +1301,7 @@ final class WindowSwitcherController {
         let refreshGeneration = axWindowListRefreshGeneration
         for processIdentifier in processIdentifiers.sorted() {
             inFlightAXWindowListPIDs.insert(processIdentifier)
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let windows = Self.fetchAXWindowList(
                     processIdentifier: processIdentifier,
                     enumerationTimeout: enumerationTimeout,
@@ -1669,7 +1669,7 @@ final class WindowSwitcherController {
         expectFocusedWindowChange(to: choice, generation: generation)
         scheduleAXObserverInstallation(for: choice)
 
-        focusQueue.async {
+        focusQueue.async { [weak self] in
             guard focusOperationGate.isCurrent(generation) else {
                 return
             }
@@ -1737,7 +1737,7 @@ final class WindowSwitcherController {
                 self.log("focus \(source) skipped; stale generation=\(generation) current=\(self.focusGeneration) key=\(choiceKey)")
                 return
             }
-            self.focusQueue.async {
+            self.focusQueue.async { [weak self] in
                 guard focusOperationGate.isCurrent(generation) else {
                     return
                 }

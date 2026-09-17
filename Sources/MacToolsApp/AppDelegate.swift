@@ -480,6 +480,11 @@ private final class PinButton: NSButton {
     }
 }
 
+@objc private protocol ResponderChainUndoRedoActions {
+    func undo(_ sender: Any?)
+    func redo(_ sender: Any?)
+}
+
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -632,20 +637,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
-        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
-        let redo = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        editMenu.addItem(NSMenuItem(title: "Undo", action: #selector(ResponderChainUndoRedoActions.undo(_:)), keyEquivalent: "z"))
+        let redo = NSMenuItem(title: "Redo", action: #selector(ResponderChainUndoRedoActions.redo(_:)), keyEquivalent: "z")
         redo.keyEquivalentModifierMask = NSEvent.ModifierFlags([.command, .shift])
         editMenu.addItem(redo)
         editMenu.addItem(NSMenuItem.separator())
-        editMenu.addItem(NSMenuItem(title: "Cut", action: Selector(("cut:")), keyEquivalent: "x"))
-        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(copy(_:)), keyEquivalent: "c"))
-        editMenu.addItem(NSMenuItem(title: "Paste", action: Selector(("paste:")), keyEquivalent: "v"))
-        let pasteAndMatchStyle = NSMenuItem(title: "Paste and Match Style", action: Selector(("pasteAsPlainText:")), keyEquivalent: "v")
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        let pasteAndMatchStyle = NSMenuItem(title: "Paste and Match Style", action: #selector(NSTextView.pasteAsPlainText(_:)), keyEquivalent: "v")
         pasteAndMatchStyle.keyEquivalentModifierMask = NSEvent.ModifierFlags([.command, .option, .shift])
         editMenu.addItem(pasteAndMatchStyle)
-        editMenu.addItem(NSMenuItem(title: "Delete", action: Selector(("delete:")), keyEquivalent: ""))
+        editMenu.addItem(NSMenuItem(title: "Delete", action: #selector(NSText.delete(_:)), keyEquivalent: ""))
         editMenu.addItem(NSMenuItem.separator())
-        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(selectAll(_:)), keyEquivalent: "a"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSResponder.selectAll(_:)), keyEquivalent: "a"))
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
