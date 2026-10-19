@@ -584,6 +584,7 @@ final class WindowSwitcherController {
     private var axWindowListCache: [pid_t: AXWindowListEntry] = [:]
     private var inFlightAXWindowListPIDs: Set<pid_t> = []
     private var axWindowListRefreshGeneration: UInt64 = 0
+    private var axWindowListPIDGenerations: [pid_t: UInt64] = [:]
     private var cgWindowInfoCache: (infos: [[String: Any]], fetchedAt: CFAbsoluteTime)?
     private var overlayRebuildPending = false
     private var overlayRowCache: [String: OverlayRowViews] = [:]
@@ -1109,6 +1110,7 @@ final class WindowSwitcherController {
             log("choices current-window corrected source=\(currentChoiceSource) cgTop=\(describe(firstEnumerated)) current=\(describe(currentFrontmostWindow))")
         }
         scheduleAXWindowListRefresh(for: axListRefreshPIDs, force: true)
+        scheduleAXWindowListRefresh(for: Set(recentChoices.values.map(\.processIdentifier)).subtracting(axListRefreshPIDs))
         return result
     }
 
@@ -1165,6 +1167,7 @@ final class WindowSwitcherController {
                   choice.processIdentifier == processIdentifier else {
                 return nil
             }
+            if let currentID = cgWindowIdentifier, let cachedID = choice.cgWindowIdentifier, currentID != cachedID { return nil }
             return choice
         }
         guard !candidates.isEmpty else {
@@ -1301,6 +1304,7 @@ final class WindowSwitcherController {
         let refreshGeneration = axWindowListRefreshGeneration
         for processIdentifier in processIdentifiers.sorted() {
             inFlightAXWindowListPIDs.insert(processIdentifier)
+            let pidGeneration = axWindowListPIDGenerations[processIdentifier, default: 0]
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let windows = Self.fetchAXWindowList(
                     processIdentifier: processIdentifier,
@@ -1314,12 +1318,17 @@ final class WindowSwitcherController {
                         return
                     }
                     self.inFlightAXWindowListPIDs.remove(processIdentifier)
+                    guard self.axWindowListPIDGenerations[processIdentifier, default: 0] == pidGeneration else {
+                        self.scheduleAXWindowListRefresh(for: [processIdentifier], force: true)
+                        return
+                    }
                     guard self.configuration.windowSwitcher.enabled else {
                         return
                     }
                     self.storeAXWindowList(
                         processIdentifier: processIdentifier,
-                        candidates: windows,
+                        candidates: windows?.candidates,
+                        completeWindowKeys: windows?.completeWindowKeys,
                         fetchedAt: CFAbsoluteTimeGetCurrent()
                     )
                 }
@@ -1327,10 +1336,22 @@ final class WindowSwitcherController {
         }
     }
 
-    private func storeAXWindowList(processIdentifier: pid_t, candidates: [AXWindowCandidate]?, fetchedAt: CFAbsoluteTime) {
+    private func storeAXWindowList(processIdentifier: pid_t, candidates: [AXWindowCandidate]?, completeWindowKeys: Set<String>?, fetchedAt: CFAbsoluteTime) {
+        var removedRecentWindows = false
+        if let completeWindowKeys {
+            let removed = recentKeys.filter { key in
+                recentChoices[key]?.processIdentifier == processIdentifier && !completeWindowKeys.contains(key)
+            }
+            removedRecentWindows = !removed.isEmpty
+            for key in removed {
+                recentChoices[key] = nil
+                recentKeys.removeAll { $0 == key }
+                removeAXObserver(forWindowKey: key)
+            }
+        }
         let previous = axWindowListCache[processIdentifier]
         if let candidates {
-            axWindowListCache[processIdentifier] = AXWindowListEntry(candidates: candidates, fetchedAt: fetchedAt, failed: false)
+            axWindowListCache[processIdentifier] = AXWindowListEntry(candidates: candidates, fetchedAt: fetchedAt, failed: completeWindowKeys == nil)
         } else {
             // Keep a last-known-good list during a transient AX timeout. Hiding an
             // application's windows until the next retry is more disruptive than
@@ -1358,7 +1379,7 @@ final class WindowSwitcherController {
         let structureChanged = previous.map { previous in
             previous.failed || !Self.areAXWindowListsEquivalent(previous.candidates, candidates)
         } ?? true
-        if structureChanged {
+        if structureChanged || removedRecentWindows {
             scheduleOverlayRebuild()
         }
     }
@@ -1394,12 +1415,17 @@ final class WindowSwitcherController {
         )]
     }
 
+    private struct AXWindowFetchResult {
+        let candidates: [AXWindowCandidate]
+        let completeWindowKeys: Set<String>?
+    }
+
     private nonisolated static func fetchAXWindowList(
         processIdentifier: pid_t,
         enumerationTimeout: Float,
         retryTimeout: Float,
         debugEnabled: Bool
-    ) -> [AXWindowCandidate]? {
+    ) -> AXWindowFetchResult? {
         let started = CFAbsoluteTimeGetCurrent()
         let app = AXUIElementCreateApplication(processIdentifier)
         AXUIElementSetMessagingTimeout(app, enumerationTimeout)
@@ -1434,10 +1460,10 @@ final class WindowSwitcherController {
                 "AX windows fallback to focused window pid=\(processIdentifier)",
                 debugEnabled: debugEnabled
             )
-            return makeAXWindowCandidates(
+            return AXWindowFetchResult(candidates: makeAXWindowCandidates(
                 processIdentifier: processIdentifier,
                 windows: [focusedWindow]
-            )
+            ), completeWindowKeys: nil)
         }
 
         windows.forEach { AXUIElementSetMessagingTimeout($0, enumerationTimeout) }
@@ -1450,7 +1476,7 @@ final class WindowSwitcherController {
             since: started,
             debugEnabled: debugEnabled
         )
-        return candidates
+        return AXWindowFetchResult(candidates: candidates, completeWindowKeys: Set(windows.map { "\(processIdentifier):ax:\(CFHash($0))" }))
     }
 
     private nonisolated static func areAXWindowListsEquivalent(
@@ -1668,6 +1694,22 @@ final class WindowSwitcherController {
         log("focus begin \(describe(choice)) frontmostBefore=\(frontmostDescription())")
         expectFocusedWindowChange(to: choice, generation: generation)
         scheduleAXObserverInstallation(for: choice)
+
+        // AX calls against this process execute AppKit synchronously on the caller.
+        // Use the owned NSWindow on the main actor, including minimized Settings.
+        if processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            let ownedWindow = NSApp.windows.first { window in
+                choice.cgWindowIdentifier.map { window.windowNumber == Int($0) } ?? false
+            } ?? NSApp.windows.first { $0.title == choice.title && ($0.isVisible || $0.isMiniaturized) }
+            if let ownedWindow {
+                if ownedWindow.isMiniaturized { ownedWindow.deminiaturize(nil) }
+                NSApp.activate(ignoringOtherApps: true)
+                ownedWindow.makeKeyAndOrderFront(nil)
+                cgWindowInfoCache = nil
+                recordFocusedWindow()
+            }
+            return updatedChoice
+        }
 
         focusQueue.async { [weak self] in
             guard focusOperationGate.isCurrent(generation) else {
@@ -2454,6 +2496,7 @@ final class WindowSwitcherController {
         switch notification {
         case kAXUIElementDestroyedNotification:
             axWindowListCache[processIdentifier] = nil
+            axWindowListPIDGenerations[processIdentifier, default: 0] &+= 1
             let keys = recentKeys.filter { key in
                 recentChoices[key].map {
                     $0.processIdentifier == processIdentifier && CFHash($0.axWindow) == elementHash
@@ -2481,6 +2524,7 @@ final class WindowSwitcherController {
             moveDormantWindowsToEnd()
         case kAXWindowCreatedNotification:
             axWindowListCache[processIdentifier] = nil
+            axWindowListPIDGenerations[processIdentifier, default: 0] &+= 1
             recordFocusedWindow(expectedProcessIdentifier: processIdentifier)
         case kAXFocusedWindowChangedNotification:
             verifyFocusedWindowChangeIfNeeded(processIdentifier: processIdentifier, source: "notification")

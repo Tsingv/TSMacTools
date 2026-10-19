@@ -232,6 +232,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     func present(configuration: UserConfiguration, configURL: URL) {
         refresh(configuration: configuration, configURL: configURL)
+        NSApp.setActivationPolicy(.regular)
+        if window?.isMiniaturized == true { window?.deminiaturize(nil) }
         NSApp.activate(ignoringOtherApps: true)
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
@@ -487,6 +489,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     }
 
     func windowWillClose(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
         endActiveHotkeyRecording()
     }
 
