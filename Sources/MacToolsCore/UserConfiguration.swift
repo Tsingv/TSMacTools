@@ -6,6 +6,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
     public var hotkeys: [HotkeyBinding]
     public var windowSwitcher: WindowSwitcherSettings
     public var scroll: ScrollSettings
+    public var fans: FanSettings = .init()
     public var translation: TranslationSettings
 
     public init(
@@ -31,6 +32,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         case windowSwitcher
         case scroll
         case translation
+        case fans
     }
 
     public init(from decoder: Decoder) throws {
@@ -42,6 +44,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         self.windowSwitcher = try container.decode(WindowSwitcherSettings.self, forKey: .windowSwitcher)
         self.scroll = try container.decodeIfPresent(ScrollSettings.self, forKey: .scroll) ?? .default
         self.translation = try container.decode(TranslationSettings.self, forKey: .translation)
+        self.fans = try container.decodeIfPresent(FanSettings.self, forKey: .fans) ?? .init()
     }
 }
 
@@ -722,5 +725,141 @@ public extension UserConfiguration {
                 )
             )
         )
+    }
+}
+
+public struct FanCurvePoint: Codable, Equatable, Sendable {
+    public var temperature: Double
+    public var percent: Double
+    /// Cubic Bezier easing control ordinates; abscissae are 1/3 and 2/3.
+    public var outgoing: Double = 0.33
+    public var incoming: Double = 0.67
+    public init(temperature: Double, percent: Double) {
+        self.temperature = temperature; self.percent = percent
+    }
+}
+
+public struct FanRule: Codable, Equatable, Sendable {
+    public var id: UUID = UUID()
+    public var enabled: Bool = true
+    private enum CodingKeys: String, CodingKey { case id, enabled, sensor, fan, points }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        id = try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(uuidString: String(format: "00000000-0000-0000-0000-%012llx", UInt64(decoder.codingPath.last?.intValue ?? 0)))!
+        sensor = try values.decode(String.self, forKey: .sensor)
+        fan = try values.decode(Int.self, forKey: .fan)
+        points = try values.decode([FanCurvePoint].self, forKey: .points)
+    }
+    public var sensor: String
+    public var fan: Int
+    public var points: [FanCurvePoint]
+    public init(sensor: String = "CPU", fan: Int = 0, points: [FanCurvePoint] = [
+        .init(temperature: 40, percent: 25), .init(temperature: 65, percent: 55), .init(temperature: 85, percent: 100)
+    ]) { self.sensor = sensor; self.fan = fan; self.points = points }
+
+    public func demand(at temperature: Double) -> Double? {
+        guard temperature.isFinite, points.count >= 2,
+              points.allSatisfy({ $0.temperature.isFinite && $0.percent.isFinite && (0...100).contains($0.percent) && (0...1).contains($0.outgoing) && (0...1).contains($0.incoming) }),
+              zip(points, points.dropFirst()).allSatisfy({ $0.temperature < $1.temperature && $0.percent <= $1.percent }) else { return nil }
+        if temperature <= points[0].temperature { return points[0].percent }
+        for (a, b) in zip(points, points.dropFirst()) where temperature <= b.temperature {
+            let t = (temperature - a.temperature) / (b.temperature - a.temperature), u = 1 - t
+            let easing = 3*u*u*t*a.outgoing + 3*u*t*t*b.incoming + t*t*t
+            return a.percent + (b.percent - a.percent) * easing
+        }
+        return points.last?.percent
+    }
+}
+
+public struct FanSettings: Codable, Equatable, Sendable {
+    public var enabled = false
+    private enum CodingKeys: String, CodingKey { case enabled, rules }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        rules = try values.decodeIfPresent([FanRule].self, forKey: .rules) ?? []
+    }
+
+    public var rules: [FanRule] = []
+    public init() {}
+    public func activeDemands(readings: [String: Double], now: Date, sampleDate: Date) -> [Int: Double]? {
+        let age = now.timeIntervalSince(sampleDate)
+        guard enabled, age >= 0, age <= 3 else { return nil }
+        return demands(readings: readings)
+    }
+    public var duplicateFanIDs: [Int] {
+        Dictionary(grouping: rules, by: \.fan).filter { $0.value.count > 1 }.keys.sorted()
+    }
+    /// Ambiguous legacy assignments restore automatic control until explicitly resolved.
+
+    public func demands(readings: [String: Double]) -> [Int: Double]? {
+        guard duplicateFanIDs.isEmpty else { return nil }
+        var output: [Int: Double] = [:]
+        for rule in rules where rule.enabled {
+            guard rule.fan >= 0, let reading = readings[rule.sensor], let value = rule.demand(at: reading) else { return nil }
+            output[rule.fan] = max(output[rule.fan] ?? 0, value)
+        }
+        return output
+    }
+}
+
+/// A privileged adapter must enforce lease expiry independently of the UI process.
+/// The live XPC adapter uses helper-serialized complete batches; this boundary supports deterministic policy tests.
+public protocol FanHardwareBoundary {
+    var supportsLeasedControl: Bool { get }
+    mutating func setDemand(_ percent: Double, fan: Int, leaseUntil: Date) throws
+    mutating func restoreAutomatic() throws
+}
+
+public struct FanControlSession<Hardware: FanHardwareBoundary> {
+    public private(set) var hardware: Hardware
+    private var activeFans = Set<Int>()
+    public init(hardware: Hardware) { self.hardware = hardware }
+    public mutating func update(settings: FanSettings, readings: [String: Double], now: Date, sampleDate: Date) throws {
+        guard hardware.supportsLeasedControl, now.timeIntervalSince(sampleDate) >= 0,
+              now.timeIntervalSince(sampleDate) <= 3, let demands = settings.demands(readings: readings), !demands.isEmpty else {
+            try hardware.restoreAutomatic(); activeFans = []; return
+        }
+        do {
+            if !activeFans.subtracting(demands.keys).isEmpty { try hardware.restoreAutomatic() }
+            for (fan, percent) in demands { try hardware.setDemand(percent, fan: fan, leaseUntil: now.addingTimeInterval(5)) }
+            activeFans = Set(demands.keys)
+        } catch { try? hardware.restoreAutomatic(); activeFans = []; throw error }
+    }
+    public mutating func stop() throws { try hardware.restoreAutomatic(); activeFans = [] }
+}
+
+/// Converts the General pane's base URL into the full request URL consumed by Python.
+public enum TranslationEndpoint {
+    public enum InvalidURL: LocalizedError {
+        case invalid
+        public var errorDescription: String? { "Base URL must be an absolute HTTP or HTTPS URL with a host." }
+    }
+
+    public static func requestURL(_ input: String) throws -> String {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var parts = URLComponents(string: trimmed),
+              ["http", "https"].contains(parts.scheme?.lowercased() ?? ""),
+              let host = parts.host, !host.isEmpty,
+              parts.url != nil else { throw InvalidURL.invalid }
+        let path = parts.percentEncodedPath
+        let clean = path.replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
+        // Existing full endpoint values retain their exact path, trailing slash and query.
+        if clean.hasSuffix("/chat/completions") { return trimmed }
+        parts.percentEncodedPath = clean.isEmpty ? "/v1/chat/completions" : clean + "/chat/completions"
+        guard let result = parts.url?.absoluteString else { throw InvalidURL.invalid }
+        return result
+    }
+
+    public static func baseURL(_ endpoint: String) -> String {
+        guard var parts = URLComponents(string: endpoint) else { return endpoint }
+        // Query-bearing or trailing-slash endpoints stay verbatim to preserve custom semantics.
+        guard parts.percentEncodedQuery == nil, parts.fragment == nil,
+              parts.percentEncodedPath.hasSuffix("/chat/completions") else { return endpoint }
+        parts.percentEncodedPath.removeLast("/chat/completions".count)
+        // A root-level custom endpoint would otherwise acquire an unwanted /v1 on save.
+        guard !parts.percentEncodedPath.isEmpty else { return endpoint }
+        return parts.string ?? endpoint
     }
 }

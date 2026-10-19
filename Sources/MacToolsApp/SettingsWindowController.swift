@@ -1,4 +1,6 @@
 import AppKit
+import Security
+import IOKit
 import Carbon.HIToolbox
 import MacToolsCore
 import QuartzCore
@@ -105,6 +107,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case googleTargetLanguage
         case googleTargetLanguageForChinese
         case copyKeystrokeDelay
+        case endpoint
         case model
         case contextWindowTokens
         case outputTokenLimit
@@ -117,12 +120,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case general
         case hotkeys
         case scrolling
+        case fans
 
         var title: String {
             switch self {
             case .general: "General"
             case .hotkeys: "Hotkeys"
             case .scrolling: "Scrolling"
+            case .fans: "Fans"
             }
         }
 
@@ -131,6 +136,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             case .general: "gearshape"
             case .hotkeys: "keyboard"
             case .scrolling: "scroll"
+            case .fans: "fan"
             }
         }
     }
@@ -147,6 +153,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private var pageButtons: [Page: NSButton] = [:]
     private var cachedPageViews: [Page: NSView] = [:]
 
+    private let savingQueue = DispatchQueue(label: "TSMacTools.settings-save", qos: .utility)
+    private var saveGeneration = 0
+    private var applicationIcons: [String: NSImage] = [:]
     private var providerPopup: NSPopUpButton?
 
     private var presetPopup: NSPopUpButton?
@@ -245,6 +254,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         self.configuration = configuration
         lastKnownGoodConfiguration = configuration
         self.configURL = configURL
+        contentContainer.subviews.forEach { $0.removeFromSuperview() }
         cachedPageViews.removeAll()
         conditionalRows.removeAll()
         showPage(selectedPage, animated: false)
@@ -258,7 +268,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         pageBar.alignment = .centerY
         pageBar.distribution = .fillEqually
         pageBar.spacing = 8
-        pageBar.edgeInsets = NSEdgeInsets(top: 8, left: 205, bottom: 6, right: 205)
+        pageBar.edgeInsets = NSEdgeInsets(top: 8, left: 160, bottom: 6, right: 160)
         pageBar.translatesAutoresizingMaskIntoConstraints = false
 
         for page in Page.allCases {
@@ -353,11 +363,126 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
     }
 
+    private func languagePicker(_ value: String, field: ConfigurationField) -> NSPopUpButton {
+        let popup = NSPopUpButton()
+        let values = ["auto", "en", "zh-CN", "zh-TW", "ja", "ko", "fr", "de", "es", "it", "pt", "ru", "ar", "hi"]
+        popup.addItems(withTitles: values.contains(value) ? values : values + [value])
+        popup.selectItem(withTitle: value)
+        popup.tag = field.rawValue
+        popup.target = self; popup.action = #selector(languageChanged(_:))
+        return popup
+    }
+    @objc private func languageChanged(_ sender: NSPopUpButton) {
+        let value = sender.titleOfSelectedItem ?? "auto"
+        persist { latest in
+            switch ConfigurationField(rawValue: sender.tag) {
+            case .googleSourceLanguage: latest.translation.googleSourceLanguage = value
+            case .googleTargetLanguage: latest.translation.googleTargetLanguage = value
+            case .googleTargetLanguageForChinese: latest.translation.googleTargetLanguageForChinese = value
+            default: break
+            }
+        }
+    }
+    private func filePicker(_ value: String, field: ConfigurationField) -> NSButton {
+        let button = NSButton(title: value, target: self, action: #selector(chooseConfigurationFile(_:)))
+        button.tag = field.rawValue; button.toolTip = value
+        button.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        return button
+    }
+    @objc private func chooseConfigurationFile(_ sender: NSButton) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        let field = ConfigurationField(rawValue: sender.tag)
+        if field != .pythonPath { panel.allowedContentTypes = [.applicationBundle] }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let value = field == .pythonPath ? url.path : Bundle(url: url)?.bundleIdentifier
+        guard let value else { return }
+        persist { latest in
+            switch field {
+            case .pythonPath: latest.scripting.pythonPath = value
+            case .finderBundleIdentifier: latest.application.finderBundleIdentifier = value
+            case .terminalBundleIdentifier: latest.application.terminalBundleIdentifier = value
+            default: break
+            }
+        }
+        sender.title = value; sender.toolTip = value
+    }
+
+    private var fanEditorCount = 0
+    var fanRuntime: FanRuntime?
+    private var fanLivePanel: FanRuntime?
+    private func makeFansPage() -> NSView {
+        fanEditorCount = configuration.fans.rules.count
+        let stack = pageStack()
+        let live = fanRuntime ?? fanLivePanel ?? FanRuntime()
+        live.onEnabledChange = { [weak self] value in self?.persist { $0.fans.enabled = value } }
+        fanLivePanel = live
+        stack.addArrangedSubview(live.monitoringView)
+        var editors: [FanCurveEditor] = []
+        for rule in configuration.fans.rules {
+            let editor = FanCurveEditor(rule: rule)
+            editors.append(editor)
+            var expected = rule
+            editor.onDelete = { [weak self] in
+                self?.persist { latest in
+                    guard let index = latest.fans.rules.firstIndex(where: { $0.id == expected.id && $0 == expected }) else { throw MutationError.invalidValue("Rule changed externally; reopen Fans.") }
+                    latest.fans.rules.remove(at: index)
+                }
+            }
+            editor.onChange = { [weak self] changed in
+                self?.persist { latest in
+                    guard let index = latest.fans.rules.firstIndex(where: { $0.id == expected.id && $0 == expected }), changed.fan == expected.fan else { throw MutationError.invalidValue("Rule changed externally; reopen Fans.") }
+                    latest.fans.rules[index] = changed
+                }
+                expected = changed
+            }
+            stack.addArrangedSubview(editor)
+        }
+        let chooser = NSPopUpButton()
+        chooser.setAccessibilityLabel("Fan for new rule")
+        let add = NSButton(title: "Add rule", target: nil, action: nil)
+        let creation = FanRuleCreationAction { [weak self, weak chooser] in
+            guard let self, let id = chooser?.selectedItem?.representedObject as? Int else { return }
+            let detected = Set(live.detectedFanIDs)
+            self.persist { latest in
+                guard detected.contains(id), !latest.fans.rules.contains(where: { $0.fan == id }) else { throw MutationError.invalidValue("Fan unavailable or already assigned. Choose an unassigned detected fan.") }
+                latest.fans.rules.append(FanRule(fan: id))
+            }
+        }
+        add.target = creation; add.action = #selector(FanRuleCreationAction.invoke)
+        // Retain the action for exactly as long as its button.
+        objc_setAssociatedObject(add, &fanCreationActionKey, creation, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        let refresh: (FanSnapshot?) -> Void = { [weak self] snapshot in
+            editors.forEach { $0.update(snapshot: snapshot) }
+            let selection = chooser.selectedItem?.representedObject as? Int
+            chooser.removeAllItems()
+            let assigned = Set(self?.configuration.fans.rules.map(\.fan) ?? [])
+            for fan in snapshot?.fans ?? [] where !assigned.contains(fan.id) {
+                chooser.addItem(withTitle: fan.name.map { "\($0) (\(fan.id))" } ?? "Fan \(fan.id)")
+                chooser.lastItem?.representedObject = fan.id
+            }
+            if let selection, let item = chooser.itemArray.first(where: { ($0.representedObject as? Int) == selection }) { chooser.select(item) }
+            add.isEnabled = chooser.numberOfItems > 0
+            chooser.isEnabled = add.isEnabled
+            if !add.isEnabled { chooser.addItem(withTitle: "No unassigned detected fans") }
+        }
+        live.onSnapshot = refresh
+        live.apply(configuration.fans)
+        live.refreshEditors()
+        stack.addArrangedSubview(NSStackView(views: [chooser, add]))
+        if !configuration.fans.duplicateFanIDs.isEmpty {
+            stack.addArrangedSubview(note("Duplicate fan assignments: \(configuration.fans.duplicateFanIDs). Control is suspended. Delete duplicate rules so each fan has one rule, including disabled rules."))
+        }
+        stack.addArrangedSubview(note("Choose an unassigned detected fan before creating a rule. Its fan is fixed; its sensor and curve remain editable. Delete a rule to release its assignment."))
+        return scrollable(stack)
+    }
+
     private func makePage(_ page: Page) -> NSView {
         switch page {
         case .general: makeGeneralPage()
         case .hotkeys: makeHotkeysPage()
         case .scrolling: makeScrollingPage()
+        case .fans: makeFansPage()
         }
     }
 
@@ -452,6 +577,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             (formRow(title: "Provider",
                      hint: "Selects the translation backend.",
                      control: provider), translationOn),
+            (formRow(title: "Base URL",
+                     hint: "Root adds /v1/chat/completions; a path adds /chat/completions. Complete chat/completions URLs and queries are preserved.",
+                     control: editableField(TranslationEndpoint.baseURL(configuration.translation.endpoint), field: .endpoint, width: 320)), translationProviders(["llm"])),
             (formRow(title: "LLM model",
                      hint: "Provider model identifier.",
                      control: editableField(configuration.translation.model, field: .model, width: 320)), translationProviders(["llm"])),
@@ -472,13 +600,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                      control: editableField(configuration.translation.googleApiKey, field: .googleAPIKey, width: 320, secure: true)), translationProviders(["google"])),
             (formRow(title: "Source language",
                      hint: "Use auto for detection.",
-                     control: editableField(configuration.translation.googleSourceLanguage, field: .googleSourceLanguage, width: 120)), translationProviders(["google_web", "google"])),
+                     control: languagePicker(configuration.translation.googleSourceLanguage, field: .googleSourceLanguage)), translationProviders(["google_web", "google"])),
             (formRow(title: "Target language",
                      hint: "Used when the selection is not Chinese.",
-                     control: editableField(configuration.translation.googleTargetLanguage, field: .googleTargetLanguage, width: 120)), translationProviders(["google_web", "google"])),
+                     control: languagePicker(configuration.translation.googleTargetLanguage, field: .googleTargetLanguage)), translationProviders(["google_web", "google"])),
             (formRow(title: "Chinese target language",
                      hint: "Used when the selection is Chinese.",
-                     control: editableField(configuration.translation.googleTargetLanguageForChinese, field: .googleTargetLanguageForChinese, width: 120)), translationProviders(["google_web", "google"])),
+                     control: languagePicker(configuration.translation.googleTargetLanguageForChinese, field: .googleTargetLanguageForChinese)), translationProviders(["google_web", "google"])),
             (formRow(title: "Join PDF hard-wrapped lines",
                      hint: "Keeps paragraphs and structural lines intact.",
                      control: boolSwitch(tag: 5, on: configuration.translation.normalizePDFLineBreaks)), translationOn),
@@ -490,11 +618,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         stack.addArrangedSubview(section(header: "Scripting & applications", rows: [
             (formRow(title: "Python executable",
                      hint: "Runs script-backed hotkey actions.",
-                     control: editableField(configuration.scripting.pythonPath, field: .pythonPath, width: 320)), nil),
+                     control: filePicker(configuration.scripting.pythonPath, field: .pythonPath)), nil),
             (formRow(title: "Finder bundle ID",
-                     control: editableField(configuration.application.finderBundleIdentifier, field: .finderBundleIdentifier, width: 320)), nil),
+                     control: filePicker(configuration.application.finderBundleIdentifier, field: .finderBundleIdentifier)), nil),
             (formRow(title: "Terminal bundle ID",
-                     control: editableField(configuration.application.terminalBundleIdentifier, field: .terminalBundleIdentifier, width: 320)), nil)
+                     control: filePicker(configuration.application.terminalBundleIdentifier, field: .terminalBundleIdentifier)), nil)
         ], into: &deps))
 
         stack.addArrangedSubview(section(header: "Diagnostics", rows: [
@@ -575,11 +703,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         table.focusRingType = .none
         table.gridStyleMask = []
         table.translatesAutoresizingMaskIntoConstraints = false
-        list.addSubview(table)
+        let viewport = NSScrollView()
+        viewport.hasVerticalScroller = true
+        viewport.drawsBackground = false
+        viewport.documentView = table
+        viewport.translatesAutoresizingMaskIntoConstraints = false
+        list.addSubview(viewport)
         hotkeyTableView = table
 
-        let tableHeight = table.heightAnchor.constraint(
-            equalToConstant: CGFloat(configuration.hotkeys.count) * table.rowHeight
+        let tableHeight = viewport.heightAnchor.constraint(
+            equalToConstant: min(360, max(60, CGFloat(configuration.hotkeys.count) * table.rowHeight))
         )
         hotkeyTableHeightConstraint = tableHeight
         NSLayoutConstraint.activate([
@@ -587,10 +720,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             header.leadingAnchor.constraint(equalTo: list.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: list.trailingAnchor),
             header.heightAnchor.constraint(equalToConstant: 32),
-            table.topAnchor.constraint(equalTo: header.bottomAnchor),
-            table.leadingAnchor.constraint(equalTo: list.leadingAnchor),
-            table.trailingAnchor.constraint(equalTo: list.trailingAnchor),
-            table.bottomAnchor.constraint(equalTo: list.bottomAnchor),
+            viewport.topAnchor.constraint(equalTo: header.bottomAnchor),
+            viewport.leadingAnchor.constraint(equalTo: list.leadingAnchor),
+            viewport.trailingAnchor.constraint(equalTo: list.trailingAnchor),
+            viewport.bottomAnchor.constraint(equalTo: list.bottomAnchor),
             tableHeight
         ])
 
@@ -630,15 +763,20 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             guard let self, let recorder else { return }
             self.endHotkeyRecording(recorder)
         }
-        recorder.onRecord = { [weak self] modifiers, key, mouseButton in
+        recorder.onRecordAsync = { [weak self] modifiers, key, mouseButton, finish in
             guard let self, self.configuration.hotkeys.indices.contains(index) else {
-                return .rejected(MutationError.hotkeyChangedExternally.localizedDescription)
+                finish(.rejected(MutationError.hotkeyChangedExternally.localizedDescription)); return
             }
             let trigger: HotkeyTrigger = mouseButton.map {
                 HotkeyTrigger.mouseButton($0, modifiers: modifiers)
             }
                 ?? .keyboard(HotkeyShortcut(modifiers: modifiers, key: key))
-            let result = self.persist(reportFailure: false) { latest in
+            let result = self.persist(reportFailure: false, completion: { result in
+                switch result {
+                case .success: finish(.accepted)
+                case let .failure(error): finish(.rejected(error.localizedDescription))
+                }
+            }) { latest in
                 guard let latestIndex = self.resolveHotkeyIndex(
                     for: binding,
                     preferredIndex: index,
@@ -652,10 +790,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                 latest.hotkeys[latestIndex].mouseButton = mouseButton
             }
             switch result {
-            case .success: return .accepted
+            case .success: break
             case let .failure(error):
-                self.didFail(error)
-                return .rejected(error.localizedDescription)
+                finish(.rejected(error.localizedDescription))
             }
         }
         recorder.widthAnchor.constraint(equalToConstant: 120).isActive = true
@@ -698,7 +835,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private func reloadHotkeyTable(focusID: String? = nil) {
         hotkeyCountLabel?.stringValue = "\(configuration.hotkeys.count) bindings"
         if let table = hotkeyTableView {
-            hotkeyTableHeightConstraint?.constant = CGFloat(configuration.hotkeys.count) * table.rowHeight
+            hotkeyTableHeightConstraint?.constant = min(360, max(60, CGFloat(configuration.hotkeys.count) * table.rowHeight))
             table.reloadData()
         }
         if let focusID { focusHotkeyRow(id: focusID) }
@@ -884,8 +1021,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         let url = action.path.map(URL.init(fileURLWithPath:))
             ?? action.bundleIdentifier.flatMap(NSWorkspace.shared.urlForApplication(withBundleIdentifier:))
         guard let url else { return nil }
+        if let cached = applicationIcons[url.path] { return cached }
         let icon = NSWorkspace.shared.icon(forFile: url.path)
         icon.size = NSSize(width: 32, height: 32)
+        applicationIcons[url.path] = icon
         return icon
     }
 
@@ -1182,6 +1321,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             }
             configuration.translation.copyKeystrokeDelay = value
             persist { $0.translation.copyKeystrokeDelay = value }
+        case .endpoint:
+            let value = try TranslationEndpoint.requestURL(rawValue)
+            configuration.translation.endpoint = value
+            persist { $0.translation.endpoint = value }
         case .model:
             let value = try requiredText(rawValue, name: "LLM model")
             configuration.translation.model = value
@@ -1245,6 +1388,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .googleTargetLanguage: configuration.translation.googleTargetLanguage
         case .googleTargetLanguageForChinese: configuration.translation.googleTargetLanguageForChinese
         case .copyKeystrokeDelay: String(format: "%.2f", configuration.translation.copyKeystrokeDelay)
+        case .endpoint: TranslationEndpoint.baseURL(configuration.translation.endpoint)
         case .model: configuration.translation.model
         case .contextWindowTokens: String(configuration.translation.contextWindowTokens)
         case .outputTokenLimit: String(configuration.translation.outputTokenLimit)
@@ -1327,35 +1471,54 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     @discardableResult
     private func persist(
         reportFailure: Bool = true,
+        completion: (@MainActor @Sendable (Result<UserConfiguration, Error>) -> Void)? = nil,
         _ mutation: (inout UserConfiguration) throws -> Void
     ) -> Result<UserConfiguration, Error> {
-        let unsavedTuningChanges = pendingTuningChanges
-        let rollbackConfiguration = lastKnownGoodConfiguration
         do {
-            var expectedConfiguration = rollbackConfiguration
-            try mutation(&expectedConfiguration)
-            let savedConfiguration = try configurationStore.update(at: configURL, mutation: mutation)
-            let mergedExternalChanges = savedConfiguration != expectedConfiguration
-            configuration = savedConfiguration
-            lastKnownGoodConfiguration = savedConfiguration
-            didSave(savedConfiguration)
-            reapplyUnsavedTuning(unsavedTuningChanges)
-            if mergedExternalChanges {
-                scheduleVisiblePageReconciliation()
+            let baseline = lastKnownGoodConfiguration
+            var proposed = configuration
+            try mutation(&proposed)
+            let patch = try ConfigurationPatch(before: baseline, after: proposed)
+            configuration = proposed
+            (fanRuntime ?? fanLivePanel)?.apply(proposed.fans)
+            lastKnownGoodConfiguration = proposed
+            saveGeneration += 1
+            let generation = saveGeneration
+            let url = configURL
+            savingQueue.async { [weak self] in
+                let store = UserConfigurationStore()
+                let result = Result { try store.update(at: url) { try patch.apply(to: &$0) } }
+                let recovery = (try? result.get()) ?? (try? store.load(from: url))
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    switch result {
+                    case let .success(saved):
+                        self.didSave(saved)
+                        if self.saveGeneration == generation {
+                            self.configuration = saved
+                            self.lastKnownGoodConfiguration = saved
+                            (self.fanRuntime ?? self.fanLivePanel)?.apply(saved.fans)
+                            self.cachedPageViews = self.cachedPageViews.filter { $0.key == self.selectedPage }
+                            if self.selectedPage != .fans || saved.fans.rules.count != self.fanEditorCount { self.scheduleVisiblePageReconciliation() }
+                        }
+                    case let .failure(error):
+                        if self.saveGeneration == generation {
+                            if let latest = recovery {
+                                self.configuration = latest
+                                self.lastKnownGoodConfiguration = latest
+                                (self.fanRuntime ?? self.fanLivePanel)?.apply(latest.fans)
+                            }
+                            self.cachedPageViews = self.cachedPageViews.filter { $0.key == self.selectedPage }
+                        }
+                        self.scheduleVisiblePageReconciliation()
+                        if reportFailure { self.didFail(error) }
+                    }
+                    completion?(result)
+                }
             }
-            return .success(savedConfiguration)
+            return .success(proposed)
         } catch {
-            if let latest = try? configurationStore.load(from: configURL) {
-                configuration = latest
-                lastKnownGoodConfiguration = latest
-            } else {
-                configuration = rollbackConfiguration
-            }
-            reapplyUnsavedTuning(unsavedTuningChanges)
-            scheduleVisiblePageReconciliation()
-            if reportFailure {
-                didFail(error)
-            }
+            if reportFailure { didFail(error) }
             return .failure(error)
         }
     }
@@ -1884,6 +2047,25 @@ private final class HotkeyRecorderButton: NSButton {
     var onRecordingBegan: (() -> Void)?
     var onRecordingEnded: (() -> Void)?
     var onRecord: (([String], String, Int?) -> CommitResult)?
+    var onRecordAsync: (([String], String, Int?, @escaping @MainActor @Sendable (CommitResult) -> Void) -> Void)?
+    private var commitPending = false
+    private var commitToken = UUID()
+    private func commit(modifiers: [String], key: String, mouse: Int?) {
+        guard !commitPending else { return }
+        let token = UUID(); commitToken = token; commitPending = true
+        let finish: @MainActor @Sendable (CommitResult) -> Void = { [weak self] result in
+            guard let self, self.recording, self.commitToken == token else { return }
+            self.commitPending = false
+            switch result {
+            case .accepted:
+                self.binding.modifiers = modifiers; self.binding.key = key; self.binding.mouseButton = mouse
+                _ = self.window?.makeFirstResponder(nil)
+            case let .rejected(message): self.title = message; self.toolTip = message; NSSound.beep()
+            }
+        }
+        if let onRecordAsync { title = "Saving…"; onRecordAsync(modifiers, key, mouse, finish) }
+        else { finish(onRecord?(modifiers, key, mouse) ?? .rejected("Unable to save this shortcut.")) }
+    }
     private var binding: HotkeyBinding
     private let allowsMouseButton: Bool
     private var recording = false
@@ -1915,6 +2097,7 @@ private final class HotkeyRecorderButton: NSButton {
     @objc private func beginRecording() {
         guard !recording else { return }
         recording = true
+        commitPending = false; commitToken = UUID()
         title = "Press shortcut…"
         toolTip = allowsMouseButton
             ? "Press a modifier plus a key, or a mouse side button with optional modifiers. Escape cancels."
@@ -1966,17 +2149,7 @@ private final class HotkeyRecorderButton: NSButton {
             NSSound.beep()
             return
         }
-        switch onRecord?(modifiers, key, nil) ?? .rejected("Unable to save this shortcut.") {
-        case .accepted:
-            binding.modifiers = modifiers
-            binding.key = key
-            binding.mouseButton = nil
-            _ = window?.makeFirstResponder(nil)
-        case let .rejected(message):
-            title = message
-            toolTip = message
-            NSSound.beep()
-        }
+        commit(modifiers: modifiers, key: key, mouse: nil)
     }
 
     private func updateTitle() {
@@ -2050,17 +2223,7 @@ private final class HotkeyRecorderButton: NSButton {
 
     private func recordMouseButton(_ button: Int, modifiers: [String]) {
         guard recording, allowsMouseButton, (2 ... 31).contains(button) else { return }
-        switch onRecord?(modifiers, "", button) ?? .rejected("Unable to save this mouse button.") {
-        case .accepted:
-            binding.modifiers = modifiers
-            binding.key = ""
-            binding.mouseButton = button
-            _ = window?.makeFirstResponder(nil)
-        case let .rejected(message):
-            title = message
-            toolTip = message
-            NSSound.beep()
-        }
+        commit(modifiers: modifiers, key: "", mouse: button)
     }
 
     private func recordedModifiers(_ flags: NSEvent.ModifierFlags) -> [String] {
@@ -2352,5 +2515,702 @@ private extension NSView {
             let current = (child as? T).map { [$0] } ?? []
             return current + child.descendants(ofType: type)
         }
+    }
+}
+
+@MainActor private final class FanMonitoringCards: NSView {
+    private final class Document: NSView { override var isFlipped: Bool { true } }
+    private let scroll = NSScrollView()
+    private let document = Document()
+    private var orderedCards: [NSView] = []
+    private var columns: Int { max(1, Int(max(bounds.width, 220) / 220)) }
+    private var rows: Int { (orderedCards.count + columns - 1) / columns }
+    private func height(_ rows: Int) -> CGFloat { rows == 0 ? 0 : CGFloat(rows) * 68 + CGFloat(rows - 1) * 8 }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        scroll.documentView = document
+        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay; scroll.drawsBackground = false
+        addSubview(scroll)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: height(min(2, rows)))
+    }
+    override func layout() {
+        super.layout()
+        let origin = scroll.contentView.bounds.origin
+        scroll.frame = bounds
+        let width = max(0, (bounds.width - CGFloat(columns - 1) * 8) / CGFloat(columns))
+        document.setFrameSize(NSSize(width: bounds.width, height: height(rows)))
+        for (index, card) in orderedCards.enumerated() {
+            card.frame = NSRect(x: CGFloat(index % columns) * (width + 8), y: CGFloat(index / columns) * 76, width: width, height: 68)
+        }
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: min(origin.y, max(0, document.bounds.height - bounds.height))))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        invalidateIntrinsicContentSize()
+    }
+    func setCards(_ views: [NSView]) {
+        guard orderedCards != views else { return }
+        for view in orderedCards where !views.contains(view) { view.removeFromSuperview() }
+        for view in views where view.superview !== document { document.addSubview(view) }
+        orderedCards = views; invalidateIntrinsicContentSize(); needsLayout = true
+    }
+}
+
+@MainActor private var fanCreationActionKey: UInt8 = 0
+@MainActor private final class FanRuleCreationAction: NSObject {
+    private let action: () -> Void
+    init(_ action: @escaping () -> Void) { self.action = action }
+    @objc func invoke() { action() }
+}
+
+private final class FanCurveEditor: NSView {
+    private var rule: FanRule
+    var onChange: ((FanRule) -> Void)?
+    var onDelete: (() -> Void)?
+    private var snapshot: FanSnapshot?
+    private let enabled = NSSwitch()
+    @objc private func enableChanged() { rule.enabled = enabled.state == .on; onChange?(rule) }
+    @objc private func deleteRule() { onDelete?() }
+    func update(snapshot: FanSnapshot?) {
+        self.snapshot = snapshot
+        let keys = Array(Set(snapshot?.descriptors.keys.map { $0 } ?? []).union(snapshot?.ruleReadings.keys.map { $0 } ?? [])).sorted()
+        sensor.removeAllItems()
+        for key in keys.sorted(by: { (snapshot?.descriptors[$0]?.area ?? "Aggregate", $0) < (snapshot?.descriptors[$1]?.area ?? "Aggregate", $1) }) {
+            let descriptor = snapshot?.descriptors[key]
+            sensor.addItem(withTitle: (descriptor.map { "\($0.area) · \($0.displayName) · \($0.id)" } ?? FanSensorMetadata.name(key)) + (snapshot?.ruleReadings[key] == nil ? " (unavailable)" : ""))
+            sensor.lastItem?.representedObject = key
+            let provenance = ["CPU", "Highest CPU"].contains(key) ? "Highest valid CPU; winner: \(snapshot?.highestCPU?.key ?? "unavailable")" : (key.hasPrefix("HID:") ? "IOHID Product + LocationID" : "AppleSMC firmware key / aggregate")
+            sensor.lastItem?.toolTip = "ID: \(key) · \(provenance)"
+        }
+        if !keys.contains(rule.sensor) { sensor.addItem(withTitle: rule.sensor + " (unavailable)"); sensor.lastItem?.representedObject = rule.sensor }
+        for item in sensor.itemArray where item.representedObject == nil { item.representedObject = item.title }
+        sensor.select(sensor.itemArray.first { ($0.representedObject as? String) == rule.sensor })
+        fan.removeAllItems()
+        for reading in snapshot?.fans ?? [] {
+            fan.addItem(withTitle: reading.name.map { "\($0) (\(reading.id))" } ?? "Fan \(reading.id)")
+            fan.lastItem?.representedObject = reading.id
+        }
+        if !fan.itemArray.contains(where: { ($0.representedObject as? Int) == rule.fan }) { fan.addItem(withTitle: "Fan \(rule.fan) (unavailable)"); fan.lastItem?.representedObject = rule.fan }
+        fan.select(fan.itemArray.first { ($0.representedObject as? Int) == rule.fan })
+        fan.isEnabled = false
+        fan.toolTip = "Fan assignment is fixed. Delete this rule to assign another fan."
+        let requested = snapshot?.ruleReadings[rule.sensor].flatMap { rule.demand(at: $0) }
+        let effective = snapshot?.acceptedDemands[rule.fan]
+        let status: String
+        if !rule.enabled { status = "Disabled · 规则已禁用" }
+        else if requested == nil { status = "Awaiting sensor · 等待读数" }
+        else if snapshot?.controlEnabled != true { status = snapshot?.controlStatus ?? "Awaiting helper" }
+        else if let effective, let requested { status = effective > requested ? "Shadowed · 更高规则优先" : "Active · 已接受批次" }
+        else { status = snapshot?.controlStatus ?? "Awaiting batch" }
+        caption.stringValue = "\(status) · 请求 \(requested.map { String(format: "%.0f%%", $0) } ?? "—") · 有效 \(effective.map { String(format: "%.0f%%", $0) } ?? "—")"
+        caption.toolTip = "Effective demand is the maximum across enabled rules for this fan. Accepted batch does not prove exclusive firmware ownership."
+        needsDisplay = true
+    }
+    private var selected: Int?
+    private var selectedHandle: (Int, Bool)?
+    private let sensor = NSPopUpButton()
+    private let fan = NSPopUpButton()
+    private let caption = NSTextField(labelWithString: "")
+    private let easing = NSPopUpButton()
+    init(rule: FanRule) {
+        self.rule = rule
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 680).isActive = true
+        heightAnchor.constraint(equalToConstant: 280).isActive = true
+        update(snapshot: nil)
+        for popup in [sensor, fan] { popup.target = self; popup.action = #selector(selectionChanged); addSubview(popup) }
+        enabled.state = rule.enabled ? .on : .off; enabled.target = self; enabled.action = #selector(enableChanged)
+        enabled.frame = NSRect(x: 450, y: 218, width: 42, height: 26); addSubview(enabled)
+        let delete = NSButton(title: "Delete", target: self, action: #selector(deleteRule))
+        delete.frame = NSRect(x: 585, y: 218, width: 80, height: 26); addSubview(delete)
+        addSubview(caption)
+        easing.addItems(withTitles: ["Linear", "Ease in", "Ease out", "Smooth"])
+        easing.target = self; easing.action = #selector(easingChanged)
+        addSubview(easing)
+        easing.frame = NSRect(x: 320, y: 218, width: 120, height: 26)
+        sensor.frame = NSRect(x: 45, y: 218, width: 140, height: 26)
+        fan.frame = NSRect(x: 195, y: 218, width: 110, height: 26)
+        caption.frame = NSRect(x: 45, y: 201, width: 400, height: 15)
+        caption.font = .systemFont(ofSize: 11)
+        caption.stringValue = "20–110 °C · 0–100% · cubic Bezier"
+    }
+    override func layout() {
+        super.layout()
+        for control in [sensor, fan, easing] { var frame = control.frame; frame.origin.y = bounds.height - 32; control.frame = frame }
+        enabled.setFrameOrigin(NSPoint(x: 450, y: bounds.height - 32))
+        for button in subviews.compactMap({ $0 as? NSButton }) where button.title == "Delete" { button.setFrameOrigin(NSPoint(x: bounds.width - 95, y: bounds.height - 32)) }
+        caption.frame = NSRect(x: 48, y: bounds.height - 65, width: bounds.width - 65, height: 28)
+    }
+    required init?(coder: NSCoder) { nil }
+    @objc private func selectionChanged() {
+        rule.sensor = sensor.selectedItem?.representedObject as? String ?? rule.sensor
+
+        needsDisplay = true
+        onChange?(rule)
+    }
+    @objc private func easingChanged() {
+        let pair: (Double, Double)
+        switch easing.indexOfSelectedItem {
+        case 1: pair = (0, 0.33)
+        case 2: pair = (0.67, 1)
+        case 3: pair = (0, 1)
+        default: pair = (1.0 / 3, 2.0 / 3)
+        }
+        for index in rule.points.indices {
+            rule.points[index].outgoing = pair.0
+            rule.points[index].incoming = pair.1
+        }
+        onChange?(rule); needsDisplay = true
+    }
+    private func location(_ point: FanCurvePoint) -> NSPoint {
+        geometry.location(temperature: point.temperature, percent: point.percent)
+    }
+    private var geometry: FanPlotGeometry { FanPlotGeometry(bounds: bounds) }
+    override func draw(_ dirtyRect: NSRect) {
+        let plotRect = geometry.rect
+        NSColor.controlBackgroundColor.setFill(); bounds.fill()
+        NSColor.separatorColor.setStroke()
+        let grid = NSBezierPath()
+        for percent in stride(from: 0.0, through: 100, by: 25) {
+            let y = geometry.location(temperature: 20, percent: percent).y
+            grid.move(to: NSPoint(x: plotRect.minX, y: y)); grid.line(to: NSPoint(x: plotRect.maxX, y: y))
+            ("\(Int(percent))%" as NSString).draw(at: NSPoint(x: 4, y: y - 5), withAttributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor])
+        }
+        for temperature in stride(from: 20.0, through: 110, by: 15) {
+            let x = geometry.location(temperature: temperature, percent: 0).x
+            grid.move(to: NSPoint(x: x, y: plotRect.minY)); grid.line(to: NSPoint(x: x, y: plotRect.maxY))
+            ("\(Int(temperature)) °C" as NSString).draw(at: NSPoint(x: x - 14, y: 8), withAttributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor])
+        }
+        if let reading = snapshot?.fans.first(where: { $0.id == rule.fan }) {
+            for percent in stride(from: 0.0, through: 100, by: 25) {
+                let y = geometry.location(temperature: 20, percent: percent).y
+                ("\(Int(reading.rpm(percent: percent))) RPM" as NSString).draw(at: NSPoint(x: plotRect.maxX + 7, y: y - 5), withAttributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor])
+            }
+        }
+        grid.stroke()
+        if let temperature = snapshot?.ruleReadings[rule.sensor], temperature.isFinite {
+            let x = location(.init(temperature: temperature.clamped(to: 20...110), percent: 0)).x
+            let marker = NSBezierPath(); marker.move(to: NSPoint(x: x, y: plotRect.minY)); marker.line(to: NSPoint(x: x, y: plotRect.maxY))
+            marker.setLineDash([5, 4], count: 2, phase: 0); NSColor.systemOrange.setStroke(); marker.stroke()
+            (String(format: "%.1f °C", temperature) as NSString).draw(at: NSPoint(x: min(x + 4, plotRect.maxX - 55), y: plotRect.maxY - 17), withAttributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.systemOrange])
+        }
+        let path = NSBezierPath(); path.lineWidth = 2
+        for temperature in stride(from: 20.0, through: 110, by: 0.5) {
+            guard let demand = rule.demand(at: temperature) else { continue }
+            let p = location(.init(temperature: temperature, percent: demand))
+            if path.isEmpty { path.move(to: p) } else { path.line(to: p) }
+        }
+        NSColor.controlAccentColor.setStroke(); path.stroke()
+        NSColor.secondaryLabelColor.setStroke()
+        for index in 0..<max(0, rule.points.count - 1) {
+            let a = rule.points[index], b = rule.points[index + 1]
+            for outgoing in [true, false] {
+                let handle = handleLocation(index, outgoing)
+                let line = NSBezierPath(); line.move(to: location(outgoing ? a : b)); line.line(to: handle); line.stroke()
+                NSColor.secondaryLabelColor.setFill()
+                NSBezierPath(rect: NSRect(x: handle.x - 3, y: handle.y - 3, width: 6, height: 6)).fill()
+            }
+        }
+        NSColor.controlAccentColor.setFill()
+        for point in rule.points { let p = location(point); NSBezierPath(ovalIn: NSRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10)).fill() }
+
+    }
+    private func handleLocation(_ index: Int, _ outgoing: Bool) -> NSPoint {
+        let a = rule.points[index], b = rule.points[index + 1]
+        let fraction = outgoing ? 1.0 / 3 : 2.0 / 3
+        let ordinate = outgoing ? a.outgoing : b.incoming
+        return location(.init(temperature: a.temperature + (b.temperature - a.temperature) * fraction,
+                              percent: a.percent + (b.percent - a.percent) * ordinate))
+    }
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        guard geometry.rect.insetBy(dx: -8, dy: -8).contains(p) else { return }
+        for index in 0..<max(0, rule.points.count - 1) {
+            for outgoing in [true, false] {
+                let h = handleLocation(index, outgoing)
+                if hypot(h.x - p.x, h.y - p.y) < 7 { selectedHandle = (index, outgoing); return }
+            }
+        }
+        selected = rule.points.indices.min(by: { hypot(location(rule.points[$0]).x - p.x, location(rule.points[$0]).y - p.y) < hypot(location(rule.points[$1]).x - p.x, location(rule.points[$1]).y - p.y) })
+        if event.modifierFlags.contains(.option), let selected, rule.points.count > 2 {
+            rule.points.remove(at: selected); self.selected = nil; onChange?(rule); needsDisplay = true
+        } else if event.clickCount == 2, rule.points.count < 20 {
+            let temperature = geometry.reading(at: p).temperature.clamped(to: 20...110)
+            guard !rule.points.contains(where: { abs($0.temperature - temperature) < 1 }) else { return }
+            rule.points.append(.init(temperature: temperature, percent: rule.demand(at: temperature) ?? 50))
+            rule.points.sort { $0.temperature < $1.temperature }; onChange?(rule); needsDisplay = true
+        }
+    }
+    override func mouseDragged(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if let (index, outgoing) = selectedHandle {
+            let a = rule.points[index], b = rule.points[index + 1]
+            guard b.percent > a.percent else { return }
+            let percent = geometry.reading(at: p).percent
+            let ordinate = ((percent - a.percent) / (b.percent - a.percent)).clamped(to: 0...1)
+            if outgoing { rule.points[index].outgoing = ordinate } else { rule.points[index + 1].incoming = ordinate }
+            onChange?(rule); needsDisplay = true; return
+        }
+        guard let selected else { return }
+        let lower = selected > 0 ? rule.points[selected - 1].temperature + 1 : 20
+        let upper = selected + 1 < rule.points.count ? rule.points[selected + 1].temperature - 1 : 110
+        guard lower <= upper else { return }
+        rule.points[selected].temperature = geometry.reading(at: p).temperature.clamped(to: lower...upper)
+        let minimum = selected > 0 ? rule.points[selected - 1].percent : 0
+        let maximum = selected + 1 < rule.points.count ? rule.points[selected + 1].percent : 100
+        rule.points[selected].percent = (geometry.reading(at: p).percent).clamped(to: minimum...maximum)
+        onChange?(rule)
+        caption.stringValue = String(format: "%.1f °C · %.0f%%", rule.points[selected].temperature, rule.points[selected].percent)
+        needsDisplay = true
+    }
+    override func mouseUp(with event: NSEvent) { if selected != nil || selectedHandle != nil { onChange?(rule) }; selected = nil; selectedHandle = nil }
+}
+
+/// Serial I/O owner; UI gets immutable snapshots. No privileged writes occur without a verified XPC peer.
+@MainActor
+final class FanRuntime: NSObject {
+    let monitoringView = NSView()
+    var onEnabledChange: ((Bool) -> Void)?
+    private var settings = FanSettings()
+    private var suspended = false
+    private var powerObservers: [NSObjectProtocol] = []
+    func apply(_ settings: FanSettings) {
+        self.settings = settings; applying = settings.enabled; toggle.state = settings.enabled ? .on : .off
+        if applying { rulesChanged() } else { restore() }
+    }
+    func start() {
+        guard timer == nil else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        powerObservers = [
+            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in MainActor.assumeIsolated { self?.suspended = true; self?.latestSnapshot = nil; self?.restore() } },
+            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in MainActor.assumeIsolated { self?.suspended = false; self?.queue.async { [weak self] in self?.reader.invalidateDiscovery() }; self?.poll() } }
+        ]
+        verifyHelper()
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.poll() } }
+        poll()
+    }
+    func shutdown(completion: @escaping @Sendable () -> Void = {}) {
+        if let proxy = connection?.remoteObjectProxyWithErrorHandler({ _ in completion() }) as? FanHelperProtocol {
+            proxy.restore { _ in completion() }
+        } else { completion() }
+        powerObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }; powerObservers = []
+        timer?.invalidate(); timer = nil; applying = false
+        let oldConnection = connection
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { oldConnection?.invalidate() }
+    }
+    private let queue = DispatchQueue(label: "fan.monitor")
+    private var timer: Timer?
+    private var closeObserver: NSObjectProtocol?
+    private let fanCards = FanMonitoringCards()
+    private let sensorCards = FanMonitoringCards()
+    private let showOther = NSButton(checkboxWithTitle: "Show Other sensors", target: nil, action: nil)
+    private let sensorSearch = NSSearchField()
+    @objc private func filterSensors() { if let snapshot = latestSnapshot { updateReadingCards(snapshot) } }
+
+    private var readingCards: [String: NSTextField] = [:]
+    private let readings = NSTextField(wrappingLabelWithString: "Reading AppleSMC…")
+    private let state = NSTextField(wrappingLabelWithString: "Helper unavailable. macOS automatic control.")
+    private let toggle = NSButton(checkboxWithTitle: "Enable Rules", target: nil, action: nil)
+    private let serviceStatus = NSTextField(wrappingLabelWithString: "Installed: checking · Running: checking · Authenticated: no")
+    private var helperUpdateRequired = false
+    private let helperVersions = NSTextField(wrappingLabelWithString: "Bundled protocol v2 · Checking helper fingerprints…")
+    private var updateButton: NSButton?
+    private var managementBusy = false
+    private var managementResult: String?
+    private var managementButtons: [NSButton] = []
+    private var connection: NSXPCConnection?
+    private var verified = false
+    private var connectionGeneration = UUID()
+    private var applying = false
+    var onSnapshot: ((FanSnapshot?) -> Void)?
+    func refreshEditors() { onSnapshot?(latestSnapshot); rulesChanged() }
+    private var acceptedDemands: [Int: Double] = [:]
+    private var batchStatus = "Awaiting authenticated batch"
+    var detectedFanIDs: [Int] { latestSnapshot?.fans.map(\.id) ?? [] }
+    private var latestSnapshot: FanSnapshot?
+    private var sampleDate: Date?
+    func rulesChanged() {
+        guard applying, verified, !suspended else { return }
+        guard settings.duplicateFanIDs.isEmpty else {
+            restore(); state.stringValue = "Duplicate fan assignments: \(settings.duplicateFanIDs). Delete duplicate rules (including disabled rules) to resume control."; return
+        }
+        guard let snapshot = latestSnapshot, let sampleDate,
+              let demands = settings.activeDemands(readings: snapshot.ruleReadings, now: Date(), sampleDate: sampleDate),
+              demands.keys.allSatisfy({ id in snapshot.fans.contains { $0.id == id } }) else { restore(); return }
+        sendDemands(demands)
+    }
+    private let reader = FanSMCReader()
+    override init() {
+        super.init()
+        monitoringView.translatesAutoresizingMaskIntoConstraints = false
+        monitoringView.widthAnchor.constraint(equalToConstant: 680).isActive = true
+        fanCards.translatesAutoresizingMaskIntoConstraints = false
+        sensorCards.translatesAutoresizingMaskIntoConstraints = false
+        readings.isSelectable = true
+        let permissions = NSTextField(wrappingLabelWithString: "App updates include a new bundled helper. Update, reinstall, or uninstall below; only these buttons request administrator authorization. Accessibility permission does not grant fan access.")
+        permissions.font = .systemFont(ofSize: 11)
+        let setup = NSButton(title: "Install helper…", target: self, action: #selector(installHelper))
+        let reinstall = NSButton(title: "Reinstall…", target: self, action: #selector(reinstallHelper))
+        updateButton = reinstall
+        let uninstall = NSButton(title: "Uninstall…", target: self, action: #selector(uninstallHelper))
+        managementButtons = [setup, reinstall, uninstall]
+        let retry = NSButton(title: "Check helper again", target: self, action: #selector(retryHelper))
+        let actions = NSStackView(views: [setup, reinstall, uninstall, retry])
+        actions.orientation = .horizontal
+        showOther.target = self; showOther.action = #selector(filterSensors)
+        sensorSearch.placeholderString = "Search sensors, raw IDs, or sources"
+        sensorSearch.target = self; sensorSearch.action = #selector(filterSensors)
+        sensorSearch.sendsSearchStringImmediately = true
+        sensorSearch.widthAnchor.constraint(equalToConstant: 400).isActive = true
+        let filters = NSStackView(views: [showOther, sensorSearch])
+        let stack = NSStackView(views: [readings, fanCards, filters, sensorCards, serviceStatus, helperVersions, state, permissions, actions, toggle])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false; monitoringView.addSubview(stack)
+        NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: monitoringView.leadingAnchor), stack.trailingAnchor.constraint(equalTo: monitoringView.trailingAnchor), stack.topAnchor.constraint(equalTo: monitoringView.topAnchor), stack.bottomAnchor.constraint(equalTo: monitoringView.bottomAnchor)])
+        fanCards.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        sensorCards.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        toggle.target = self; toggle.action = #selector(change); toggle.isEnabled = true
+    }
+    @objc private func change() {
+        onEnabledChange?(toggle.state == .on)
+    }
+    private func restore() {
+        acceptedDemands = [:]; batchStatus = "Automatic restoration requested"
+        (connection?.remoteObjectProxy as? FanHelperProtocol)?.restore { _ in }
+    }
+    private func stop() {
+        if let closeObserver { NotificationCenter.default.removeObserver(closeObserver); self.closeObserver = nil }
+        applying = false; toggle.state = .off; timer?.invalidate(); timer = nil
+        restore(); connectionGeneration = UUID(); connection?.invalidate(); connection = nil; verified = false; toggle.isEnabled = false
+    }
+    @objc private func installHelper() { manage("install") }
+    @objc private func reinstallHelper() { manage("reinstall") }
+    @objc private func uninstallHelper() { manage("uninstall") }
+    private func manage(_ operation: String) {
+        guard !managementBusy else { return }
+        managementBusy = true
+        applying = false; toggle.isEnabled = false
+        restore(); connectionGeneration = UUID(); connection?.invalidate(); connection = nil; verified = false
+        managementButtons.forEach { $0.isEnabled = false }
+        state.stringValue = "Waiting for administrator authorization to \(operation) helper…"
+        queue.async { [weak self] in
+            let result = FanHelperInstallation.manage(operation)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.managementBusy = false
+                self.managementButtons.forEach { $0.isEnabled = true }
+                self.managementResult = result
+                self.verifyHelper()
+            }
+        }
+    }
+    @objc private func retryHelper() {
+        guard !managementBusy else { return }
+        restore(); connectionGeneration = UUID(); connection?.invalidate(); connection = nil; verified = false
+        verifyHelper()
+    }
+    private func verifyHelper() {
+        state.stringValue = "Checking helper installation and signature…"
+        let generation = UUID(); connectionGeneration = generation
+        queue.async { [weak self] in
+            let status = FanHelperInstallation.check()
+            let running = FanHelperInstallation.runningStatus()
+            let installedHash = FanHelperInstallation.fingerprint(FanHelperInstallation.installedPath)
+            let bundledHash = FanHelperInstallation.fingerprint(FanHelperInstallation.bundledPath)
+            let update = FanHelperUpdatePolicy.needsUpdate(installedHash: installedHash, bundledHash: bundledHash)
+            DispatchQueue.main.async {
+                guard let self, self.connectionGeneration == generation else { return }
+                self.helperUpdateRequired = update
+                self.updateButton?.title = update ? "Update helper…" : "Reinstall…"
+                self.helperVersions.stringValue = "Installed: \(installedHash.map { String($0.prefix(12)) } ?? "missing / unverified") · Bundled v2: \(bundledHash.map { String($0.prefix(12)) } ?? "unverified") (CDHash)"
+                self.serviceStatus.stringValue = "Installed: \(status == nil ? "verified" : "unavailable or unsafe") · \(running) · Authenticated: no"
+                self.toggle.isEnabled = true
+                guard status == nil else { self.state.stringValue = [self.managementResult, status].compactMap { $0 }.joined(separator: "\n"); return }
+                self.connectHelper()
+            }
+        }
+    }
+    private var handshakeGeneration: UUID?
+    private func connectHelper() {
+        state.stringValue = "Helper installed and signed. Connecting and authenticating…"
+        let xpc = NSXPCConnection(machServiceName: FanHelperIdentity.service, options: .privileged)
+        xpc.setCodeSigningRequirement(FanHelperIdentity.helperRequirement)
+        xpc.remoteObjectInterface = NSXPCInterface(with: FanHelperProtocol.self)
+        let generation = UUID(); connectionGeneration = generation
+        let lost: @Sendable () -> Void = { [weak self] in DispatchQueue.main.async {
+            guard let self, self.connectionGeneration == generation else { return }
+            self.verified = false; self.connection?.invalidate(); self.connection = nil; self.toggle.isEnabled = !self.managementBusy
+            self.serviceStatus.stringValue = "Installed: verified · Running: check again · Authenticated: no"
+            self.state.stringValue = "Helper connection/authentication failed. Check service logs, matching app signature, and supported hardware; then Check helper again."
+        } }
+        xpc.invalidationHandler = lost; xpc.interruptionHandler = lost
+        connection = xpc; xpc.resume()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak xpc] in
+            guard let self, self.connectionGeneration == generation, self.handshakeGeneration != generation else { return }
+            xpc?.invalidate(); lost()
+        }
+        let proxy = xpc.remoteObjectProxyWithErrorHandler { @Sendable _ in lost() } as? FanHelperProtocol
+        proxy?.status { @Sendable [weak self] response in DispatchQueue.main.async {
+            guard let self, self.connectionGeneration == generation else { return }
+            self.handshakeGeneration = generation
+            self.helperUpdateRequired = self.helperUpdateRequired || FanHelperUpdatePolicy.needsUpdate(installedHash: "matched", bundledHash: "matched", runningStatus: response)
+            self.updateButton?.title = self.helperUpdateRequired ? "Update helper…" : "Reinstall…"
+            self.verified = response == FanHelperUpdatePolicy.protocolStatus && !self.helperUpdateRequired
+            self.toggle.isEnabled = true
+            self.applying = self.settings.enabled
+            self.toggle.state = self.settings.enabled ? .on : .off
+            self.rulesChanged()
+            self.state.stringValue = [self.managementResult, self.helperUpdateRequired ? "Helper update required. Click Update helper to authorize replacement; automatic fan control remains active. Running protocol: \(response)." : (self.verified ? "Signed helper verified. Enabled rules run automatically while TSMacTools is running." : "Authenticated helper: \(response)")].compactMap { $0 }.joined(separator: "\n")
+            self.serviceStatus.stringValue += self.verified ? " → yes (ready-v2 handshake)" : " → yes (control unavailable)"
+        } }
+    }
+    private func publishControl() {
+        guard var snapshot = latestSnapshot else { return }
+        snapshot.controlEnabled = applying && verified && !suspended
+        snapshot.acceptedDemands = acceptedDemands
+        snapshot.controlStatus = batchStatus
+        latestSnapshot = snapshot
+        onSnapshot?(snapshot)
+    }
+    private func sendDemands(_ demands: [Int: Double]) {
+        let generation = connectionGeneration
+        batchStatus = "Awaiting authenticated batch acceptance"
+        publishControl()
+        let proxy = connection?.remoteObjectProxyWithErrorHandler { @Sendable [weak self] error in
+            DispatchQueue.main.async {
+                guard let self, self.connectionGeneration == generation else { return }
+                self.acceptedDemands = [:]; self.batchStatus = "Error: \(error.localizedDescription)"; self.publishControl()
+            }
+        } as? FanHelperProtocol
+        proxy?.applyDemands(Dictionary(uniqueKeysWithValues: demands.map { (String($0.key), $0.value) })) { @Sendable [weak self] response in
+            DispatchQueue.main.async {
+                guard let self, self.connectionGeneration == generation else { return }
+                if response == "ok" {
+                    self.acceptedDemands = demands
+                    self.batchStatus = "Authenticated batch accepted at \(Date().formatted(date: .omitted, time: .standard))"
+                } else {
+                    self.restore(); self.batchStatus = response.hasPrefix("error: ") ? "Error: " + String(response.dropFirst(7)) : "Error: \(response)"
+                }
+                self.state.stringValue = self.batchStatus
+                self.publishControl()
+            }
+        }
+    }
+    private var polling = false
+    private func updateReadingCards(_ snapshot: FanSnapshot) {
+        readings.stringValue = snapshot.fans.isEmpty ? "No fans detected" : "Live monitoring"
+        var values: [(String, String)] = snapshot.fans.map { fan in
+            ("fan:\(fan.id)", "\(fan.name ?? "Fan \(fan.id)") · Actual \(Int(fan.current)) RPM · Target \(fan.target.map { String(Int($0)) } ?? "—") RPM\nMin \(Int(fan.minimum)) · Max \(Int(fan.maximum)) RPM · Mode readback: \(fan.manual.map { $0 ? "Manual" : "Automatic" } ?? "Unavailable")")
+        }
+        let query = sensorSearch.stringValue.lowercased()
+        let ordered = snapshot.descriptors.values.sorted { ($0.area, $0.displayName, $0.id) < ($1.area, $1.displayName, $1.id) }
+        var displayedLogical = Set<String>()
+        for descriptor in ordered {
+            guard descriptor.curated || showOther.state == .on else { continue }
+            let detail = "\(descriptor.area) · \(descriptor.displayName) · \(descriptor.id) · \(descriptor.source)"
+            guard query.isEmpty || detail.lowercased().contains(query) else { continue }
+            let identity = descriptor.source + ":" + descriptor.rawKey
+            guard displayedLogical.insert(identity).inserted else { continue }
+            let fresh = snapshot.temperatures.filter { snapshot.descriptors[$0.key]?.source == descriptor.source && snapshot.descriptors[$0.key]?.rawKey == descriptor.rawKey }.values.max()
+            values.append(("sensor:" + descriptor.id, detail + " · " + (fresh.map { String(format: "%.1f °C", $0) } ?? "Unavailable")))
+        }
+        for key in ["Highest CPU", "Average CPU", "Highest GPU", "Average GPU", "Highest Computer", "Average Computer"] {
+            if query.isEmpty || key.lowercased().contains(query) {
+                values.insert(("aggregate:" + key, key + " · " + (snapshot.ruleReadings[key].map { String(format: "%.1f °C", $0) } ?? "Unavailable")), at: min(snapshot.fans.count, values.count))
+            }
+        }
+        let keys = Set(values.map { $0.0 })
+        for key in Array(readingCards.keys) where !keys.contains(key) {
+            readingCards.removeValue(forKey: key)?.removeFromSuperview()
+        }
+        for (key, value) in values {
+            let card: NSTextField
+            if let existing = readingCards[key] { card = existing }
+            else {
+                card = NSTextField(wrappingLabelWithString: "")
+                card.isSelectable = true; card.wantsLayer = true
+                card.layer?.cornerRadius = 8; card.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+                card.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+                card.translatesAutoresizingMaskIntoConstraints = true
+                readingCards[key] = card
+            }
+            card.stringValue = value; card.toolTip = value; card.setAccessibilityLabel(value)
+        }
+        fanCards.setCards(values.filter { $0.0.hasPrefix("fan:") }.compactMap { readingCards[$0.0] })
+        sensorCards.setCards(values.filter { !$0.0.hasPrefix("fan:") }.compactMap { readingCards[$0.0] })
+    }
+
+    private func poll() {
+        guard !polling, !suspended else { return }; polling = true
+        queue.async { [weak self] in
+            guard let self else { return }
+            // Storage is touched only by this queue; no main-thread IOKit calls.
+            let result = Result { try self.reader.snapshot() }
+            DispatchQueue.main.async {
+                self.polling = false
+                guard self.timer != nil else { return }
+                switch result {
+                case let .success(snapshot):
+                    self.updateReadingCards(snapshot)
+                    self.latestSnapshot = snapshot; self.sampleDate = Date()
+                    self.onSnapshot?(snapshot); self.rulesChanged()
+                case let .failure(error):
+                    if var unavailable = self.latestSnapshot { unavailable.temperatures = [:]; self.updateReadingCards(unavailable) }
+                    self.latestSnapshot = nil; self.sampleDate = nil; self.onSnapshot?(nil); self.readings.stringValue = error.localizedDescription; self.restore()
+                }
+            }
+        }
+    }
+}
+
+private final class FanSMCReader: @unchecked Sendable {
+    private var smc: AppleSMC?
+    private var keys: [String] = []
+    private var registry = FanSensorRegistry()
+    private var enumeratedAt: TimeInterval = 0
+    private var keyCount: Double?
+    func invalidateDiscovery() { enumeratedAt = 0 }
+    func snapshot() throws -> FanSnapshot {
+        if smc == nil { smc = try AppleSMC() }
+        let opened = smc!
+        let now = ProcessInfo.processInfo.systemUptime
+        let count = try? opened.read("#KEY").number
+        if enumeratedAt == 0 || now - enumeratedAt >= 60 || count != keyCount {
+            keys = try opened.keys().filter { key in
+                guard FanSensorMetadata.eligible(key), let info = try? opened.metadata(key) else { return false }
+                return (info.type == "flt " && info.size == 4) || (info.type == "sp78" && info.size == 2)
+            }
+            keyCount = count; enumeratedAt = now
+        }
+        var result = try SMCMonitor.snapshot(io: opened, temperatureKeys: keys)
+        result.temperatures.merge(FanHIDReader.read()) { smc, _ in smc }
+        registry.update(&result)
+        return result
+    }
+}
+
+/// Optional read-only private API. Each sample owns its client and all returned CF objects.
+private enum FanHIDReader {
+    static func read() -> [String: Double] {
+        guard let library = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY) else { return [:] }
+        defer { dlclose(library) }
+        func symbol<T>(_ name: String, as type: T.Type) -> T? {
+            dlsym(library, name).map { unsafeBitCast($0, to: type) }
+        }
+        typealias Create = @convention(c) (CFAllocator?) -> Unmanaged<CFTypeRef>?
+        typealias Match = @convention(c) (CFTypeRef, CFDictionary) -> Void
+        typealias Services = @convention(c) (CFTypeRef) -> Unmanaged<CFArray>?
+        typealias Property = @convention(c) (CFTypeRef, CFString) -> Unmanaged<CFTypeRef>?
+        typealias Event = @convention(c) (CFTypeRef, Int64, Int32, Int64) -> Unmanaged<CFTypeRef>?
+        typealias Value = @convention(c) (CFTypeRef, Int32) -> Double
+        guard let create = symbol("IOHIDEventSystemClientCreate", as: Create.self),
+              let match = symbol("IOHIDEventSystemClientSetMatching", as: Match.self),
+              let services = symbol("IOHIDEventSystemClientCopyServices", as: Services.self),
+              let property = symbol("IOHIDServiceClientCopyProperty", as: Property.self),
+              let event = symbol("IOHIDServiceClientCopyEvent", as: Event.self),
+              let value = symbol("IOHIDEventGetFloatValue", as: Value.self),
+              let client = create(nil)?.takeRetainedValue() else { return [:] }
+        match(client, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
+        guard let array = services(client)?.takeRetainedValue() else { return [:] }
+        var samples: [(product: String, location: String?, value: Double)] = []
+        for service in (array as [AnyObject]) {
+            guard let product = property(service, "Product" as CFString)?.takeRetainedValue() as? String,
+                  !product.isEmpty,
+                  let sample = event(service, 15, 0, 0)?.takeRetainedValue() else { continue }
+            let temperature = value(sample, 15 << 16)
+            guard FanSensorMetadata.valid(temperature) else { continue }
+            let location = property(service, "LocationID" as CFString)?.takeRetainedValue() as? NSNumber
+            samples.append((product, location?.stringValue, temperature))
+        }
+        return FanSensorMetadata.mergeHID(samples)
+    }
+}
+
+private enum FanHelperInstallation {
+    static let installedPath = "/Library/PrivilegedHelperTools/TSMacToolsFanHelper/TSMacToolsFanHelper"
+    static var bundledPath: String { Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LaunchServices/TSMacToolsFanHelper").path }
+    /// Validate the exact pinned identity before trusting the signed executable's content hash.
+    static func fingerprint(_ path: String) -> String? {
+        var code: SecStaticCode?, requirement: SecRequirement?
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess,
+              SecRequirementCreateWithString(FanHelperIdentity.helperRequirement as CFString, [], &requirement) == errSecSuccess,
+              let code, let requirement,
+              SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), requirement) == errSecSuccess else { return nil }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let dictionary = information as? [String: Any],
+              let hash = dictionary[kSecCodeInfoUnique as String] as? Data else { return nil }
+        return hash.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func runningStatus() -> String {
+        let process = Process(); let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["print", "system/" + FanHelperIdentity.service]
+        process.standardOutput = pipe; process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+            let output = String(decoding: data, as: UTF8.self)
+            if let line = output.split(separator: "\n").first(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("pid = ") }) {
+                return "Running: yes (\(line.trimmingCharacters(in: .whitespaces)))"
+            }
+            let details = output.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.hasPrefix("state =") || $0.hasPrefix("last exit code =") || $0.hasPrefix("runs =") }.joined(separator: "; ")
+            return process.terminationStatus == 0 ? "Running: no (\(details))" : "Running: status unavailable (launchctl exit \(process.terminationStatus))"
+        } catch { return "Running: status unavailable" }
+    }
+    static func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }
+    static func manage(_ operation: String) -> String? {
+        guard ["install", "reinstall", "uninstall"].contains(operation),
+              let helper = Optional(Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LaunchServices/TSMacToolsFanHelper")) else { return "Bundled helper is missing." }
+        // Inline fixed bootstrap code is part of the signed application. Never execute
+        // a checkout script as root. Verify the copied bytes in root-private staging.
+        let script = """
+        set -eu
+        umask 077
+        stage=$(/usr/bin/mktemp -d /private/var/tmp/tsmactools-helper.XXXXXX)
+        trap '/bin/rm -rf "$stage"' EXIT
+        /usr/bin/install -o root -g wheel -m 700 \(quote(helper.path)) "$stage/helper"
+        /usr/bin/codesign --verify --strict -R \(quote("=" + FanHelperIdentity.helperRequirement)) "$stage/helper"
+        "$stage/helper" --manage \(quote(operation))
+        """
+        let escaped = script.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n")
+        let source = "do shell script \"" + escaped + "\" with administrator privileges with prompt \"TSMacTools needs permission to " + operation + " its signed fan helper.\""
+        var error: NSDictionary?
+        guard let appleScript = NSAppleScript(source: source) else { return "Could not prepare administrator authorization." }
+        appleScript.executeAndReturnError(&error)
+        if let error {
+            if (error[NSAppleScript.errorNumber] as? NSNumber)?.intValue == -128 { return "Administrator authorization cancelled. No helper operation was started." }
+            return "Helper \(operation) failed: \(error[NSAppleScript.errorMessage] as? String ?? error.description)"
+        }
+        return nil
+    }
+    static func check() -> String? {
+        let directory = "/Library/PrivilegedHelperTools/TSMacToolsFanHelper"
+        let executable = directory + "/TSMacToolsFanHelper"
+        let plist = "/Library/LaunchDaemons/local.clearain.MacTools.FanHelper.plist"
+        guard FileManager.default.fileExists(atPath: executable) else {
+            return "Helper not installed. Click Install helper to authorize installation of the signed bundled helper."
+        }
+        for path in ["/Library", "/Library/PrivilegedHelperTools", "/Library/LaunchDaemons", directory, executable, plist] {
+            var info = stat()
+            guard lstat(path, &info) == 0, info.st_uid == 0, info.st_mode & 0o022 == 0,
+                  info.st_mode & S_IFMT != S_IFLNK else {
+                return "Helper installation has unsafe ownership or permissions. Use Reinstall after repairing unsafe paths."
+            }
+        }
+        for (path, rule) in [(executable, FanHelperIdentity.helperRequirement)] {
+            var code: SecStaticCode?, requirement: SecRequirement?
+            guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess,
+                  SecRequirementCreateWithString(rule as CFString, [], &requirement) == errSecSuccess,
+                  let code, let requirement,
+                  SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), requirement) == errSecSuccess else {
+                return "Helper signature is missing or does not match the required SurTeamCode certificate and identifier. Reinstall the signed bundled helper."
+            }
+        }
+        return nil
     }
 }

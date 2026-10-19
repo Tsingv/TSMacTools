@@ -495,6 +495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsHotkeyCaptureToken: GlobalHotkeyController.CaptureToken?
     private var windowSwitcherController: WindowSwitcherController?
     private var smoothScrollController: SmoothScrollController?
+    private let fanRuntime = FanRuntime()
     private var settingsWindowController: SettingsWindowController?
     private var statusItem: NSStatusItem?
     private var menuBarVisibilityMenuController: MenuBarVisibilityMenuController?
@@ -591,6 +592,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         smoothScrollController?.start()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        var replied = false
+        let finish: @MainActor @Sendable () -> Void = {
+            guard !replied else { return }; replied = true
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        fanRuntime.shutdown { DispatchQueue.main.async { finish() } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { finish() }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         settingsHotkeyCaptureToken = nil
         hotkeyController?.shutdown()
@@ -658,6 +670,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startAutomation(runtime: AutomationRuntime, configuration: UserConfiguration) {
+        fanRuntime.apply(configuration.fans)
+        fanRuntime.start()
         let windowSwitcherController: WindowSwitcherController
         if let existing = self.windowSwitcherController {
             existing.apply(configuration: configuration)
@@ -728,6 +742,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self?.showStatusWindow(title: "Settings Error", body: error.localizedDescription)
                     }
                 )
+                controller.fanRuntime = fanRuntime
                 settingsWindowController = controller
                 controller.present(configuration: result.configuration, configURL: result.configURL)
             }
@@ -787,6 +802,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyAutomationChange(from previous: UserConfiguration, to configuration: UserConfiguration) {
+        fanRuntime.apply(configuration.fans)
+
         guard previous != configuration, let runtime else {
             return
         }

@@ -43,6 +43,7 @@
 		1A0001240000000000000001 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002050000000000000001 /* AppKit.framework */; };
 		1A0001250000000000000001 /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002060000000000000001 /* ApplicationServices.framework */; };
 		1A0001260000000000000001 /* CoreVideo.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002090000000000000001 /* CoreVideo.framework */; };
+		FA0000010000000000000001 /* FanHardware.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA0000020000000000000001 /* FanHardware.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -141,6 +142,7 @@
 		1A0002070000000000000001 /* Carbon.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Carbon.framework; path = System/Library/Frameworks/Carbon.framework; sourceTree = SDKROOT; };
 		1A0002080000000000000001 /* libMacToolsMacOS.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libMacToolsMacOS.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002090000000000000001 /* CoreVideo.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreVideo.framework; path = System/Library/Frameworks/CoreVideo.framework; sourceTree = SDKROOT; };
+		FA0000020000000000000001 /* FanHardware.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FanHardware.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -241,6 +243,7 @@
 				1A0000030000000000000001 /* CoreServices.swift */,
 				1A0000070000000000000001 /* SystemPermissions.swift */,
 				1A0000080000000000000001 /* UserConfiguration.swift */,
+                FA0000020000000000000001 /* FanHardware.swift */,
 				1A0000090000000000000001 /* UserConfigurationStore.swift */,
 				1A0000100000000000000001 /* SmoothScrollModels.swift */,
 			);
@@ -325,6 +328,7 @@
 				1A0008010000000000000001 /* Frameworks */,
 				1A000B050000000000000001 /* Resources */,
 				1A0007010000000000000001 /* Embed Frameworks */,
+                FA0000030000000000000001 /* Build and embed signed fan helper */,
 			);
 			buildRules = (
 			);
@@ -469,6 +473,31 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+        FA0000030000000000000001 /* Build and embed signed fan helper */ = {
+            isa = PBXShellScriptBuildPhase;
+            buildActionMask = 2147483647;
+            files = ();
+            inputPaths = (
+                "$(SRCROOT)/Tools/FanHelper/build.sh",
+                "$(SRCROOT)/Tools/FanHelper/main.swift",
+                "$(SRCROOT)/Sources/MacToolsCore",
+                "$(SRCROOT)/Sources/MacToolsCore/AutomationModels.swift",
+                "$(SRCROOT)/Sources/MacToolsCore/CoreServices.swift",
+                "$(SRCROOT)/Sources/MacToolsCore/FanHardware.swift",
+                "$(SRCROOT)/Sources/MacToolsCore/SmoothScrollModels.swift",
+                "$(SRCROOT)/Sources/MacToolsCore/SystemPermissions.swift",
+                "$(SRCROOT)/Sources/MacToolsCore/UserConfiguration.swift",
+                "$(SRCROOT)/Sources/MacToolsCore/UserConfigurationStore.swift",
+            );
+            outputPaths = ("$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchServices/TSMacToolsFanHelper",);
+            name = "Build and embed signed fan helper";
+            runOnlyForDeploymentPostprocessing = 0;
+            shellPath = /bin/bash;
+            shellScript = "FAN_HELPER_OUTPUT=\"$DERIVED_FILE_DIR/FanHelper\" /bin/bash \"$SRCROOT/Tools/FanHelper/build.sh\"";
+        };
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		1A000B010000000000000001 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -491,6 +520,7 @@
 				1A0001030000000000000001 /* CoreServices.swift in Sources */,
 				1A00010D0000000000000001 /* SystemPermissions.swift in Sources */,
 				1A00010F0000000000000001 /* UserConfiguration.swift in Sources */,
+                FA0000010000000000000001 /* FanHardware.swift in Sources */,
 				1A0001100000000000000001 /* UserConfigurationStore.swift in Sources */,
 				1A0001180000000000000001 /* SmoothScrollModels.swift in Sources */,
 			);
@@ -678,7 +708,8 @@
 				MTL_FAST_MATH = YES;
 				SDKROOT = macosx;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SWIFT_COMPILATION_MODE = wholemodule;
+				ENABLE_TESTABILITY = YES;
+                SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 6.0;
 			};
@@ -688,14 +719,15 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_IDENTITY = "Apple Development";
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_IDENTITY = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = 426R374L39;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
+                ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Sources/MacToolsApp/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -715,13 +747,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_IDENTITY = "Apple Development";
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_IDENTITY = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = 426R374L39;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
+                ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Sources/MacToolsApp/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -740,7 +773,7 @@
 		1A000C040000000000000001 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
 				DEFINES_MODULE = YES;
@@ -761,7 +794,7 @@
 		1A000C050000000000000001 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
 				DEFINES_MODULE = YES;
@@ -782,7 +815,7 @@
 		1A000C060000000000000001 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
 				DEFINES_MODULE = YES;
@@ -803,7 +836,7 @@
 		1A000C070000000000000001 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
 				DEFINES_MODULE = YES;
@@ -824,11 +857,11 @@
 		1A000C080000000000000001 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = 426R374L39;
+				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = "$(RECOMMENDED_MACOSX_DEPLOYMENT_TARGET)";
 				MARKETING_VERSION = 0.2.3;
@@ -842,11 +875,11 @@
 		1A000C090000000000000001 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = 426R374L39;
+				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = "$(RECOMMENDED_MACOSX_DEPLOYMENT_TARGET)";
 				MARKETING_VERSION = 0.2.3;
@@ -860,7 +893,7 @@
 		1A000C0A0000000000000001 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
 				DEFINES_MODULE = YES;
@@ -881,7 +914,7 @@
 		1A000C0B0000000000000001 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 5;
 				DEAD_CODE_STRIPPING = YES;
 				DEFINES_MODULE = YES;

@@ -2,6 +2,14 @@
 // Copy this directory to my_config for local use, then keep my_config untracked.
 // The app reads ~/.config/tsmactool/config.jsonc; in this repo that symlink points to my_config.
 {
+  // Fan rules; control requires the separately installed signed helper and explicit UI opt-in.
+  // The helper maps percentages to live firmware minimum/maximum RPM with five-second leases.
+  "fans": {
+    "enabled": false, // Enable automatic rules at app startup, including when Settings is closed.
+    // Create rules in Fans settings after choosing an actually detected, unassigned fan.
+    // Each fan may have one rule, including disabled rules; delete to release an assignment.
+    "rules": []
+  },
   // macOS application identifiers and window filtering defaults.
   "application": {
     "finderBundleIdentifier": "com.apple.finder", // Used by the Finder toggle action.
@@ -240,7 +248,7 @@
     "googleSourceLanguage": "auto", // "auto" lets Google detect the source language.
     "googleTargetLanguage": "zh-CN", // Target used for non-Chinese selected text.
     "googleTargetLanguageForChinese": "en", // Target used when selected text contains Chinese.
-    "endpoint": "http://127.0.0.1:8787/v1/chat/completions", // Chat completions endpoint URL.
+    "endpoint": "http://127.0.0.1:8787/v1/chat/completions", // Full chat-completions request URL. General → Base URL accepts a root (adds /v1/chat/completions), a prefix (adds /chat/completions), or this complete URL; query parameters are retained.
     "model": "qwen/qwen3.6-27b", // Model name sent to the endpoint.
     "normalizePDFLineBreaks": true, // Joins common PDF hard-wrapped lines before translation while preserving blank paragraphs and lists.
     "contextWindowTokens": 262144, // Model context window. Used for a preflight selected-text budget warning.

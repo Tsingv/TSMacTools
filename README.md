@@ -52,6 +52,7 @@ TSMacTools is a native menu bar automation app inspired by Hammerspoon. It combi
    - **General** configures window switching, scripting, translation, and application behavior.
    - **Hotkeys** records triggers and assigns their actions.
    - **Scrolling** enables smoothing and chooses a preset or custom curve.
+   - **Fans** shows available AppleSMC temperatures and fan RPM, and edits temperature/output Bezier curves. Install, reinstall, or uninstall the bundled [signed helper](Tools/FanHelper/README.md) directly in Fans settings with an explicit administrator authorization. Status shows installation, running process, and authenticated connection. Control requires supported hardware; otherwise macOS keeps automatic control.
 
 On first launch, TSMacTools creates its configuration at `~/.config/tsmactool/config.jsonc` and a companion `scripts` directory. Most changes made in Settings apply immediately; the status menu also provides **Reload Configuration** and **Open Configuration** actions.
 
@@ -80,3 +81,9 @@ Keep provider keys in your local configuration. The tracked examples intentional
 ## Development
 
 Architecture, implementation constraints, build and test workflows, permission-sensitive diagnostics, and parity notes live in [`AGENTS.md`](AGENTS.md).
+
+In Fans settings, choose an unassigned detected fan before adding a rule. Its fan assignment is fixed; the sensor, curve, and enabled state remain editable. Disabled rules still reserve their fan. Delete a rule to release its assignment. New configurations start without rules. Legacy duplicate assignments remain visible and suspend control until duplicate rules are explicitly deleted. Live selectable cards show sensor temperatures and fan actual/target RPM, limits, and mode readback. Rule edits take effect while Enable Rules is enabled, even with Settings closed. Older fan helpers require explicit reinstallation from Settings.
+
+After updating the app, Fans settings shows **Update helper…** when its privileged helper needs replacement. Click once and authorize the update, the saved automatic-rules preference then resumes. App launch never prompts to update the helper automatically.
+
+Automatic fan rules use the persisted `fans.enabled` preference, disabled by default and for legacy configurations. Once enabled, AppDelegate starts one FanRuntime at launch and reconfigures it on saves and configuration reloads. The runtime owns the serial reader, single authenticated helper connection, snapshots and complete demand batches; Settings only displays its monitoring view and edits configuration. Closing Settings or changing tabs leaves rules active. Missing/outdated helpers block application without administrator prompts. Sleep suspends demand and clears the snapshot; wake requires a fresh reading. Exit requests automatic restoration and waits up to 1.5 seconds; independent helper disconnect handling and five-second leases remain the fallback.

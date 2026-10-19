@@ -450,6 +450,17 @@ public final class UserConfigurationStore {
     }
 
     public func save(_ configuration: UserConfiguration, to configURL: URL) throws {
+        guard configuration.fans.duplicateFanIDs.isEmpty else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "Duplicate fan assignments. Delete duplicate rules, including disabled rules."])
+        }
+        if FileManager.default.fileExists(atPath: configURL.path) {
+            let previous = try load(from: configURL)
+            for old in previous.fans.rules {
+                if let changed = configuration.fans.rules.first(where: { $0.id == old.id }), changed.fan != old.fan {
+                    throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "A rule's fan cannot change. Delete it and create a new rule."])
+                }
+            }
+        }
         let data = try encodeConfigurationAsJSONC(configuration)
         try data.write(to: configURL, options: [.atomic])
     }
@@ -477,7 +488,18 @@ public final class UserConfigurationStore {
                 for _ in 0 ..< 3 {
                     let original = try Data(contentsOf: coordinatedURL)
                     var configuration = try decodeConfiguration(from: original)
+                    let previousFans = configuration.fans
                     try mutation(&configuration)
+                    let oldCounts = Dictionary(grouping: previousFans.rules, by: \.fan).mapValues(\.count)
+                    let newCounts = Dictionary(grouping: configuration.fans.rules, by: \.fan).mapValues(\.count)
+                    guard newCounts.allSatisfy({ $0.value <= max(1, oldCounts[$0.key] ?? 0) }) else {
+                        throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "Each fan can have only one rule, including disabled rules. Delete duplicate rules."])
+                    }
+                    for old in previousFans.rules {
+                        if let changed = configuration.fans.rules.first(where: { $0.id == old.id }), changed.fan != old.fan {
+                            throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "A rule's fan cannot change. Delete it and create a new rule."])
+                        }
+                    }
 
                     let encoded = try encoder.encode(configuration)
                     let replacementObject = try JSONSerialization.jsonObject(
@@ -986,4 +1008,38 @@ public final class UserConfigurationStore {
         emit_window_command(source_text, translated_text)
         return 0
     """
+}
+
+/// A leaf patch computed on the UI thread and replayed against the latest JSONC snapshot.
+/// Arrays are atomic: concurrent hotkey edits are rejected rather than silently overwritten.
+public struct ConfigurationPatch: @unchecked Sendable {
+    private let before: [String: Any]
+    private let after: [String: Any]
+
+    public init(before: UserConfiguration, after: UserConfiguration) throws {
+        self.before = try JSONSerialization.jsonObject(with: JSONEncoder().encode(before)) as! [String: Any]
+        self.after = try JSONSerialization.jsonObject(with: JSONEncoder().encode(after)) as! [String: Any]
+    }
+
+    public func apply(to configuration: inout UserConfiguration) throws {
+        let current = try JSONSerialization.jsonObject(with: JSONEncoder().encode(configuration)) as! [String: Any]
+        func merge(_ old: [String: Any], _ new: [String: Any], _ latest: [String: Any]) throws -> [String: Any] {
+            var result = latest
+            for key in Set(old.keys).union(new.keys) {
+                let lhs = old[key] ?? NSNull(), rhs = new[key] ?? NSNull()
+                if (lhs as AnyObject).isEqual(rhs) { continue }
+                if let a = lhs as? [String: Any], let b = rhs as? [String: Any] {
+                    result[key] = try merge(a, b, latest[key] as? [String: Any] ?? [:])
+                } else {
+                    if lhs is [Any], !((latest[key] ?? NSNull()) as AnyObject).isEqual(lhs) {
+                        throw CocoaError(.fileWriteFileExists)
+                    }
+                    result[key] = new[key]
+                }
+            }
+            return result
+        }
+        let object = try merge(before, after, current)
+        configuration = try JSONDecoder().decode(UserConfiguration.self, from: JSONSerialization.data(withJSONObject: object))
+    }
 }

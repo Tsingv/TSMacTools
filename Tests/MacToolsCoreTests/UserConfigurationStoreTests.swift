@@ -2,6 +2,25 @@ import XCTest
 import MacToolsCore
 
 final class UserConfigurationStoreTests: XCTestCase {
+    func testTranslationBaseURLNormalizationAndEndpointCompatibility() throws {
+        for (input, expected) in [
+            (" https://example.com/ ", "https://example.com/v1/chat/completions"),
+            ("http://localhost:8787", "http://localhost:8787/v1/chat/completions"),
+            ("https://example.com/v1/", "https://example.com/v1/chat/completions"),
+            ("https://example.com/custom/api///?key=a%2Fb", "https://example.com/custom/api/chat/completions?key=a%2Fb"),
+            ("https://example.com/v1/chat/completions?key=a%2Fb", "https://example.com/v1/chat/completions?key=a%2Fb"),
+            ("https://example.com/chat/completions", "https://example.com/chat/completions"),
+            ("https://example.com/custom/chat/completions/", "https://example.com/custom/chat/completions/")
+        ] {
+            XCTAssertEqual(try TranslationEndpoint.requestURL(input), expected)
+            XCTAssertEqual(try TranslationEndpoint.requestURL(TranslationEndpoint.baseURL(expected)), expected)
+        }
+        XCTAssertEqual(TranslationEndpoint.baseURL("https://example.com/custom/chat/completions"), "https://example.com/custom")
+        for invalid in ["", "example.com", "/v1", "ftp://example.com", "https://"] {
+            XCTAssertThrowsError(try TranslationEndpoint.requestURL(invalid))
+        }
+    }
+
     func testHotkeyShortcutNormalizesModifierAliasesOrderAndKeyCase() {
         let configured = HotkeyShortcut(modifiers: ["shift", "command", "option", "control"], key: "r")
         let recorded = HotkeyShortcut(modifiers: ["ALT", "ctrl", "cmd", "shift"], key: "R")
@@ -685,5 +704,474 @@ private extension String {
             replacements += 1
         }
         return result
+    }
+}
+
+final class FanSafetyTests: XCTestCase {
+    func testBezierAndMissingReadings() throws {
+        let rule = FanRule()
+        XCTAssertEqual(rule.demand(at: 20), 25)
+        XCTAssertEqual(rule.demand(at: 110), 100)
+        XCTAssertNil(rule.demand(at: .nan))
+        var configured = FanSettings(); configured.rules = [rule]
+        XCTAssertNil(configured.demands(readings: [:]))
+        XCTAssertEqual(configured.demands(readings: ["CPU": 85]), [0: 100])
+        var malformed = rule
+        malformed.points[1].temperature = malformed.points[0].temperature
+        XCTAssertNil(malformed.demand(at: 60))
+    }
+    struct Hardware: FanHardwareBoundary {
+        var supportsLeasedControl = true
+        var restored = false
+        var leases: [Date] = []
+        mutating func setDemand(_ percent: Double, fan: Int, leaseUntil: Date) throws { leases.append(leaseUntil) }
+        mutating func restoreAutomatic() throws { restored = true }
+    }
+    func testLeaseAndStaleSampleRestore() throws {
+        let now = Date(timeIntervalSince1970: 100)
+        var session = FanControlSession(hardware: Hardware())
+        var configured = FanSettings(); configured.rules = [FanRule()]
+        try session.update(settings: configured, readings: ["CPU": 70], now: now, sampleDate: now)
+        XCTAssertEqual(session.hardware.leases, [now.addingTimeInterval(5)])
+        try session.update(settings: configured, readings: ["CPU": 70], now: now, sampleDate: now.addingTimeInterval(-4))
+        XCTAssertTrue(session.hardware.restored)
+    }
+    func testPatchPreservesConcurrentLeafEditsAndRejectsArrayConflict() throws {
+        let original = UserConfiguration.migratedHammerspoonDefault()
+        var proposed = original
+        proposed.translation.model = "new-model"
+        let patch = try ConfigurationPatch(before: original, after: proposed)
+        var latest = original
+        latest.application.terminalBundleIdentifier = "external"
+        try patch.apply(to: &latest)
+        XCTAssertEqual(latest.translation.model, "new-model")
+        XCTAssertEqual(latest.application.terminalBundleIdentifier, "external")
+        proposed = original
+        proposed.hotkeys.removeLast()
+        let arrayPatch = try ConfigurationPatch(before: original, after: proposed)
+        latest.hotkeys.removeFirst()
+        XCTAssertThrowsError(try arrayPatch.apply(to: &latest))
+    }
+}
+
+final class SMCHardwareTests: XCTestCase {
+    final class IO: SMCMetadataIO {
+        var values: [String: SMCValue] = [:]
+        var writes: [String] = []
+        var failReadback = false
+        var ignoreAutomaticTargets = false
+        var ignoredTargets = 0
+        var rejectManual = false
+        var rejectAutomatic = false
+        init() throws {
+            for (key, number, type) in [("FNum", 1.0, "ui8 "), ("F0Ac", 2000, "fpe2"), ("F0Mn", 1200, "fpe2"), ("F0Mx", 6000, "fpe2"), ("F0Tg", 2000, "fpe2"), ("F0Md", 0, "ui8 "), ("Tp01", 65, "sp78")] {
+                values[key] = try SMCValue.encode(number, type: type)
+            }
+        }
+        var ignoredModes = 0
+        var requiresUnlock = false
+        var rejectUnlockClear = false
+        var metadataOverrides: [String: SMCKeyMetadata] = [:]
+        func metadata(_ key: String) throws -> SMCKeyMetadata {
+            if let info = metadataOverrides[key] { return info }
+            let value = try read(key)
+            return SMCKeyMetadata(type: value.type, size: value.bytes.count, attributes: 0x40)
+        }
+        func keys() throws -> [String] { Array(values.keys) }
+        func read(_ key: String) throws -> SMCValue {
+            guard let value = values[key] else { throw SMCError.invalid(key) }
+            return value
+        }
+        func write(_ key: String, value: SMCValue) throws {
+            writes.append(key)
+            if key == "Ftst", value.number == 0, rejectUnlockClear { throw SMCError.transport(-1) }
+            if ["F0Md", "F0md"].contains(key), value.number == 1 {
+                if ignoredModes > 0 { ignoredModes -= 1; return }
+                if requiresUnlock && values["Ftst"]?.number != 1 { return }
+            }
+            if key == "F0Md", (value.number == 1 && rejectManual) || (value.number == 0 && rejectAutomatic) { throw SMCError.transport(-1) }
+            if key == "F0Tg" {
+                if ignoreAutomaticTargets && values["F0Md"]?.number != 1 { return }
+                if ignoredTargets > 0 { ignoredTargets -= 1; return }
+            }
+            if !(failReadback && key == "F0Tg") { values[key] = value }
+        }
+    }
+    func testCodecsAndSnapshot() throws {
+        for (type, number) in [("ui8 ", 200.0), ("ui16", 6000), ("fpe2", 2345.25), ("sp78", -12.5), ("flt ", 2345.5)] {
+            XCTAssertEqual(try XCTUnwrap(SMCValue.encode(number, type: type).number), number, accuracy: 0.001)
+        }
+        XCTAssertThrowsError(try SMCValue.encode(.nan, type: "flt "))
+        XCTAssertThrowsError(try SMCValue.encode(20000, type: "fpe2"))
+        let io = try IO(), snapshot = try SMCMonitor.snapshot(io: io, temperatureKeys: ["Tp01", "unknown"])
+        XCTAssertEqual(snapshot.fans[0].maximum, 6000)
+        XCTAssertEqual(snapshot.ruleReadings["CPU"], 65)
+        XCTAssertTrue(io.writes.isEmpty)
+    }
+    func testLiveLimitsReadbackAndExpiry() throws {
+        let io = try IO(), controller = LeasedFanController(io: io)
+        try controller.restore()
+        try controller.set(fan: 0, percent: 50, now: 100)
+        XCTAssertEqual(try io.read("F0Tg").number, 3600)
+        XCTAssertEqual(try io.read("F0Md").number, 1)
+        try controller.expire(now: 104.9)
+        XCTAssertEqual(try io.read("F0Md").number, 1)
+        try controller.expire(now: 106)
+        XCTAssertEqual(try io.read("F0Md").number, 0)
+        XCTAssertThrowsError(try controller.set(fan: 7, percent: 50, now: 100))
+        XCTAssertThrowsError(try controller.set(fan: 0, percent: 101, now: 100))
+        io.failReadback = true
+        XCTAssertThrowsError(try controller.set(fan: 0, percent: 75, now: 100))
+        XCTAssertEqual(try io.read("F0Md").number, 0)
+    }
+    func testRestoreRejectsUnavailableFanEnumeration() throws {
+        let io = try IO(), controller = LeasedFanController(io: io)
+        io.values["FNum"] = nil
+        XCTAssertThrowsError(try controller.restore())
+        XCTAssertTrue(io.writes.isEmpty)
+    }
+    func testRestoreRetainsFailedFanForRetry() throws {
+        let io = try IO(), controller = LeasedFanController(io: io)
+        let mode = io.values.removeValue(forKey: "F0Md")
+        XCTAssertThrowsError(try controller.restore())
+        io.values["F0Md"] = mode
+        try controller.restore()
+        XCTAssertEqual(try io.read("F0Md").number, 0)
+    }
+    func testUnsupportedModeFailsClosedAndRestoresOtherFans() throws {
+        let io = try IO(), controller = LeasedFanController(io: io)
+        io.values["F0Md"] = nil
+        XCTAssertThrowsError(try controller.set(fan: 0, percent: 50, now: 100))
+        XCTAssertFalse(io.writes.contains("F0Tg"))
+    }
+}
+
+extension SMCHardwareTests {
+    func testSleepRestoresAndRejectsRequestsUntilWake() throws {
+        let io = try IO(), controller = LeasedFanController(io: io)
+        try controller.set(fan: 0, percent: 50, now: 100)
+        try controller.prepareForSleep()
+        XCTAssertEqual(try io.read("F0Md").number, 0)
+        XCTAssertThrowsError(try controller.set(fan: 0, percent: 50, now: 101))
+        try controller.resumeAfterSleep()
+        try controller.set(fan: 0, percent: 50, now: 102)
+        XCTAssertEqual(try io.read("F0Md").number, 1)
+    }
+}
+
+
+extension SMCHardwareTests {
+    func testBatchReleasesRemovedFansImmediately() throws {
+        let io = try IO(), controller = LeasedFanController(io: io)
+        try controller.apply(demands: [0: 60], now: 100)
+        XCTAssertEqual(try io.read("F0Md").number, 1)
+        try controller.apply(demands: [:], now: 100.01)
+        XCTAssertEqual(try io.read("F0Md").number, 0)
+    }
+    func testCompleteTwoFanBatchUsesOneControllerRequest() throws {
+        let io = try IO(), controller = LeasedFanController(io: io)
+        io.values["FNum"] = try SMCValue.encode(2, type: "ui8 ")
+        for suffix in ["Ac", "Mn", "Mx", "Tg", "Md"] { io.values["F1" + suffix] = io.values["F0" + suffix] }
+        try controller.apply(demands: [0: 25, 1: 75], now: 100)
+        XCTAssertEqual(try io.read("F0Md").number, 1)
+        XCTAssertEqual(try io.read("F1Md").number, 1)
+        XCTAssertEqual(try io.read("F0Tg").number, 2400)
+        XCTAssertEqual(try io.read("F1Tg").number, 4800)
+    }
+    func testInvalidBatchRestoresActiveLease() throws {
+        let io = try IO(), controller = LeasedFanController(io: io)
+        try controller.apply(demands: [0: 60], now: 100)
+        XCTAssertThrowsError(try controller.apply(demands: [7: 50], now: 101))
+        XCTAssertEqual(try io.read("F0Md").number, 0)
+    }
+    func testLegacyRuleDefaultsEnabledAndDisabledMissingSensorIsIgnored() throws {
+        let data = Data(#"{"sensor":"missing","fan":0,"points":[{"temperature":40,"percent":25,"outgoing":0.33,"incoming":0.67},{"temperature":85,"percent":100,"outgoing":0.33,"incoming":0.67}]}"#.utf8)
+        var rule = try JSONDecoder().decode(FanRule.self, from: data)
+        XCTAssertTrue(rule.enabled)
+        var settings = FanSettings(); settings.rules = [rule]
+        XCTAssertNil(settings.demands(readings: [:]))
+        rule.enabled = false; settings.rules = [rule]
+        XCTAssertEqual(settings.demands(readings: [:]), [:])
+        XCTAssertFalse(try JSONDecoder().decode(FanRule.self, from: JSONEncoder().encode(rule)).enabled)
+    }
+}
+
+
+extension SMCHardwareTests {
+    func testHelperUpdateRequiresMatchingSignedContentAndRunningProtocol() {
+        XCTAssertFalse(FanHelperUpdatePolicy.needsUpdate(installedHash: "a", bundledHash: "a", runningStatus: "ready-v2"))
+        XCTAssertTrue(FanHelperUpdatePolicy.needsUpdate(installedHash: "old", bundledHash: "new", runningStatus: "ready-v2"))
+        XCTAssertTrue(FanHelperUpdatePolicy.needsUpdate(installedHash: "a", bundledHash: "a", runningStatus: "ready-v1"))
+        XCTAssertTrue(FanHelperUpdatePolicy.needsUpdate(installedHash: nil, bundledHash: "a"))
+        XCTAssertTrue(FanHelperUpdatePolicy.needsUpdate(installedHash: "a", bundledHash: nil))
+        XCTAssertFalse(FanHelperUpdatePolicy.needsUpdate(installedHash: "a", bundledHash: "a", runningStatus: "unavailable-v2: SMC unavailable"))
+        XCTAssertTrue(FanHelperUpdatePolicy.needsUpdate(installedHash: "a", bundledHash: "a", runningStatus: "unavailable-v1: SMC unavailable"))
+    }
+}
+
+
+extension SMCHardwareTests {
+    func testPersistentFanEnableDefaultsOffAndEvaluatesFreshStartupConfiguration() throws {
+        var settings = try JSONDecoder().decode(FanSettings.self, from: Data("{}".utf8))
+        let now = Date()
+        XCTAssertFalse(settings.enabled)
+        XCTAssertNil(settings.activeDemands(readings: ["CPU": 70], now: now, sampleDate: now))
+        settings.enabled = true
+        let restarted = try JSONDecoder().decode(FanSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertNotNil(restarted.activeDemands(readings: ["CPU": 70], now: now, sampleDate: now))
+        XCTAssertNil(restarted.activeDemands(readings: ["CPU": 70], now: now, sampleDate: now.addingTimeInterval(-4)))
+        XCTAssertNil(restarted.activeDemands(readings: ["CPU": 70], now: now, sampleDate: now.addingTimeInterval(1)))
+        settings.rules = []
+        XCTAssertEqual(settings.activeDemands(readings: [:], now: now, sampleDate: now), [:])
+    }
+}
+
+final class FanPlotAndSensorTests: XCTestCase {
+    func testGeometryRoundTripsAcrossSizes() {
+        for size in [CGSize(width: 680, height: 280), CGSize(width: 950, height: 360)] {
+            let geometry = FanPlotGeometry(bounds: CGRect(origin: .zero, size: size))
+            for temperature in [20.0, 46.5, 110] {
+                for percent in [0.0, 37, 100] {
+                    let reading = geometry.reading(at: geometry.location(temperature: temperature, percent: percent))
+                    XCTAssertEqual(reading.temperature, temperature, accuracy: 0.00001)
+                    XCTAssertEqual(reading.percent, percent, accuracy: 0.00001)
+                }
+            }
+        }
+    }
+    func testCPUAggregateExcludesChargerDieAndInvalidValues() {
+        var snapshot = FanSnapshot(temperatures: ["TCHP": 120, "Te01": 63, "Tp01": 71, "Tp02": .nan, "HID:PMU tdie3:1": 95])
+        snapshot.descriptors = FanSensorMetadata.descriptors(keys: Array(snapshot.temperatures.keys), model: "unknown", topology: ["Efficiency": 2, "Performance": 4])
+        XCTAssertEqual(snapshot.ruleReadings["CPU"], 71)
+        XCTAssertEqual(snapshot.ruleReadings["Highest CPU"], 71)
+        XCTAssertEqual(snapshot.highestCPU?.key, "Tp01")
+        XCTAssertEqual(FanSensorMetadata.group("TCHP"), "Power")
+        XCTAssertEqual(FanSensorMetadata.group("HID:PMU tdie3:1"), "SoC")
+        XCTAssertNil(FanSnapshot(temperatures: ["TCHP": 80]).ruleReadings["CPU"])
+    }
+    func testTemperatureDiscoveryRejectsNumericConstantsAndBadWidths() {
+        for key in ["Tz0A", "TTPD", "TVMD", "TVmS", "TfCB", "F0Ac"] { XCTAssertFalse(FanSensorMetadata.eligible(key), key) }
+        for key in ["Tp01", "ftE0", "sd01", "Tg05"] { XCTAssertTrue(FanSensorMetadata.eligible(key), key) }
+        XCTAssertNil(FanSensorMetadata.temperature(SMCValue(type: "ui8 ", bytes: [42])))
+        XCTAssertNil(FanSensorMetadata.temperature(SMCValue(type: "flt ", bytes: [42, 0])))
+        XCTAssertEqual(FanSensorMetadata.temperature(SMCValue(type: "sp78", bytes: [42, 128])), 42.5)
+    }
+    func testTopologyBoundsAndExactCatalogKeepUnknownKeysOther() {
+        let keys = ["Te01", "Te02", "Te03", "Tp01", "Tm01", "Tg01"]
+        let legacy = FanSensorMetadata.descriptors(keys: keys, model: "unknown", topology: ["Efficiency": 2, "Performance": 4])
+        XCTAssertEqual(legacy["Te03"]?.area, "Other")
+        XCTAssertEqual(legacy["Tm01"]?.area, "Memory")
+        XCTAssertEqual(legacy["Tp01"]?.displayName, "CPU sensor · Tp01")
+        let modern = FanSensorMetadata.descriptors(keys: keys, model: "unknown", topology: ["Efficiency": 2, "Performance": 4, "Super": 6])
+        XCTAssertEqual(modern["Tm01"]?.area, "CPU")
+        let exact = FanSensorMetadata.descriptors(keys: ["Tp09", "Tpzz", "Tg05"], model: "Mac13,1", topology: [:])
+        XCTAssertEqual(exact["Tp09"]?.displayName, "Efficiency Core 1")
+        XCTAssertEqual(exact["Tpzz"]?.area, "Other")
+        XCTAssertEqual(exact["Tg05"]?.area, "GPU")
+    }
+    func testRegistryRetainsDescriptorButNeverMissingControlValue() {
+        var registry = FanSensorRegistry()
+        var first = FanSnapshot(temperatures: ["TB0T": 35, "Tg05": 72])
+        registry.update(&first)
+        var missing = FanSnapshot()
+        registry.update(&missing)
+        XCTAssertEqual(missing.descriptors, first.descriptors)
+        XCTAssertTrue(missing.temperatures.isEmpty)
+        XCTAssertNil(missing.ruleReadings["TB0T"])
+        XCTAssertNil(missing.ruleReadings["Maximum"])
+        var returned = FanSnapshot(temperatures: ["TB0T": 36])
+        registry.update(&returned)
+        XCTAssertEqual(returned.descriptors["TB0T"], first.descriptors["TB0T"])
+        XCTAssertEqual(returned.ruleReadings["TB0T"], 36)
+        XCTAssertNil(returned.ruleReadings["Tg05"])
+    }
+    func testHIDLogicalAggregateDedupAndNonTemperatureProducts() {
+        let values = FanSensorMetadata.mergeHID([("PMU tdie0", "1", 60), ("PMU tdie0", "2", 80), ("PMU tdie1", "3", 40), ("PMU tcal", "4", 30), ("PMU tdev0", "5", 45)])
+        XCTAssertEqual(values.count, 3)
+        let snapshot = FanSnapshot(temperatures: values)
+        XCTAssertEqual(snapshot.ruleReadings["Highest Computer"], 80)
+        XCTAssertEqual(snapshot.ruleReadings["Average Computer"], 60)
+        XCTAssertNil(snapshot.ruleReadings["CPU"])
+        XCTAssertNil(snapshot.ruleReadings["Average CPU"])
+        var gpu = FanSnapshot(temperatures: ["Tg01": 80, "TG0D": 60, "mystery": 125])
+        gpu.descriptors = FanSensorMetadata.descriptors(keys: Array(gpu.temperatures.keys), model: "unknown", topology: [:])
+        XCTAssertEqual(gpu.ruleReadings["GPU"], 80)
+        XCTAssertEqual(gpu.ruleReadings["Average GPU"], 70)
+        XCTAssertEqual(gpu.ruleReadings["Maximum"], 80)
+    }
+    func testHIDIdentityDedupPreservesDistinctLocations() {
+        let result = FanSensorMetadata.mergeHID([("PMU tdie0", "1", 65), ("PMU tdie0", "1", 68), ("PMU tdie0", "2", 72), ("bad", nil, -9200)])
+        XCTAssertEqual(result.count, 2)
+        XCTAssertEqual(result["HID:PMU tdie0:1"], 68)
+        XCTAssertEqual(result["HID:PMU tdie0:2"], 72)
+    }
+    func testRPMUsesHardwareMinimumRatherThanZero() throws {
+        let fan = try JSONDecoder().decode(FanReading.self, from: Data("{\"id\":0,\"current\":2000,\"minimum\":1200,\"maximum\":6000}".utf8))
+        XCTAssertEqual(fan.rpm(percent: 0), 1200)
+        XCTAssertEqual(fan.rpm(percent: 50), 3600)
+        XCTAssertEqual(fan.rpm(percent: 100), 6000)
+    }
+}
+
+
+extension SMCHardwareTests {
+    func testManualModePrecedesTargetAndRoundsRPM() throws {
+        let io = try IO()
+        io.ignoreAutomaticTargets = true
+        let controller = LeasedFanController(io: io, sleep: { _ in XCTFail("Unexpected retry") })
+        try controller.set(fan: 0, percent: 50.01, now: 100)
+        XCTAssertEqual(Array(io.writes.prefix(2)), ["F0Md", "F0Tg"])
+        XCTAssertEqual(io.values["F0Tg"]?.number, 3600)
+    }
+    func testDelayedTargetConvergesWithinBoundedRetries() throws {
+        let io = try IO(); io.ignoredTargets = 2
+        var delays: [TimeInterval] = []
+        let controller = LeasedFanController(io: io, sleep: { delays.append($0) })
+        try controller.set(fan: 0, percent: 50, now: 100)
+        XCTAssertEqual(delays, [0.1, 0.1])
+        XCTAssertEqual(io.writes.filter { $0 == "F0Tg" }.count, 3)
+        XCTAssertEqual(io.values["F0Md"]?.number, 1)
+    }
+    func testPersistentMismatchReportsDetailsAndRestores() throws {
+        let io = try IO(); io.failReadback = true
+        let controller = LeasedFanController(io: io, sleep: { _ in })
+        XCTAssertThrowsError(try controller.set(fan: 0, percent: 50, now: 100)) { error in
+            for text in ["F0Tg", "expected=3600", "readback=", "encoding=fpe2", "mode=manual", "3 attempts"] {
+                XCTAssertTrue(error.localizedDescription.contains(text), error.localizedDescription)
+            }
+        }
+        XCTAssertEqual(io.writes.filter { $0 == "F0Tg" }.count, 3)
+        XCTAssertEqual(io.values["F0Md"]?.number, 0)
+    }
+    func testManualFailureNeverWritesTarget() throws {
+        let io = try IO(); io.rejectManual = true
+        let controller = LeasedFanController(io: io, sleep: { _ in })
+        XCTAssertThrowsError(try controller.set(fan: 0, percent: 50, now: 100))
+        XCTAssertFalse(io.writes.contains("F0Tg"))
+        XCTAssertEqual(io.values["F0Md"]?.number, 0)
+    }
+    func testFailedReleaseRemainsPendingWithoutDiscovery() throws {
+        let io = try IO()
+        let controller = LeasedFanController(io: io, sleep: { _ in })
+        try controller.set(fan: 0, percent: 50, now: 100)
+        io.rejectAutomatic = true
+        XCTAssertThrowsError(try controller.apply(demands: [:], now: 101)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("restoration failed"))
+        }
+        io.values["FNum"] = nil
+        io.rejectAutomatic = false
+        XCTAssertThrowsError(try controller.restore()) // discovery still fails, but known fan is released
+        XCTAssertEqual(io.values["F0Md"]?.number, 0)
+        let count = io.writes.count
+        try controller.expire(now: 106)
+        XCTAssertEqual(io.writes.count, count)
+    }
+}
+
+
+extension SMCHardwareTests {
+    func testDelayedManualModeRetriesBeforeTarget() throws {
+        let io = try IO(); io.ignoredModes = 7
+        var delays: [TimeInterval] = []
+        let controller = LeasedFanController(io: io, sleep: { delays.append($0) }, clock: { 0 })
+        try controller.set(fan: 0, percent: 50, now: 100)
+        XCTAssertEqual(delays, Array(repeating: 0.25, count: 7))
+        XCTAssertEqual(io.writes.filter { $0 == "F0Md" }.count, 8)
+        XCTAssertEqual(io.writes.last, "F0Tg")
+    }
+    func testWritableUnlockAndPendingReset() throws {
+        let io = try IO(); io.requiresUnlock = true
+        io.values["Ftst"] = SMCValue(type: "ui8 ", bytes: [0])
+        let controller = LeasedFanController(io: io, sleep: { _ in }, clock: { 0 })
+        try controller.set(fan: 0, percent: 50, now: 100)
+        XCTAssertEqual(Array(io.writes.prefix(3)), ["Ftst", "F0Md", "F0Tg"])
+        io.rejectAutomatic = true
+        XCTAssertThrowsError(try controller.restore())
+        XCTAssertEqual(io.values["Ftst"]?.number, 1)
+        io.rejectAutomatic = false; io.rejectUnlockClear = true
+        XCTAssertThrowsError(try controller.restore())
+        io.rejectUnlockClear = false
+        try controller.expire(now: 106)
+        XCTAssertEqual(io.values["Ftst"]?.number, 0)
+    }
+    func testUnsupportedUnlockNeverWrittenAndManualRemainsStrict() throws {
+        for present in [false, true] {
+            let io = try IO(); io.requiresUnlock = true
+            if present {
+                io.values["Ftst"] = SMCValue(type: "ui8 ", bytes: [0])
+                io.metadataOverrides["Ftst"] = SMCKeyMetadata(type: "ui8 ", size: 1, attributes: 0)
+            }
+            let controller = LeasedFanController(io: io, sleep: { _ in }, clock: { 0 })
+            XCTAssertThrowsError(try controller.set(fan: 0, percent: 50, now: 100))
+            XCTAssertFalse(io.writes.contains("Ftst"))
+            XCTAssertFalse(io.writes.contains("F0Tg"))
+        }
+    }
+    func testFloatPrefersLowercaseAndSnapshotUsesSameMode() throws {
+        let io = try IO()
+        io.values["F0Tg"] = try SMCValue.encode(2000, type: "flt ")
+        io.values["F0md"] = SMCValue(type: "ui8 ", bytes: [0])
+        let controller = LeasedFanController(io: io, sleep: { _ in }, clock: { 0 })
+        try controller.set(fan: 0, percent: 50, now: 100)
+        XCTAssertTrue(io.writes.contains("F0md"))
+        XCTAssertFalse(io.writes.contains("F0Md"))
+        XCTAssertEqual(try SMCMonitor.snapshot(io: io, temperatureKeys: []).fans.first?.manual, true)
+        io.values["F0md"] = nil
+        XCTAssertEqual(try FanModeDiscovery.key(io: io, fan: 0), "F0Md")
+    }
+    func testPreexistingUnlockIsNotCleared() throws {
+        let io = try IO(); io.values["Ftst"] = SMCValue(type: "ui8 ", bytes: [1])
+        let controller = LeasedFanController(io: io, sleep: { _ in }, clock: { 0 })
+        try controller.set(fan: 0, percent: 50, now: 100)
+        try controller.restore()
+        XCTAssertEqual(io.values["Ftst"]?.number, 1)
+    }
+    func testLeaseBeginsAfterSuccessfulVerification() throws {
+        let io = try IO(); io.ignoredModes = 3
+        var uptime = 0.0
+        let controller = LeasedFanController(io: io, sleep: { uptime += $0 }, clock: { uptime })
+        try controller.set(fan: 0, percent: 50, now: 100)
+        try controller.expire(now: 105)
+        XCTAssertEqual(io.values["F0Md"]?.number, 1)
+        try controller.expire(now: 105.75)
+        XCTAssertEqual(io.values["F0Md"]?.number, 0)
+    }
+}
+
+extension UserConfigurationStoreTests {
+    func testFanAssignmentsRejectDisabledDuplicatesAndRetargetAtPersistence() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("config.jsonc")
+        let store = UserConfigurationStore()
+        var config = UserConfiguration.migratedHammerspoonDefault()
+        config.fans.rules = [FanRule(fan: 7)]
+        try store.save(config, to: url)
+        XCTAssertThrowsError(try store.update(at: url) { latest in
+            var duplicate = FanRule(fan: 7); duplicate.enabled = false
+            latest.fans.rules.append(duplicate)
+        })
+        XCTAssertThrowsError(try store.update(at: url) { $0.fans.rules[0].fan = 9 })
+        XCTAssertEqual(try store.load(from: url).fans.rules, config.fans.rules)
+    }
+
+    func testLegacyDuplicateFansRemainVisibleButSuspendAllDemands() throws {
+        var settings = FanSettings()
+        var disabled = FanRule(fan: 7); disabled.enabled = false
+        settings.rules = [FanRule(fan: 7), disabled]
+        XCTAssertEqual(settings.duplicateFanIDs, [7])
+        XCTAssertNil(settings.demands(readings: ["CPU": 70]))
+        settings.rules.removeLast()
+        XCTAssertNotNil(settings.demands(readings: ["CPU": 70]))
+    }
+
+    func testLegacyRuleIdentityIsStableAndNewRulesKeepIdentityAcrossRoundTrip() throws {
+        let data = Data(#"{"rules":[{"sensor":"CPU","fan":7,"points":[]},{"sensor":"CPU","fan":7,"points":[]}]}"#.utf8)
+        let first = try JSONDecoder().decode(FanSettings.self, from: data)
+        let second = try JSONDecoder().decode(FanSettings.self, from: data)
+        XCTAssertEqual(first, second)
+        XCTAssertNotEqual(first.rules[0].id, first.rules[1].id)
+        XCTAssertEqual(first, try JSONDecoder().decode(FanSettings.self, from: JSONEncoder().encode(first)))
     }
 }
