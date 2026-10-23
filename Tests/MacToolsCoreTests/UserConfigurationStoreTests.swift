@@ -2,6 +2,65 @@ import XCTest
 import MacToolsCore
 
 final class UserConfigurationStoreTests: XCTestCase {
+    func testFanReadPlanSeparatesBackgroundAndExpandedMonitoring() {
+        let descriptors = FanSensorMetadata.descriptors(keys: ["Tp01", "Tg01", "TB0T", "Tzzz"], model: "unknown", topology: ["Performance": 4])
+        var settings = FanSettings()
+        XCTAssertFalse(FanReadPlan(settings: settings, monitoring: false).needsSample)
+        settings.enabled = true
+        var disabled = FanRule(sensor: "Maximum"); disabled.enabled = false
+        settings.rules = [FanRule(sensor: "CPU"), disabled]
+        let background = FanReadPlan(settings: settings, monitoring: false, areas: ["Battery"])
+        XCTAssertEqual(Set(background.keys(in: descriptors)), ["Tp01"])
+        let visible = FanReadPlan(settings: settings, monitoring: true, areas: ["Battery"])
+        XCTAssertEqual(Set(visible.keys(in: descriptors)), ["Tp01", "TB0T"])
+        settings.enabled = false
+        XCTAssertEqual(Set(FanReadPlan(settings: settings, monitoring: true, areas: ["GPU"]).keys(in: descriptors)), ["Tg01"])
+    }
+
+    func testFanReadPlanExpandsEveryAggregateAndPreservesRawSensors() {
+        let descriptors = FanSensorMetadata.descriptors(keys: ["Tp01", "Tg01", "TB0T", "Tzzz"], model: "unknown", topology: ["Performance": 4])
+        for alias in FanReadPlan.aggregates {
+            var settings = FanSettings(); settings.enabled = true; settings.rules = [FanRule(sensor: alias)]
+            let keys = Set(FanReadPlan(settings: settings, monitoring: false).keys(in: descriptors))
+            if alias.contains("CPU") || alias == "CPU" { XCTAssertEqual(keys, ["Tp01"], alias) }
+            else if alias.contains("GPU") || alias == "GPU" { XCTAssertEqual(keys, ["Tg01"], alias) }
+            else { XCTAssertEqual(keys, ["Tp01", "Tg01", "TB0T"], alias) }
+        }
+        var settings = FanSettings(); settings.enabled = true; settings.rules = [FanRule(sensor: "Tzzz")]
+        XCTAssertEqual(FanReadPlan(settings: settings, monitoring: false).keys(in: descriptors), ["Tzzz"])
+        var registry = FanSensorRegistry(); registry.discover(keys: Array(descriptors.keys))
+        var snapshot = FanSnapshot(); registry.update(&snapshot)
+        XCTAssertEqual(Set(snapshot.descriptors.keys), Set(descriptors.keys))
+        XCTAssertTrue(snapshot.temperatures.isEmpty)
+    }
+
+    func testFanControlVersionRejectsOldPartialSamplesAndRoundTrips() {
+        var version = FanControlSampleVersion()
+        var settings = FanSettings(); settings.enabled = true; settings.rules = [FanRule(sensor: "Tp01")]
+        XCTAssertTrue(version.update(settings))
+        let partial = version.generation
+        XCTAssertFalse(version.update(settings))
+        XCTAssertTrue(version.accepts(partial))
+        let original = settings
+        settings.rules[0].sensor = "Maximum"
+        XCTAssertTrue(version.update(settings))
+        XCTAssertFalse(version.accepts(partial))
+        let full = version.generation
+        XCTAssertTrue(version.update(original))
+        XCTAssertFalse(version.accepts(partial))
+        XCTAssertFalse(version.accepts(full))
+        XCTAssertTrue(version.accepts(version.generation))
+    }
+
+    func testExpandedAggregatesReadAllCuratedDependenciesWithoutControlRules() {
+        let descriptors = FanSensorMetadata.descriptors(keys: ["Tp01", "Tg01", "TB0T", "Tzzz"], model: "unknown", topology: ["Performance": 4])
+        let expanded = FanReadPlan(settings: FanSettings(), monitoring: true, areas: ["Aggregates"])
+        XCTAssertEqual(Set(expanded.keys(in: descriptors)), ["Tp01", "Tg01", "TB0T"])
+        let hidden = FanReadPlan(settings: FanSettings(), monitoring: false, areas: ["Aggregates"])
+        XCTAssertFalse(hidden.needsSample)
+        XCTAssertTrue(hidden.keys(in: descriptors).isEmpty)
+    }
+
     func testTranslationBaseURLNormalizationAndEndpointCompatibility() throws {
         for (input, expected) in [
             (" https://example.com/ ", "https://example.com/v1/chat/completions"),

@@ -362,10 +362,52 @@ public enum FanSensorMetadata {
 public struct FanSensorRegistry: Sendable {
     public private(set) var descriptors: [String: FanSensorDescriptor] = [:]
     public init() {}
+    public mutating func discover(keys: [String]) {
+        let incoming = FanSensorMetadata.descriptors(keys: Array(Set(descriptors.keys).union(keys)))
+        for (key, descriptor) in incoming { descriptors[key] = descriptor }
+    }
     public mutating func update(_ snapshot: inout FanSnapshot) {
         let incoming = FanSensorMetadata.descriptors(keys: Array(Set(descriptors.keys).union(snapshot.temperatures.keys)))
         for (key, descriptor) in incoming where descriptors[key] == nil { descriptors[key] = descriptor }
         snapshot.descriptors = descriptors
+    }
+}
+
+/// Immutable demand passed from the main actor to the serial hardware owner.
+/// Rejects samples dispatched before a control configuration change, including A → B → A.
+public struct FanControlSampleVersion: Sendable {
+    public private(set) var generation: UInt64 = 0
+    private var settings = FanSettings()
+    public init() {}
+    @discardableResult public mutating func update(_ settings: FanSettings) -> Bool {
+        guard self.settings != settings else { return false }
+        self.settings = settings; generation &+= 1
+        return true
+    }
+    public func accepts(_ generation: UInt64) -> Bool { self.generation == generation }
+}
+
+public struct FanReadPlan: Equatable, Sendable {
+    public static let aggregates = ["CPU", "Highest CPU", "Average CPU", "GPU", "Highest GPU", "Average GPU", "Maximum", "Highest Computer", "Average Computer"]
+    public var sensors: Set<String>
+    public var areas: Set<String>
+    public var monitoring: Bool
+    public init(settings: FanSettings, monitoring: Bool, areas: Set<String> = []) {
+        sensors = settings.enabled ? Set(settings.rules.filter(\.enabled).map(\.sensor)) : []
+        self.monitoring = monitoring; self.areas = monitoring ? areas : []
+    }
+    public var needsSample: Bool { monitoring || !sensors.isEmpty }
+    public func includes(_ descriptor: FanSensorDescriptor) -> Bool {
+        if areas.contains(descriptor.area) || sensors.contains(descriptor.id) { return true }
+        guard descriptor.curated else { return false }
+        if areas.contains("Aggregates") { return true }
+        if !sensors.isDisjoint(with: ["Maximum", "Highest Computer", "Average Computer"]) { return true }
+        if descriptor.area == "CPU", !sensors.isDisjoint(with: ["CPU", "Highest CPU", "Average CPU"]) { return true }
+        if descriptor.area == "GPU", !sensors.isDisjoint(with: ["GPU", "Highest GPU", "Average GPU"]) { return true }
+        return false
+    }
+    public func keys(in descriptors: [String: FanSensorDescriptor]) -> [String] {
+        descriptors.values.filter { includes($0) }.map(\.id).sorted()
     }
 }
 

@@ -237,6 +237,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         NSApp.activate(ignoringOtherApps: true)
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        updateFanVisibility()
     }
 
     func refresh(configuration: UserConfiguration, configURL: URL) {
@@ -322,6 +323,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         endActiveHotkeyRecording()
         let previousPage = selectedPage
         selectedPage = page
+        defer { updateFanVisibility() }
         for (candidate, button) in pageButtons {
             let isSelected = candidate == page
             button.state = .off
@@ -488,7 +490,15 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
     }
 
+    private func updateFanVisibility() {
+        (fanRuntime ?? fanLivePanel)?.setMonitoringVisible(selectedPage == .fans && window?.isVisible == true && window?.isMiniaturized != true && window?.occlusionState.contains(.visible) == true)
+    }
+    func windowDidChangeOcclusionState(_ notification: Notification) { updateFanVisibility() }
+    func windowDidMiniaturize(_ notification: Notification) { updateFanVisibility() }
+    func windowDidDeminiaturize(_ notification: Notification) { updateFanVisibility() }
+
     func windowWillClose(_ notification: Notification) {
+        (fanRuntime ?? fanLivePanel)?.setMonitoringVisible(false)
         NSApp.setActivationPolicy(.accessory)
         endActiveHotkeyRecording()
     }
@@ -2551,7 +2561,11 @@ private extension NSView {
         }
         scroll.contentView.scroll(to: NSPoint(x: 0, y: min(origin.y, max(0, document.bounds.height - bounds.height))))
         scroll.reflectScrolledClipView(scroll.contentView)
-        invalidateIntrinsicContentSize()
+    }
+    override func setFrameSize(_ newSize: NSSize) {
+        let oldColumns = columns
+        super.setFrameSize(newSize)
+        if oldColumns != columns { invalidateIntrinsicContentSize() }
     }
     func setCards(_ views: [NSView]) {
         guard orderedCards != views else { return }
@@ -2576,29 +2590,38 @@ private final class FanCurveEditor: NSView {
     private let enabled = NSSwitch()
     @objc private func enableChanged() { rule.enabled = enabled.state == .on; onChange?(rule) }
     @objc private func deleteRule() { onDelete?() }
+    private var choiceSignature: [String] = []
     func update(snapshot: FanSnapshot?) {
+        let previousTemperature = self.snapshot?.ruleReadings[rule.sensor]
+        let previousFan = self.snapshot?.fans.first { $0.id == rule.fan }
         self.snapshot = snapshot
-        let keys = Array(Set(snapshot?.descriptors.keys.map { $0 } ?? []).union(snapshot?.ruleReadings.keys.map { $0 } ?? [])).sorted()
-        sensor.removeAllItems()
-        for key in keys.sorted(by: { (snapshot?.descriptors[$0]?.area ?? "Aggregate", $0) < (snapshot?.descriptors[$1]?.area ?? "Aggregate", $1) }) {
-            let descriptor = snapshot?.descriptors[key]
-            sensor.addItem(withTitle: (descriptor.map { "\($0.area) · \($0.displayName) · \($0.id)" } ?? FanSensorMetadata.name(key)) + (snapshot?.ruleReadings[key] == nil ? " (unavailable)" : ""))
-            sensor.lastItem?.representedObject = key
-            let provenance = ["CPU", "Highest CPU"].contains(key) ? "Highest valid CPU; winner: \(snapshot?.highestCPU?.key ?? "unavailable")" : (key.hasPrefix("HID:") ? "IOHID Product + LocationID" : "AppleSMC firmware key / aggregate")
-            sensor.lastItem?.toolTip = "ID: \(key) · \(provenance)"
+        let keys = Array(Set(snapshot?.descriptors.keys.map { $0 } ?? []).union(snapshot?.ruleReadings.keys.map { $0 } ?? []).union(FanReadPlan.aggregates)).sorted()
+        let signature = keys.map { key in
+            "\(key)|\(snapshot?.descriptors[key]?.displayName ?? "")|\(snapshot?.ruleReadings[key] == nil)"
+        } + (snapshot?.fans.map { "\($0.id)|\($0.name ?? "")" } ?? [])
+        if choiceSignature != signature {
+            choiceSignature = signature
+            sensor.removeAllItems()
+            for key in keys.sorted(by: { (snapshot?.descriptors[$0]?.area ?? "Aggregate", $0) < (snapshot?.descriptors[$1]?.area ?? "Aggregate", $1) }) {
+                let descriptor = snapshot?.descriptors[key]
+                sensor.addItem(withTitle: (descriptor.map { "\($0.area) · \($0.displayName) · \($0.id)" } ?? FanSensorMetadata.name(key)) + (snapshot?.ruleReadings[key] == nil ? " (unavailable)" : ""))
+                sensor.lastItem?.representedObject = key
+                let provenance = ["CPU", "Highest CPU"].contains(key) ? "Highest valid CPU; winner: \(snapshot?.highestCPU?.key ?? "unavailable")" : (key.hasPrefix("HID:") ? "IOHID Product + LocationID" : "AppleSMC firmware key / aggregate")
+                sensor.lastItem?.toolTip = "ID: \(key) · \(provenance)"
+            }
+            if !keys.contains(rule.sensor) { sensor.addItem(withTitle: rule.sensor + " (unavailable)"); sensor.lastItem?.representedObject = rule.sensor }
+            for item in sensor.itemArray where item.representedObject == nil { item.representedObject = item.title }
+            sensor.select(sensor.itemArray.first { ($0.representedObject as? String) == rule.sensor })
+            fan.removeAllItems()
+            for reading in snapshot?.fans ?? [] {
+                fan.addItem(withTitle: reading.name.map { "\($0) (\(reading.id))" } ?? "Fan \(reading.id)")
+                fan.lastItem?.representedObject = reading.id
+            }
+            if !fan.itemArray.contains(where: { ($0.representedObject as? Int) == rule.fan }) { fan.addItem(withTitle: "Fan \(rule.fan) (unavailable)"); fan.lastItem?.representedObject = rule.fan }
+            fan.select(fan.itemArray.first { ($0.representedObject as? Int) == rule.fan })
+            fan.isEnabled = false
+            fan.toolTip = "Fan assignment is fixed. Delete this rule to assign another fan."
         }
-        if !keys.contains(rule.sensor) { sensor.addItem(withTitle: rule.sensor + " (unavailable)"); sensor.lastItem?.representedObject = rule.sensor }
-        for item in sensor.itemArray where item.representedObject == nil { item.representedObject = item.title }
-        sensor.select(sensor.itemArray.first { ($0.representedObject as? String) == rule.sensor })
-        fan.removeAllItems()
-        for reading in snapshot?.fans ?? [] {
-            fan.addItem(withTitle: reading.name.map { "\($0) (\(reading.id))" } ?? "Fan \(reading.id)")
-            fan.lastItem?.representedObject = reading.id
-        }
-        if !fan.itemArray.contains(where: { ($0.representedObject as? Int) == rule.fan }) { fan.addItem(withTitle: "Fan \(rule.fan) (unavailable)"); fan.lastItem?.representedObject = rule.fan }
-        fan.select(fan.itemArray.first { ($0.representedObject as? Int) == rule.fan })
-        fan.isEnabled = false
-        fan.toolTip = "Fan assignment is fixed. Delete this rule to assign another fan."
         let requested = snapshot?.ruleReadings[rule.sensor].flatMap { rule.demand(at: $0) }
         let effective = snapshot?.acceptedDemands[rule.fan]
         let status: String
@@ -2607,9 +2630,11 @@ private final class FanCurveEditor: NSView {
         else if snapshot?.controlEnabled != true { status = snapshot?.controlStatus ?? "Awaiting helper" }
         else if let effective, let requested { status = effective > requested ? "Shadowed · 更高规则优先" : "Active · 已接受批次" }
         else { status = snapshot?.controlStatus ?? "Awaiting batch" }
-        caption.stringValue = "\(status) · 请求 \(requested.map { String(format: "%.0f%%", $0) } ?? "—") · 有效 \(effective.map { String(format: "%.0f%%", $0) } ?? "—")"
+        let captionText = "\(status) · 请求 \(requested.map { String(format: "%.0f%%", $0) } ?? "—") · 有效 \(effective.map { String(format: "%.0f%%", $0) } ?? "—")"
+        if caption.stringValue != captionText { caption.stringValue = captionText }
         caption.toolTip = "Effective demand is the maximum across enabled rules for this fan. Accepted batch does not prove exclusive firmware ownership."
-        needsDisplay = true
+        let currentFan = snapshot?.fans.first { $0.id == rule.fan }
+        if previousTemperature != snapshot?.ruleReadings[rule.sensor] || previousFan?.minimum != currentFan?.minimum || previousFan?.maximum != currentFan?.maximum { needsDisplay = true }
     }
     private var selected: Int?
     private var selectedHandle: (Int, Bool)?
@@ -2780,20 +2805,53 @@ final class FanRuntime: NSObject {
     private var settings = FanSettings()
     private var suspended = false
     private var powerObservers: [NSObjectProtocol] = []
+    private var controlSampleVersion = FanControlSampleVersion()
     func apply(_ settings: FanSettings) {
+        let changed = controlSampleVersion.update(settings)
         self.settings = settings; applying = settings.enabled; toggle.state = settings.enabled ? .on : .off
-        if applying { rulesChanged() } else { restore() }
+        if changed {
+            latestSnapshot = nil; sampleDate = nil
+            restore(); publishUnavailable()
+        } else if applying { rulesChanged() }
+        poll()
     }
     func start() {
-        guard timer == nil else { return }
+        guard powerObservers.isEmpty else { return }
         let center = NSWorkspace.shared.notificationCenter
         powerObservers = [
-            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in MainActor.assumeIsolated { self?.suspended = true; self?.latestSnapshot = nil; self?.restore() } },
-            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in MainActor.assumeIsolated { self?.suspended = false; self?.queue.async { [weak self] in self?.reader.invalidateDiscovery() }; self?.poll() } }
+            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.prepareForSystemSleep() }
+            },
+            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.resumeAfterSystemSleep() }
+            }
         ]
         verifyHelper()
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.poll() } }
+        startSamplingTimer()
         poll()
+    }
+    private var powerGeneration = UUID()
+    private func prepareForSystemSleep() {
+        suspended = true
+        powerGeneration = UUID()
+        timer?.invalidate(); timer = nil
+        latestSnapshot = nil; sampleDate = nil; latestSamplePlan = nil
+        lastPollUptime = nil
+        restore()
+    }
+    private func resumeAfterSystemSleep() {
+        guard !powerObservers.isEmpty else { return }
+        suspended = false
+        queue.async { [weak self] in self?.reader.invalidateDiscovery() }
+        startSamplingTimer()
+        poll()
+    }
+    private func startSamplingTimer() {
+        guard timer == nil, !suspended else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pollIfDue() }
+        }
+        timer?.tolerance = 0.15
     }
     func shutdown(completion: @escaping @Sendable () -> Void = {}) {
         if let proxy = connection?.remoteObjectProxyWithErrorHandler({ _ in completion() }) as? FanHelperProtocol {
@@ -2808,10 +2866,25 @@ final class FanRuntime: NSObject {
     private var timer: Timer?
     private var closeObserver: NSObjectProtocol?
     private let fanCards = FanMonitoringCards()
-    private let sensorCards = FanMonitoringCards()
+    private var monitoringVisible = false
+    private var areaCards: [String: FanMonitoringCards] = [:]
+    private var areaButtons: [String: NSButton] = [:]
+    private var expandedAreas: Set<String> = []
+    private let sensorSections = NSStackView()
+    func setMonitoringVisible(_ visible: Bool) {
+        guard monitoringVisible != visible else { return }
+        monitoringVisible = visible
+        if visible { poll() }
+    }
+    @objc private func toggleArea(_ sender: NSButton) {
+        let area = sender.identifier!.rawValue
+        if sender.state == .on { expandedAreas.insert(area) } else { expandedAreas.remove(area) }
+        areaCards[area]?.isHidden = sender.state != .on
+        filterSensors(); poll()
+    }
     private let showOther = NSButton(checkboxWithTitle: "Show Other sensors", target: nil, action: nil)
     private let sensorSearch = NSSearchField()
-    @objc private func filterSensors() { if let snapshot = latestSnapshot { updateReadingCards(snapshot) } }
+    @objc private func filterSensors() { if monitoringVisible, let snapshot = latestSnapshot { updateReadingCards(snapshot) }; poll() }
 
     private var readingCards: [String: NSTextField] = [:]
     private let readings = NSTextField(wrappingLabelWithString: "Reading AppleSMC…")
@@ -2829,10 +2902,11 @@ final class FanRuntime: NSObject {
     private var connectionGeneration = UUID()
     private var applying = false
     var onSnapshot: ((FanSnapshot?) -> Void)?
-    func refreshEditors() { onSnapshot?(latestSnapshot); rulesChanged() }
+    func refreshEditors() { if monitoringVisible { onSnapshot?(latestSnapshot) }; rulesChanged() }
     private var acceptedDemands: [Int: Double] = [:]
     private var batchStatus = "Awaiting authenticated batch"
     var detectedFanIDs: [Int] { latestSnapshot?.fans.map(\.id) ?? [] }
+    private var latestSamplePlan: FanReadPlan?
     private var latestSnapshot: FanSnapshot?
     private var sampleDate: Date?
     func rulesChanged() {
@@ -2851,7 +2925,8 @@ final class FanRuntime: NSObject {
         monitoringView.translatesAutoresizingMaskIntoConstraints = false
         monitoringView.widthAnchor.constraint(equalToConstant: 680).isActive = true
         fanCards.translatesAutoresizingMaskIntoConstraints = false
-        sensorCards.translatesAutoresizingMaskIntoConstraints = false
+        sensorSections.orientation = .vertical; sensorSections.alignment = .leading
+        sensorSections.translatesAutoresizingMaskIntoConstraints = false
         readings.isSelectable = true
         let permissions = NSTextField(wrappingLabelWithString: "App updates include a new bundled helper. Update, reinstall, or uninstall below; only these buttons request administrator authorization. Accessibility permission does not grant fan access.")
         permissions.font = .systemFont(ofSize: 11)
@@ -2869,12 +2944,12 @@ final class FanRuntime: NSObject {
         sensorSearch.sendsSearchStringImmediately = true
         sensorSearch.widthAnchor.constraint(equalToConstant: 400).isActive = true
         let filters = NSStackView(views: [showOther, sensorSearch])
-        let stack = NSStackView(views: [readings, fanCards, filters, sensorCards, serviceStatus, helperVersions, state, permissions, actions, toggle])
+        let stack = NSStackView(views: [readings, fanCards, filters, sensorSections, serviceStatus, helperVersions, state, permissions, actions, toggle])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false; monitoringView.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: monitoringView.leadingAnchor), stack.trailingAnchor.constraint(equalTo: monitoringView.trailingAnchor), stack.topAnchor.constraint(equalTo: monitoringView.topAnchor), stack.bottomAnchor.constraint(equalTo: monitoringView.bottomAnchor)])
         fanCards.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        sensorCards.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        sensorSections.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         toggle.target = self; toggle.action = #selector(change); toggle.isEnabled = true
     }
     @objc private func change() {
@@ -2976,9 +3051,10 @@ final class FanRuntime: NSObject {
         snapshot.acceptedDemands = acceptedDemands
         snapshot.controlStatus = batchStatus
         latestSnapshot = snapshot
-        onSnapshot?(snapshot)
+        if monitoringVisible { onSnapshot?(snapshot) }
     }
     private func sendDemands(_ demands: [Int: Double]) {
+        let sampleVersion = controlSampleVersion.generation
         let generation = connectionGeneration
         batchStatus = "Awaiting authenticated batch acceptance"
         publishControl()
@@ -2990,7 +3066,7 @@ final class FanRuntime: NSObject {
         } as? FanHelperProtocol
         proxy?.applyDemands(Dictionary(uniqueKeysWithValues: demands.map { (String($0.key), $0.value) })) { @Sendable [weak self] response in
             DispatchQueue.main.async {
-                guard let self, self.connectionGeneration == generation else { return }
+                guard let self, self.connectionGeneration == generation, self.controlSampleVersion.accepts(sampleVersion) else { return }
                 if response == "ok" {
                     self.acceptedDemands = demands
                     self.batchStatus = "Authenticated batch accepted at \(Date().formatted(date: .omitted, time: .standard))"
@@ -3002,17 +3078,28 @@ final class FanRuntime: NSObject {
             }
         }
     }
+    private func publishUnavailable() { if monitoringVisible { onSnapshot?(nil) } }
     private var polling = false
     private func updateReadingCards(_ snapshot: FanSnapshot) {
-        readings.stringValue = snapshot.fans.isEmpty ? "No fans detected" : "Live monitoring"
+        let summary = snapshot.fans.isEmpty ? "No fans detected" : "Live monitoring"
+        if readings.stringValue != summary { readings.stringValue = summary }
         var values: [(String, String)] = snapshot.fans.map { fan in
             ("fan:\(fan.id)", "\(fan.name ?? "Fan \(fan.id)") · Actual \(Int(fan.current)) RPM · Target \(fan.target.map { String(Int($0)) } ?? "—") RPM\nMin \(Int(fan.minimum)) · Max \(Int(fan.maximum)) RPM · Mode readback: \(fan.manual.map { $0 ? "Manual" : "Automatic" } ?? "Unavailable")")
         }
+        for area in Set(snapshot.descriptors.values.map(\.area)).union(["Aggregates"]).sorted() where areaCards[area] == nil {
+            let button = NSButton(checkboxWithTitle: area, target: self, action: #selector(toggleArea(_:)))
+            button.identifier = NSUserInterfaceItemIdentifier(area)
+            let cards = FanMonitoringCards(); cards.translatesAutoresizingMaskIntoConstraints = false; cards.isHidden = true
+            areaCards[area] = cards; areaButtons[area] = button
+            sensorSections.addArrangedSubview(button); sensorSections.addArrangedSubview(cards)
+            cards.widthAnchor.constraint(equalTo: sensorSections.widthAnchor).isActive = true
+        }
+        for (area, button) in areaButtons { button.isHidden = area == "Other" && showOther.state != .on }
         let query = sensorSearch.stringValue.lowercased()
         let ordered = snapshot.descriptors.values.sorted { ($0.area, $0.displayName, $0.id) < ($1.area, $1.displayName, $1.id) }
         var displayedLogical = Set<String>()
         for descriptor in ordered {
-            guard descriptor.curated || showOther.state == .on else { continue }
+            guard expandedAreas.contains(descriptor.area), descriptor.curated || showOther.state == .on else { continue }
             let detail = "\(descriptor.area) · \(descriptor.displayName) · \(descriptor.id) · \(descriptor.source)"
             guard query.isEmpty || detail.lowercased().contains(query) else { continue }
             let identity = descriptor.source + ":" + descriptor.rawKey
@@ -3020,9 +3107,9 @@ final class FanRuntime: NSObject {
             let fresh = snapshot.temperatures.filter { snapshot.descriptors[$0.key]?.source == descriptor.source && snapshot.descriptors[$0.key]?.rawKey == descriptor.rawKey }.values.max()
             values.append(("sensor:" + descriptor.id, detail + " · " + (fresh.map { String(format: "%.1f °C", $0) } ?? "Unavailable")))
         }
-        for key in ["Highest CPU", "Average CPU", "Highest GPU", "Average GPU", "Highest Computer", "Average Computer"] {
-            if query.isEmpty || key.lowercased().contains(query) {
-                values.insert(("aggregate:" + key, key + " · " + (snapshot.ruleReadings[key].map { String(format: "%.1f °C", $0) } ?? "Unavailable")), at: min(snapshot.fans.count, values.count))
+        if expandedAreas.contains("Aggregates") {
+            for key in ["Highest CPU", "Average CPU", "Highest GPU", "Average GPU", "Highest Computer", "Average Computer"] where query.isEmpty || key.lowercased().contains(query) {
+                values.append(("aggregate:" + key, key + " · " + ((latestSamplePlan?.areas.contains("Aggregates") == true ? snapshot.ruleReadings[key] : nil).map { String(format: "%.1f °C", $0) } ?? "Unavailable")))
             }
         }
         let keys = Set(values.map { $0.0 })
@@ -3040,29 +3127,57 @@ final class FanRuntime: NSObject {
                 card.translatesAutoresizingMaskIntoConstraints = true
                 readingCards[key] = card
             }
-            card.stringValue = value; card.toolTip = value; card.setAccessibilityLabel(value)
+            if card.stringValue != value { card.stringValue = value; card.toolTip = value; card.setAccessibilityLabel(value) }
         }
         fanCards.setCards(values.filter { $0.0.hasPrefix("fan:") }.compactMap { readingCards[$0.0] })
-        sensorCards.setCards(values.filter { !$0.0.hasPrefix("fan:") }.compactMap { readingCards[$0.0] })
+        for (area, cards) in areaCards {
+            cards.isHidden = !expandedAreas.contains(area) || (area == "Other" && showOther.state != .on)
+            cards.setCards(values.filter { item in
+                (area == "Aggregates" && item.0.hasPrefix("aggregate:")) || (item.0.hasPrefix("sensor:") && snapshot.descriptors[String(item.0.dropFirst(7))]?.area == area)
+            }.compactMap { readingCards[$0.0] })
+        }
     }
 
+    private func currentReadPlan() -> FanReadPlan {
+        let visibleAreas = expandedAreas.subtracting(showOther.state == .on ? [] : ["Other"])
+        return FanReadPlan(settings: settings, monitoring: monitoringVisible, areas: visibleAreas)
+    }
+    private var lastPollUptime: TimeInterval?
+    private func pollIfDue() {
+        let plan = currentReadPlan()
+        // Keep control samples comfortably inside the three-second freshness limit.
+        // Read-only monitoring can refresh less often; user actions still poll immediately.
+        let now = ProcessInfo.processInfo.systemUptime
+        guard !plan.sensors.isEmpty || lastPollUptime.map({ now - $0 >= 1.8 }) ?? true else { return }
+        poll()
+    }
     private func poll() {
-        guard !polling, !suspended else { return }; polling = true
+        let plan = currentReadPlan()
+        let version = controlSampleVersion.generation
+        let powerVersion = powerGeneration
+        let started = Date()
+        guard !polling, !suspended, plan.needsSample else { return }; polling = true
+        lastPollUptime = ProcessInfo.processInfo.systemUptime
         queue.async { [weak self] in
             guard let self else { return }
             // Storage is touched only by this queue; no main-thread IOKit calls.
-            let result = Result { try self.reader.snapshot() }
+            let result = Result { try self.reader.snapshot(plan: plan) }
             DispatchQueue.main.async {
                 self.polling = false
-                guard self.timer != nil else { return }
+                guard self.timer != nil, !self.suspended else { return }
+                guard powerVersion == self.powerGeneration,
+                      self.controlSampleVersion.accepts(version), plan == self.currentReadPlan() else {
+                    self.poll(); return
+                }
                 switch result {
                 case let .success(snapshot):
-                    self.updateReadingCards(snapshot)
-                    self.latestSnapshot = snapshot; self.sampleDate = Date()
-                    self.onSnapshot?(snapshot); self.rulesChanged()
+                    self.latestSamplePlan = plan
+                    if self.monitoringVisible { self.updateReadingCards(snapshot) }
+                    self.latestSnapshot = snapshot; self.sampleDate = started
+                    if self.monitoringVisible { self.onSnapshot?(snapshot) }; self.rulesChanged()
                 case let .failure(error):
-                    if var unavailable = self.latestSnapshot { unavailable.temperatures = [:]; self.updateReadingCards(unavailable) }
-                    self.latestSnapshot = nil; self.sampleDate = nil; self.onSnapshot?(nil); self.readings.stringValue = error.localizedDescription; self.restore()
+                    if self.monitoringVisible, var unavailable = self.latestSnapshot { unavailable.temperatures = [:]; self.updateReadingCards(unavailable) }
+                    self.latestSnapshot = nil; self.sampleDate = nil; self.publishUnavailable(); self.readings.stringValue = error.localizedDescription; self.restore()
                 }
             }
         }
@@ -3076,7 +3191,7 @@ private final class FanSMCReader: @unchecked Sendable {
     private var enumeratedAt: TimeInterval = 0
     private var keyCount: Double?
     func invalidateDiscovery() { enumeratedAt = 0 }
-    func snapshot() throws -> FanSnapshot {
+    func snapshot(plan: FanReadPlan) throws -> FanSnapshot {
         if smc == nil { smc = try AppleSMC() }
         let opened = smc!
         let now = ProcessInfo.processInfo.systemUptime
@@ -3088,8 +3203,11 @@ private final class FanSMCReader: @unchecked Sendable {
             }
             keyCount = count; enumeratedAt = now
         }
-        var result = try SMCMonitor.snapshot(io: opened, temperatureKeys: keys)
-        result.temperatures.merge(FanHIDReader.read()) { smc, _ in smc }
+        registry.discover(keys: keys)
+        let hid = FanHIDReader.read(plan: plan)
+        registry.discover(keys: hid.keys)
+        var result = try SMCMonitor.snapshot(io: opened, temperatureKeys: plan.keys(in: registry.descriptors).filter { !$0.hasPrefix("HID:") })
+        result.temperatures.merge(hid.values) { smc, _ in smc }
         registry.update(&result)
         return result
     }
@@ -3097,8 +3215,8 @@ private final class FanSMCReader: @unchecked Sendable {
 
 /// Optional read-only private API. Each sample owns its client and all returned CF objects.
 private enum FanHIDReader {
-    static func read() -> [String: Double] {
-        guard let library = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY) else { return [:] }
+    static func read(plan: FanReadPlan) -> (keys: [String], values: [String: Double]) {
+        guard let library = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY) else { return ([], [:]) }
         defer { dlclose(library) }
         func symbol<T>(_ name: String, as type: T.Type) -> T? {
             dlsym(library, name).map { unsafeBitCast($0, to: type) }
@@ -3115,20 +3233,24 @@ private enum FanHIDReader {
               let property = symbol("IOHIDServiceClientCopyProperty", as: Property.self),
               let event = symbol("IOHIDServiceClientCopyEvent", as: Event.self),
               let value = symbol("IOHIDEventGetFloatValue", as: Value.self),
-              let client = create(nil)?.takeRetainedValue() else { return [:] }
+              let client = create(nil)?.takeRetainedValue() else { return ([], [:]) }
         match(client, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
-        guard let array = services(client)?.takeRetainedValue() else { return [:] }
+        guard let array = services(client)?.takeRetainedValue() else { return ([], [:]) }
+        var discovered: [String] = []
         var samples: [(product: String, location: String?, value: Double)] = []
         for service in (array as [AnyObject]) {
             guard let product = property(service, "Product" as CFString)?.takeRetainedValue() as? String,
-                  !product.isEmpty,
+                  !product.isEmpty else { continue }
+            let location = property(service, "LocationID" as CFString)?.takeRetainedValue() as? NSNumber
+            let key = "HID:\(product):\(location?.stringValue ?? "unknown")"
+            discovered.append(key)
+            guard let descriptor = FanSensorMetadata.descriptors(keys: [key])[key], plan.includes(descriptor),
                   let sample = event(service, 15, 0, 0)?.takeRetainedValue() else { continue }
             let temperature = value(sample, 15 << 16)
             guard FanSensorMetadata.valid(temperature) else { continue }
-            let location = property(service, "LocationID" as CFString)?.takeRetainedValue() as? NSNumber
             samples.append((product, location?.stringValue, temperature))
         }
-        return FanSensorMetadata.mergeHID(samples)
+        return (discovered, FanSensorMetadata.mergeHID(samples))
     }
 }
 
