@@ -2802,6 +2802,26 @@ private final class FanCurveEditor: NSView {
 final class FanRuntime: NSObject {
     let monitoringView = NSView()
     var onEnabledChange: ((Bool) -> Void)?
+    private let refreshIntervalPicker = NSPopUpButton()
+    private var monitoringInterval: TimeInterval {
+        let value = UserDefaults.standard.double(forKey: "fanMonitoringRefreshInterval")
+        return [1.0, 2.0, 5.0, 10.0].contains(value) ? value : 2
+    }
+    private let controlIntervalPicker = NSPopUpButton()
+    private var controlInterval: TimeInterval {
+        let value = UserDefaults.standard.double(forKey: "fanControlSamplingInterval")
+        return [1.0, 2.0].contains(value) ? value : 1
+    }
+    @objc private func changeControlInterval() {
+        UserDefaults.standard.set(Double(controlIntervalPicker.selectedTag()), forKey: "fanControlSamplingInterval")
+        poll()
+    }
+    private var lastMonitoringUpdate: TimeInterval?
+    @objc private func changeRefreshInterval() {
+        UserDefaults.standard.set(Double(refreshIntervalPicker.selectedTag()), forKey: "fanMonitoringRefreshInterval")
+        lastMonitoringUpdate = nil
+        poll()
+    }
     private var settings = FanSettings()
     private var suspended = false
     private var powerObservers: [NSObjectProtocol] = []
@@ -2874,12 +2894,13 @@ final class FanRuntime: NSObject {
     func setMonitoringVisible(_ visible: Bool) {
         guard monitoringVisible != visible else { return }
         monitoringVisible = visible
-        if visible { poll() }
+        if visible { lastMonitoringUpdate = nil; poll() }
     }
     @objc private func toggleArea(_ sender: NSButton) {
         let area = sender.identifier!.rawValue
         if sender.state == .on { expandedAreas.insert(area) } else { expandedAreas.remove(area) }
         areaCards[area]?.isHidden = sender.state != .on
+        lastMonitoringUpdate = nil
         filterSensors(); poll()
     }
     private let showOther = NSButton(checkboxWithTitle: "Show Other sensors", target: nil, action: nil)
@@ -2943,8 +2964,27 @@ final class FanRuntime: NSObject {
         sensorSearch.target = self; sensorSearch.action = #selector(filterSensors)
         sensorSearch.sendsSearchStringImmediately = true
         sensorSearch.widthAnchor.constraint(equalToConstant: 400).isActive = true
+        for seconds in [1, 2, 5, 10] {
+            refreshIntervalPicker.addItem(withTitle: "Every \(seconds) s")
+            refreshIntervalPicker.lastItem?.tag = seconds
+        }
+        refreshIntervalPicker.selectItem(withTag: Int(monitoringInterval))
+        refreshIntervalPicker.target = self
+        refreshIntervalPicker.action = #selector(changeRefreshInterval)
+        refreshIntervalPicker.setAccessibilityLabel("Monitoring refresh interval")
+        let refreshRow = NSStackView(views: [NSTextField(labelWithString: "Monitoring refresh"), refreshIntervalPicker])
+        for seconds in [1, 2] {
+            controlIntervalPicker.addItem(withTitle: "Every \(seconds) s")
+            controlIntervalPicker.lastItem?.tag = seconds
+        }
+        controlIntervalPicker.selectItem(withTag: Int(controlInterval))
+        controlIntervalPicker.target = self
+        controlIntervalPicker.action = #selector(changeControlInterval)
+        controlIntervalPicker.setAccessibilityLabel("Background control sampling interval")
+        controlIntervalPicker.toolTip = "Used while enabled rules run. Visible monitoring may require faster sampling."
+        let controlRow = NSStackView(views: [NSTextField(labelWithString: "Background control sampling"), controlIntervalPicker])
         let filters = NSStackView(views: [showOther, sensorSearch])
-        let stack = NSStackView(views: [readings, fanCards, filters, sensorSections, serviceStatus, helperVersions, state, permissions, actions, toggle])
+        let stack = NSStackView(views: [refreshRow, controlRow, readings, fanCards, filters, sensorSections, serviceStatus, helperVersions, state, permissions, actions, toggle])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false; monitoringView.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: monitoringView.leadingAnchor), stack.trailingAnchor.constraint(equalTo: monitoringView.trailingAnchor), stack.topAnchor.constraint(equalTo: monitoringView.topAnchor), stack.bottomAnchor.constraint(equalTo: monitoringView.bottomAnchor)])
@@ -3051,7 +3091,8 @@ final class FanRuntime: NSObject {
         snapshot.acceptedDemands = acceptedDemands
         snapshot.controlStatus = batchStatus
         latestSnapshot = snapshot
-        if monitoringVisible { onSnapshot?(snapshot) }
+        // Control acknowledgements update state independently; live editors refresh
+        // with the next monitoring tick at the user's selected interval.
     }
     private func sendDemands(_ demands: [Int: Double]) {
         let sampleVersion = controlSampleVersion.generation
@@ -3148,7 +3189,11 @@ final class FanRuntime: NSObject {
         // Keep control samples comfortably inside the three-second freshness limit.
         // Read-only monitoring can refresh less often; user actions still poll immediately.
         let now = ProcessInfo.processInfo.systemUptime
-        guard !plan.sensors.isEmpty || lastPollUptime.map({ now - $0 >= 1.8 }) ?? true else { return }
+        guard plan.needsSample else { return }
+        let monitoringDemand = monitoringVisible ? monitoringInterval : TimeInterval.infinity
+        let controlDemand = plan.sensors.isEmpty ? TimeInterval.infinity : controlInterval
+        let interval = min(monitoringDemand, controlDemand)
+        guard lastPollUptime.map({ now - $0 >= interval - 0.2 }) ?? true else { return }
         poll()
     }
     private func poll() {
@@ -3172,9 +3217,15 @@ final class FanRuntime: NSObject {
                 switch result {
                 case let .success(snapshot):
                     self.latestSamplePlan = plan
-                    if self.monitoringVisible { self.updateReadingCards(snapshot) }
+                    let now = ProcessInfo.processInfo.systemUptime
+                    let refreshMonitoring = self.monitoringVisible && (self.lastMonitoringUpdate.map { now - $0 >= self.monitoringInterval - 0.2 } ?? true)
                     self.latestSnapshot = snapshot; self.sampleDate = started
-                    if self.monitoringVisible { self.onSnapshot?(snapshot) }; self.rulesChanged()
+                    if refreshMonitoring {
+                        self.lastMonitoringUpdate = now
+                        self.updateReadingCards(snapshot)
+                        self.onSnapshot?(snapshot)
+                    }
+                    self.rulesChanged()
                 case let .failure(error):
                     if self.monitoringVisible, var unavailable = self.latestSnapshot { unavailable.temperatures = [:]; self.updateReadingCards(unavailable) }
                     self.latestSnapshot = nil; self.sampleDate = nil; self.publishUnavailable(); self.readings.stringValue = error.localizedDescription; self.restore()
