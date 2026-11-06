@@ -44,6 +44,13 @@
 		1A0001250000000000000001 /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002060000000000000001 /* ApplicationServices.framework */; };
 		1A0001260000000000000001 /* CoreVideo.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A0002090000000000000001 /* CoreVideo.framework */; };
 		FA0000010000000000000001 /* FanHardware.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA0000020000000000000001 /* FanHardware.swift */; };
+		CA0001010000000000000001 /* CaptureMediaModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA0000010000000000000001 /* CaptureMediaModels.swift */; };
+		CA0001020000000000000001 /* CaptureAnnotationRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA0000020000000000000001 /* CaptureAnnotationRenderer.swift */; };
+		CA0001030000000000000001 /* ScreenshotCaptureController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA0000030000000000000001 /* ScreenshotCaptureController.swift */; };
+		CA0001040000000000000001 /* ScreenRecordingController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA0000040000000000000001 /* ScreenRecordingController.swift */; };
+		CA0001050000000000000001 /* CaptureMediaModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA0000050000000000000001 /* CaptureMediaModelsTests.swift */; };
+		CA0001060000000000000001 /* ScreenCaptureKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CA0000060000000000000001 /* ScreenCaptureKit.framework */; };
+		CA0001070000000000000001 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CA0000070000000000000001 /* AVFoundation.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -143,6 +150,13 @@
 		1A0002080000000000000001 /* libMacToolsMacOS.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libMacToolsMacOS.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0002090000000000000001 /* CoreVideo.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreVideo.framework; path = System/Library/Frameworks/CoreVideo.framework; sourceTree = SDKROOT; };
 		FA0000020000000000000001 /* FanHardware.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FanHardware.swift; sourceTree = "<group>"; };
+		CA0000010000000000000001 /* CaptureMediaModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureMediaModels.swift; sourceTree = "<group>"; };
+		CA0000020000000000000001 /* CaptureAnnotationRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureAnnotationRenderer.swift; sourceTree = "<group>"; };
+		CA0000030000000000000001 /* ScreenshotCaptureController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotCaptureController.swift; sourceTree = "<group>"; };
+		CA0000040000000000000001 /* ScreenRecordingController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenRecordingController.swift; sourceTree = "<group>"; };
+		CA0000050000000000000001 /* CaptureMediaModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureMediaModelsTests.swift; sourceTree = "<group>"; };
+		CA0000060000000000000001 /* ScreenCaptureKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ScreenCaptureKit.framework; path = System/Library/Frameworks/ScreenCaptureKit.framework; sourceTree = SDKROOT; };
+		CA0000070000000000000001 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -156,6 +170,8 @@
 				1A0001050000000000000001 /* libMacToolsCore.a in Frameworks */,
 				1A0001060000000000000001 /* libMacToolsScripting.a in Frameworks */,
 				1A00011E0000000000000001 /* libMacToolsMacOS.a in Frameworks */,
+				CA0001060000000000000001 /* ScreenCaptureKit.framework in Frameworks */,
+				CA0001070000000000000001 /* AVFoundation.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -231,6 +247,8 @@
 				1A00000F0000000000000001 /* MenuBarVisibilityController.swift */,
 				1A0000110000000000000001 /* SmoothScrollController.swift */,
 				1A0000130000000000000001 /* SettingsWindowController.swift */,
+				CA0000030000000000000001 /* ScreenshotCaptureController.swift */,
+				CA0000040000000000000001 /* ScreenRecordingController.swift */,
 				1A00000B0000000000000001 /* Resources/Assets.xcassets */,
 			);
 			path = MacToolsApp;
@@ -246,6 +264,8 @@
                 FA0000020000000000000001 /* FanHardware.swift */,
 				1A0000090000000000000001 /* UserConfigurationStore.swift */,
 				1A0000100000000000000001 /* SmoothScrollModels.swift */,
+				CA0000010000000000000001 /* CaptureMediaModels.swift */,
+				CA0000020000000000000001 /* CaptureAnnotationRenderer.swift */,
 			);
 			path = MacToolsCore;
 			sourceTree = "<group>";
@@ -286,6 +306,7 @@
 				1A00000A0000000000000001 /* UserConfigurationStoreTests.swift */,
 				1A00000E0000000000000001 /* WindowAbsenceConfirmationTests.swift */,
 				1A0000120000000000000001 /* SmoothScrollEngineTests.swift */,
+				CA0000050000000000000001 /* CaptureMediaModelsTests.swift */,
 			);
 			path = MacToolsCoreTests;
 			sourceTree = "<group>";
@@ -297,6 +318,8 @@
 				1A0002060000000000000001 /* ApplicationServices.framework */,
 				1A0002070000000000000001 /* Carbon.framework */,
 				1A0002090000000000000001 /* CoreVideo.framework */,
+				CA0000060000000000000001 /* ScreenCaptureKit.framework */,
+				CA0000070000000000000001 /* AVFoundation.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -489,6 +512,8 @@
                 "$(SRCROOT)/Sources/MacToolsCore/SystemPermissions.swift",
                 "$(SRCROOT)/Sources/MacToolsCore/UserConfiguration.swift",
                 "$(SRCROOT)/Sources/MacToolsCore/UserConfigurationStore.swift",
+                "$(SRCROOT)/Sources/MacToolsCore/CaptureMediaModels.swift",
+                "$(SRCROOT)/Sources/MacToolsCore/CaptureAnnotationRenderer.swift",
             );
             outputPaths = ("$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchServices/TSMacToolsFanHelper",);
             name = "Build and embed signed fan helper";
@@ -509,6 +534,8 @@
 				1A0001170000000000000001 /* MenuBarVisibilityController.swift in Sources */,
 				1A0001190000000000000001 /* SmoothScrollController.swift in Sources */,
 				1A00011B0000000000000001 /* SettingsWindowController.swift in Sources */,
+				CA0001030000000000000001 /* ScreenshotCaptureController.swift in Sources */,
+				CA0001040000000000000001 /* ScreenRecordingController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -523,6 +550,8 @@
                 FA0000010000000000000001 /* FanHardware.swift in Sources */,
 				1A0001100000000000000001 /* UserConfigurationStore.swift in Sources */,
 				1A0001180000000000000001 /* SmoothScrollModels.swift in Sources */,
+				CA0001010000000000000001 /* CaptureMediaModels.swift in Sources */,
+				CA0001020000000000000001 /* CaptureAnnotationRenderer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -543,6 +572,7 @@
 				1A0001160000000000000001 /* WindowAbsenceConfirmationTests.swift in Sources */,
 				1A00011A0000000000000001 /* SmoothScrollEngineTests.swift in Sources */,
 				1A00011D0000000000000001 /* SmoothScrollControllerTests.swift in Sources */,
+				CA0001050000000000000001 /* CaptureMediaModelsTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -719,6 +749,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Sources/MacToolsApp/TSMacTools.entitlements;
 				CODE_SIGN_IDENTITY = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
 				CODE_SIGN_STYLE = Manual;
@@ -747,6 +778,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Sources/MacToolsApp/TSMacTools.entitlements;
 				CODE_SIGN_IDENTITY = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "85B37EA8D5B9719CB5F443613573AD1F4986B17B";
 				CODE_SIGN_STYLE = Manual;

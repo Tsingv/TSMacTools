@@ -200,8 +200,42 @@
         "alt",
         "ctrl"
       ]
+    },
+    {
+      "action": {
+        "kind": "captureScreenshot"
+      },
+      "key": "P",
+      "modifiers": [
+        "alt"
+      ]
+    },
+    {
+      "action": {
+        "kind": "toggleScreenRecording"
+      },
+      "key": "G",
+      "modifiers": [
+        "alt"
+      ]
     }
   ],
+
+  // Screenshot annotation and energy-first screen recording.
+  // Screenshots freeze and dim the display, then allow region adjust plus arrow/box/circle/mosaic/sequence/text annotations.
+  // Return or ⌘C copies the annotated image; Save writes a PNG. Recording defaults prefer low FPS and capped resolution.
+  "capture": {
+    "screenshotSaveDirectory": "~/Pictures/TSMacTools/Screenshots",
+    "recordingSaveDirectory": "~/Movies/TSMacTools/Recordings",
+    "copyScreenshotToClipboard": true,
+    "saveScreenshotToDisk": true,
+    "recordingResolution": "energy", // "energy" (<=1280), "balanced" (<=1920), or "native".
+    "recordingFrameRate": 15, // 8...30. Lower values use less power.
+    "recordingBitrateKbps": 2500, // 800...20000.
+    "captureSystemAudio": true,
+    "captureMicrophone": false, // Requests mic permission; mixed mic tracks remain deferred for power.
+    "showMouseCursorInRecording": true
+  },
 
   // Mouse-wheel smoothing. Trackpad/Magic Mouse gestures and already-continuous remote-desktop
   // events bypass this path by default; Logitech Options wheel metadata is treated as mouse input.

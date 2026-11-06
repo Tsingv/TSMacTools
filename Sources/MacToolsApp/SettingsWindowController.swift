@@ -114,12 +114,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case requestTokenLimit
         case apiKey
         case googleAPIKey
+        case screenshotSaveDirectory
+        case recordingSaveDirectory
+        case recordingFrameRate
+        case recordingBitrateKbps
     }
 
     private enum Page: Int, CaseIterable {
         case general
         case hotkeys
         case scrolling
+        case capture
         case fans
 
         var title: String {
@@ -127,6 +132,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             case .general: "General"
             case .hotkeys: "Hotkeys"
             case .scrolling: "Scrolling"
+            case .capture: "Capture"
             case .fans: "Fans"
             }
         }
@@ -136,6 +142,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             case .general: "gearshape"
             case .hotkeys: "keyboard"
             case .scrolling: "scroll"
+            case .capture: "camera.viewfinder"
             case .fans: "fan"
             }
         }
@@ -271,7 +278,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         pageBar.alignment = .centerY
         pageBar.distribution = .fillEqually
         pageBar.spacing = 8
-        pageBar.edgeInsets = NSEdgeInsets(top: 8, left: 160, bottom: 6, right: 160)
+        pageBar.edgeInsets = NSEdgeInsets(top: 8, left: 96, bottom: 6, right: 96)
         pageBar.translatesAutoresizingMaskIntoConstraints = false
 
         for page in Page.allCases {
@@ -486,6 +493,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .general: makeGeneralPage()
         case .hotkeys: makeHotkeysPage()
         case .scrolling: makeScrollingPage()
+        case .capture: makeCapturePage()
         case .fans: makeFansPage()
         }
     }
@@ -873,6 +881,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             .simulateKeystroke,
             .runScript,
             .translateSelection,
+            .captureScreenshot,
+            .toggleScreenRecording,
             .showFocusedWindowInfo,
             .reloadConfiguration,
             .toggleFinder,
@@ -895,6 +905,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .simulateKeystroke: "Simulate Keystroke"
         case .runScript: "Run Python Script"
         case .translateSelection: "Translate Selection"
+        case .captureScreenshot: "Capture Screenshot"
+        case .toggleScreenRecording: "Toggle Screen Recording"
         case .showFocusedWindowInfo: "Focused Window Info"
         case .reloadConfiguration: "Reload Configuration"
         case .toggleFinder: "Toggle Finder"
@@ -1021,6 +1033,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .simulateKeystroke: "keyboard.badge.ellipsis"
         case .runScript: "terminal"
         case .translateSelection: "character.bubble"
+        case .captureScreenshot: "camera.viewfinder"
+        case .toggleScreenRecording: "record.circle"
         case .showFocusedWindowInfo: "info.window"
         case .reloadConfiguration: "arrow.clockwise"
         case .toggleFinder: "folder"
@@ -1130,6 +1144,253 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             latest.hotkeys.remove(at: latestIndex)
         }) {
             reloadHotkeyTable()
+        }
+    }
+
+    private func makeCapturePage() -> NSView {
+        let stack = pageStack()
+        var deps: [ConditionalRow] = []
+        let capture = configuration.capture.sanitized
+
+        stack.addArrangedSubview(section(header: "Screenshot", rows: [
+            (formRow(
+                title: "Save directory",
+                hint: "PNG files are written here when Save is used.",
+                control: directoryPicker(capture.screenshotSaveDirectory, field: .screenshotSaveDirectory)
+            ), nil),
+            (formRow(
+                title: "Copy by default",
+                hint: "Return and ⌘C still copy even when this is off.",
+                control: boolSwitch(tag: 30, on: capture.copyScreenshotToClipboard, action: #selector(toggleCopyScreenshot))
+            ), nil),
+            (formRow(
+                title: "Save to disk",
+                hint: "Used by the Save button after annotation.",
+                control: boolSwitch(tag: 31, on: capture.saveScreenshotToDisk, action: #selector(toggleSaveScreenshot))
+            ), nil)
+        ], into: &deps))
+
+        let resolution = NSPopUpButton(frame: .zero, pullsDown: false)
+        resolution.controlSize = .small
+        for option in CaptureMediaSettings.RecordingResolution.allCases {
+            resolution.addItem(withTitle: option.displayName)
+            resolution.lastItem?.representedObject = option.rawValue
+        }
+        resolution.selectItem(withTitle: capture.recordingResolution.displayName)
+        resolution.target = self
+        resolution.action = #selector(changeRecordingResolution(_:))
+        resolution.widthAnchor.constraint(equalToConstant: 170).isActive = true
+
+        stack.addArrangedSubview(section(header: "Screen Recording", rows: [
+            (formRow(
+                title: "Save directory",
+                hint: "MP4 recordings are written here.",
+                control: directoryPicker(capture.recordingSaveDirectory, field: .recordingSaveDirectory)
+            ), nil),
+            (formRow(
+                title: "Resolution",
+                hint: "Energy caps the long edge near 1280 px.",
+                control: resolution
+            ), nil),
+            (formRow(
+                title: "Frame rate",
+                hint: "8…30 fps. Lower values use less power.",
+                control: editableField(String(capture.recordingFrameRate), field: .recordingFrameRate, width: 90)
+            ), nil),
+            (formRow(
+                title: "Bitrate (kbps)",
+                hint: "800…20000. Keep this modest for long recordings.",
+                control: editableField(String(capture.recordingBitrateKbps), field: .recordingBitrateKbps, width: 90)
+            ), nil),
+            (formRow(
+                title: "System audio",
+                hint: "Requires Screen Recording permission.",
+                control: boolSwitch(tag: 32, on: capture.captureSystemAudio, action: #selector(toggleSystemAudio))
+            ), nil),
+            (formRow(
+                title: "Microphone",
+                hint: "Turning this on shows the system Allow dialog. TSMacTools only appears in System Settings after that prompt; it cannot be added manually.",
+                control: microphoneControls(on: capture.captureMicrophone)
+            ), nil),
+            (formRow(
+                title: "Show cursor",
+                hint: "Include the pointer in recorded frames.",
+                control: boolSwitch(tag: 34, on: capture.showMouseCursorInRecording, action: #selector(toggleRecordingCursor))
+            ), nil)
+        ], into: &deps))
+
+        stack.addArrangedSubview(note("Defaults: ⌥P screenshot, ⌥G toggle recording. Recording prefers low FPS, capped resolution, H.264 Baseline, and shallow capture queues."))
+        conditionalRows[.capture] = deps
+        return scrollable(stack)
+    }
+
+    @objc private func toggleCopyScreenshot(_ sender: NSSwitch) {
+        let value = sender.state == .on
+        configuration.capture.copyScreenshotToClipboard = value
+        persist { $0.capture.copyScreenshotToClipboard = value }
+    }
+
+    @objc private func toggleSaveScreenshot(_ sender: NSSwitch) {
+        let value = sender.state == .on
+        configuration.capture.saveScreenshotToDisk = value
+        persist { $0.capture.saveScreenshotToDisk = value }
+    }
+
+    @objc private func toggleSystemAudio(_ sender: NSSwitch) {
+        let value = sender.state == .on
+        configuration.capture.captureSystemAudio = value
+        persist { $0.capture.captureSystemAudio = value }
+    }
+
+    private func microphoneControls(on: Bool) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.alignment = .centerY
+        let toggle = boolSwitch(tag: 33, on: on, action: #selector(toggleMicrophone))
+        let request = NSButton(title: "Request Access...", target: self, action: #selector(requestMicrophoneAccess))
+        request.bezelStyle = .rounded
+        request.controlSize = .small
+        row.addArrangedSubview(toggle)
+        row.addArrangedSubview(request)
+        return row
+    }
+
+    @objc private func toggleMicrophone(_ sender: NSSwitch) {
+        let value = sender.state == .on
+        configuration.capture.captureMicrophone = value
+        persist { $0.capture.captureMicrophone = value }
+        if value {
+            Task { @MainActor in
+                await promptForMicrophoneAccess()
+            }
+        }
+    }
+
+    @objc private func requestMicrophoneAccess() {
+        Task { @MainActor in
+            await promptForMicrophoneAccess()
+        }
+    }
+
+    @MainActor
+    private func promptForMicrophoneAccess() async {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        // Yield so activation finishes before TCC evaluates the frontmost app.
+        await Task.yield()
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        let prior = MicrophonePermission.authorizationState()
+        if prior == .authorized {
+            TransientAlertPresenter.shared.show(
+                title: "Microphone Ready",
+                body: "TSMacTools already has Microphone access (state=\(prior.displayName))."
+            )
+            return
+        }
+
+        if prior == .denied || prior == .restricted {
+            let alert = NSAlert()
+            alert.messageText = "Microphone Still \(prior.displayName.capitalized)"
+            alert.informativeText =
+                "macOS still reports \(prior.displayName) for this process, so System Settings will not offer an Add button.\n\n1. Fully quit TSMacTools (status item ▸ Quit)\n2. Run: tccutil reset Microphone local.clearain.MacTools\n3. Relaunch this same app binary\n4. Click Request Access... again and choose Allow on the system dialog\n\nOpening Settings alone cannot register the app."
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Open Settings Anyway")
+            if alert.runModal() == .alertSecondButtonReturn {
+                openMicrophoneSettings()
+            }
+            return
+        }
+
+        let granted = await MicrophonePermission.requestAccess()
+        let after = MicrophonePermission.authorizationState()
+        if granted || after == .authorized {
+            if !configuration.capture.captureMicrophone {
+                configuration.capture.captureMicrophone = true
+                persist { $0.capture.captureMicrophone = true }
+                showPage(.capture, rebuild: true, animated: false)
+            }
+            TransientAlertPresenter.shared.show(
+                title: "Microphone Allowed",
+                body: "Microphone access is enabled for TSMacTools."
+            )
+            return
+        }
+
+        let alert = NSAlert()
+        switch after {
+        case .denied, .restricted:
+            alert.messageText = "Microphone Access \(after.displayName.capitalized)"
+            alert.informativeText =
+                "The system dialog returned \(after.displayName). TSMacTools should now appear under System Settings ▸ Privacy & Security ▸ Microphone. If it still does not, quit the app and request again after `tccutil reset Microphone local.clearain.MacTools`."
+            alert.addButton(withTitle: "Open System Settings")
+            alert.addButton(withTitle: "OK")
+            if alert.runModal() == .alertFirstButtonReturn {
+                openMicrophoneSettings()
+            }
+        case .notDetermined, .unknown, .authorized:
+            alert.messageText = "Microphone Dialog Did Not Appear"
+            alert.informativeText =
+                "TCC state is still \(after.displayName), so System Settings will stay empty. Keep TSMacTools frontmost, click Request Access... again, and watch for the Allow dialog. Do not expect a manual Add button in Settings."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+    }
+
+    private func openMicrophoneSettings() {
+        let candidates = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone"
+        ]
+        for candidate in candidates {
+            if let url = URL(string: candidate), NSWorkspace.shared.open(url) {
+                return
+            }
+        }
+    }
+
+    @objc private func toggleRecordingCursor(_ sender: NSSwitch) {
+        let value = sender.state == .on
+        configuration.capture.showMouseCursorInRecording = value
+        persist { $0.capture.showMouseCursorInRecording = value }
+    }
+
+    @objc private func changeRecordingResolution(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let value = CaptureMediaSettings.RecordingResolution(rawValue: raw) else { return }
+        configuration.capture.recordingResolution = value
+        persist { $0.capture.recordingResolution = value }
+    }
+
+    private func directoryPicker(_ value: String, field: ConfigurationField) -> NSButton {
+        let button = NSButton(title: value, target: self, action: #selector(chooseDirectory(_:)))
+        button.tag = field.rawValue
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+        button.imagePosition = .imageLeading
+        button.toolTip = value
+        button.lineBreakMode = .byTruncatingMiddle
+        button.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        return button
+    }
+
+    @objc private func chooseDirectory(_ sender: NSButton) {
+        guard let field = ConfigurationField(rawValue: sender.tag) else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: displayedValue(for: field), isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try persistTextValue(url.path, for: field)
+            sender.title = url.path
+            sender.toolTip = url.path
+        } catch {
+            didFail(error)
         }
     }
 
@@ -1362,6 +1623,30 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .googleAPIKey:
             configuration.translation.googleApiKey = rawValue
             persist { $0.translation.googleApiKey = rawValue }
+        case .screenshotSaveDirectory:
+            let value = try requiredText(rawValue, name: "Screenshot save directory")
+            configuration.capture.screenshotSaveDirectory = value
+            persist { $0.capture.screenshotSaveDirectory = value }
+        case .recordingSaveDirectory:
+            let value = try requiredText(rawValue, name: "Recording save directory")
+            configuration.capture.recordingSaveDirectory = value
+            persist { $0.capture.recordingSaveDirectory = value }
+        case .recordingFrameRate:
+            let value = try boundedInt(
+                rawValue,
+                name: "Frame rate",
+                range: CaptureMediaSettings.frameRateRange
+            )
+            configuration.capture.recordingFrameRate = value
+            persist { $0.capture.recordingFrameRate = value }
+        case .recordingBitrateKbps:
+            let value = try boundedInt(
+                rawValue,
+                name: "Bitrate",
+                range: CaptureMediaSettings.bitrateRange
+            )
+            configuration.capture.recordingBitrateKbps = value
+            persist { $0.capture.recordingBitrateKbps = value }
         }
     }
 
@@ -1406,6 +1691,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .contextWindowTokens: String(configuration.translation.contextWindowTokens)
         case .outputTokenLimit: String(configuration.translation.outputTokenLimit)
         case .requestTokenLimit: String(configuration.translation.requestTokenLimit)
+        case .screenshotSaveDirectory: configuration.capture.screenshotSaveDirectory
+        case .recordingSaveDirectory: configuration.capture.recordingSaveDirectory
+        case .recordingFrameRate: String(configuration.capture.recordingFrameRate)
+        case .recordingBitrateKbps: String(configuration.capture.recordingBitrateKbps)
         case .apiKey: configuration.translation.apiKey
         case .googleAPIKey: configuration.translation.googleApiKey
         }
@@ -2004,6 +2293,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .focusApplication: "Focus · \(URL(fileURLWithPath: action.path ?? "Application").deletingPathExtension().lastPathComponent)"
         case .showFocusedWindowInfo: "Show focused window info"
         case .translateSelection: "Translate selected text"
+        case .captureScreenshot: "Capture annotated screenshot"
+        case .toggleScreenRecording: "Start or stop screen recording"
         case .toggleFinder: "Toggle Finder"
         case .toggleTerminal: "Toggle Terminal"
         case .reloadConfiguration: "Reload configuration"

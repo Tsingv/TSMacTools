@@ -8,6 +8,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
     public var scroll: ScrollSettings
     public var fans: FanSettings = .init()
     public var translation: TranslationSettings
+    public var capture: CaptureMediaSettings = .default
 
     public init(
         application: ApplicationSettings,
@@ -15,7 +16,8 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         hotkeys: [HotkeyBinding],
         windowSwitcher: WindowSwitcherSettings,
         scroll: ScrollSettings = .default,
-        translation: TranslationSettings
+        translation: TranslationSettings,
+        capture: CaptureMediaSettings = .default
     ) {
         self.application = application
         self.scripting = scripting
@@ -23,6 +25,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         self.windowSwitcher = windowSwitcher
         self.scroll = scroll
         self.translation = translation
+        self.capture = capture
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -33,6 +36,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         case scroll
         case translation
         case fans
+        case capture
     }
 
     public init(from decoder: Decoder) throws {
@@ -45,6 +49,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         self.scroll = try container.decodeIfPresent(ScrollSettings.self, forKey: .scroll) ?? .default
         self.translation = try container.decode(TranslationSettings.self, forKey: .translation)
         self.fans = try container.decodeIfPresent(FanSettings.self, forKey: .fans) ?? .init()
+        self.capture = try container.decodeIfPresent(CaptureMediaSettings.self, forKey: .capture) ?? .default
     }
 }
 
@@ -297,6 +302,8 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
         case runScript
         case callInterface
         case simulateKeystroke
+        case captureScreenshot
+        case toggleScreenRecording
     }
 
     public var kind: Kind
@@ -668,7 +675,9 @@ public extension UserConfiguration {
                 HotkeyBinding(modifiers: ["alt"], key: "S", action: HotkeyAction(kind: .runScript, path: "scripts/translate_selection.py", nativeWindowID: "translate", function: "main", input: "selectedText")),
                 HotkeyBinding(modifiers: ["alt"], key: "E", action: HotkeyAction(kind: .toggleFinder, bundleIdentifier: "com.apple.finder")),
                 HotkeyBinding(modifiers: ["cmd"], key: "D", action: HotkeyAction(kind: .toggleTerminal, bundleIdentifier: "net.kovidgoyal.kitty")),
-                HotkeyBinding(modifiers: ["cmd", "alt", "ctrl"], key: "R", action: HotkeyAction(kind: .callInterface, interfaceName: "reloadConfiguration"))
+                HotkeyBinding(modifiers: ["cmd", "alt", "ctrl"], key: "R", action: HotkeyAction(kind: .callInterface, interfaceName: "reloadConfiguration")),
+                HotkeyBinding(modifiers: ["alt"], key: "P", action: HotkeyAction(kind: .captureScreenshot)),
+                HotkeyBinding(modifiers: ["alt"], key: "G", action: HotkeyAction(kind: .toggleScreenRecording))
             ],
             windowSwitcher: WindowSwitcherSettings(
                 enabled: true,
@@ -723,7 +732,8 @@ public extension UserConfiguration {
                     height: 620,
                     pinByDefault: false
                 )
-            )
+            ),
+            capture: .default
         )
     }
 }

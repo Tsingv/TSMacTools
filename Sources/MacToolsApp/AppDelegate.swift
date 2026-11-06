@@ -496,9 +496,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowSwitcherController: WindowSwitcherController?
     private var smoothScrollController: SmoothScrollController?
     private let fanRuntime = FanRuntime()
+    private let screenshotController = ScreenshotCaptureController()
+    private let screenRecordingController = ScreenRecordingController()
     private var settingsWindowController: SettingsWindowController?
     private var statusItem: NSStatusItem?
     private var menuBarVisibilityMenuController: MenuBarVisibilityMenuController?
+    private var recordingStatusTimer: Timer?
+    private var defaultStatusImage: NSImage?
+    private var smoothScrollSuspendedForCapture = false
 
     static func main() {
         #if DEBUG
@@ -537,6 +542,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        if CommandLine.arguments.contains("--check-microphone") {
+            let state = MicrophonePermission.authorizationState()
+            print("microphone=\(state.displayName)")
+            print("bundle=\(Bundle.main.bundleIdentifier ?? "unknown")")
+            print("path=\(Bundle.main.bundlePath)")
+            return
+        }
+
         if CommandLine.arguments.contains("--list-menu-bar-applications") {
             let app = NSApplication.shared
             app.setActivationPolicy(.prohibited)
@@ -566,6 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         installStatusItem()
         installMainMenu()
+        configureCaptureControllers()
 
         let manager = NativeWindowManager()
         let permissionClient = AccessibilityPermissionClient()
@@ -608,14 +622,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyController?.shutdown()
         windowSwitcherController?.stop()
         smoothScrollController?.shutdown()
+        if screenRecordingController.isRecording {
+            screenRecordingController.stop()
+        }
+        screenshotController.cancel()
+        recordingStatusTimer?.invalidate()
     }
 
     private func installStatusItem() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.image = NSImage(named: "StatusBarIcon") ?? NSImage(systemSymbolName: "hammer", accessibilityDescription: "TSMacTools")
-            button.image?.isTemplate = true
-            button.title = button.image == nil ? "TS" : ""
+            let image = NSImage(named: "StatusBarIcon") ?? NSImage(systemSymbolName: "hammer", accessibilityDescription: "TSMacTools")
+            image?.isTemplate = true
+            defaultStatusImage = image
+            button.image = image
+            button.title = image == nil ? "TS" : ""
         }
 
         let menu = NSMenu()
@@ -628,6 +649,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         visibilityItem.submenu = visibilityMenuController.menu
         menu.addItem(visibilityItem)
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Capture Screenshot", action: #selector(captureScreenshot), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Toggle Screen Recording", action: #selector(toggleScreenRecording), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "Open Configuration Folder", action: #selector(openConfigurationFolder), keyEquivalent: ""))
@@ -636,6 +660,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.menu = menu
         statusItem = item
         menuBarVisibilityMenuController = visibilityMenuController
+    }
+
+    private func configureCaptureControllers() {
+        screenshotController.onStatus = { [weak self] title, body in
+            self?.showStatusWindow(title: title, body: body)
+        }
+        screenshotController.onActiveChange = { [weak self] isActive in
+            self?.setSmoothScrollSuspendedForCapture(isActive)
+        }
+        screenRecordingController.onStatus = { [weak self] title, body in
+            self?.showStatusWindow(title: title, body: body)
+        }
+        screenRecordingController.onRecordingStateChange = { [weak self] isRecording, _ in
+            self?.updateRecordingStatusItem(isRecording: isRecording)
+        }
+    }
+
+    /// Pause mouse-wheel smoothing while the screenshot overlay is adjusting sizes.
+    private func setSmoothScrollSuspendedForCapture(_ suspended: Bool) {
+        guard let smoothScrollController else { return }
+        guard let scroll = configurationBootstrap?.configuration.scroll else { return }
+        if suspended {
+            guard !smoothScrollSuspendedForCapture else { return }
+            smoothScrollSuspendedForCapture = true
+            var paused = scroll
+            paused.enabled = false
+            smoothScrollController.apply(paused)
+        } else if smoothScrollSuspendedForCapture {
+            smoothScrollSuspendedForCapture = false
+            smoothScrollController.apply(scroll)
+        }
+    }
+
+    private func applyScrollSettingsRespectingCaptureSuspension(_ settings: ScrollSettings) {
+        guard let smoothScrollController else { return }
+        if smoothScrollSuspendedForCapture {
+            var paused = settings
+            paused.enabled = false
+            smoothScrollController.apply(paused)
+        } else {
+            smoothScrollController.apply(settings)
+        }
+    }
+
+    @objc private func captureScreenshot() {
+        screenshotController.beginCapture()
+    }
+
+    @objc private func toggleScreenRecording() {
+        screenRecordingController.toggle()
+    }
+
+    private func updateRecordingStatusItem(isRecording: Bool) {
+        recordingStatusTimer?.invalidate()
+        recordingStatusTimer = nil
+        guard let button = statusItem?.button else { return }
+        button.image = defaultStatusImage
+        if isRecording {
+            // Keep the normal status icon and only append elapsed time.
+            refreshRecordingElapsedTitle()
+            let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    self?.refreshRecordingElapsedTitle()
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            recordingStatusTimer = timer
+        } else {
+            button.title = defaultStatusImage == nil ? "TS" : ""
+        }
+    }
+
+    private func refreshRecordingElapsedTitle() {
+        guard screenRecordingController.isRecording, let button = statusItem?.button else { return }
+        let elapsed = Int(screenRecordingController.elapsed())
+        let minutes = elapsed / 60
+        let seconds = elapsed % 60
+        button.title = String(format: " %d:%02d", minutes, seconds)
     }
 
     private func installMainMenu() {
@@ -695,19 +797,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 windowSwitcherController: windowSwitcherController,
                 reloadConfigurationHandler: { [weak self] in
                     self?.reloadConfiguration()
+                },
+                captureScreenshotHandler: { [weak self] in
+                    self?.captureScreenshot()
+                },
+                toggleScreenRecordingHandler: { [weak self] in
+                    self?.toggleScreenRecording()
                 }
             )
             controller.start()
             hotkeyController = controller
         }
 
-        if let smoothScrollController {
-            smoothScrollController.apply(configuration.scroll)
+        if smoothScrollController != nil {
+            applyScrollSettingsRespectingCaptureSuspension(configuration.scroll)
         } else {
-            let controller = SmoothScrollController(settings: configuration.scroll)
+            let initial = smoothScrollSuspendedForCapture
+                ? {
+                    var paused = configuration.scroll
+                    paused.enabled = false
+                    return paused
+                }()
+                : configuration.scroll
+            let controller = SmoothScrollController(settings: initial)
             controller.start()
             smoothScrollController = controller
         }
+
+        screenshotController.apply(configuration.capture)
+        screenRecordingController.apply(configuration.capture)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
