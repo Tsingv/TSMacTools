@@ -338,8 +338,10 @@ private final class ScreenshotOverlaySession: NSObject {
 }
 
 private final class ScreenshotOverlayWindow: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
+    // AX snapshotting (WindowSwitcher) can read accessibilitySubrole off the main actor.
+    // Keep these getters nonisolated so NSPanel's AX path cannot trap on MainActor checks.
+    nonisolated override var canBecomeKey: Bool { true }
+    nonisolated override var canBecomeMain: Bool { false }
 }
 
 @MainActor
