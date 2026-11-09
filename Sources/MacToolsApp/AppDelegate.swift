@@ -370,20 +370,28 @@ final class TransientAlertPresenter: NSObject, NSWindowDelegate {
     private var panels: [NSPanel] = []
 
     func show(title: String, body: String) {
+        // Non-activating HUD toast: never steals focus from the restored app after screenshot/copy.
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 420, height: 128),
-            styleMask: [.titled, .closable, .utilityWindow],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        panel.title = title
         panel.level = .floating
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
         panel.isReleasedWhenClosed = false
         panel.delegate = self
 
         let container = NSView()
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        container.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
+        container.layer?.cornerRadius = 12
+        container.layer?.masksToBounds = true
 
         let stack = NSStackView()
         stack.orientation = .vertical

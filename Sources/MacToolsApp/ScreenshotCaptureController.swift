@@ -7,6 +7,8 @@ import MacToolsCore
 final class ScreenshotCaptureController {
     private var sessions: [ScreenshotOverlaySession] = []
     private var settings: CaptureMediaSettings = .default
+    /// App that owned focus before the floating annotation overlay activated.
+    private var previousFrontmostApplication: NSRunningApplication?
     var onStatus: ((String, String) -> Void)?
     /// Fired when an annotation overlay becomes active or fully dismisses.
     var onActiveChange: ((Bool) -> Void)?
@@ -18,7 +20,7 @@ final class ScreenshotCaptureController {
     var isActive: Bool { !sessions.isEmpty }
 
     func beginCapture() {
-        cancel()
+        cancel(restoreFocus: true)
 
         if !ensureScreenRecordingPermission() {
             return
@@ -40,6 +42,8 @@ final class ScreenshotCaptureController {
             return
         }
 
+        rememberPreviousFrontmostApplication()
+
         for (screen, image, scale) in freezeFrames {
             let session = ScreenshotOverlaySession(
                 screen: screen,
@@ -50,7 +54,7 @@ final class ScreenshotCaptureController {
                     self?.finish(with: result)
                 },
                 onCancel: { [weak self] in
-                    self?.cancel()
+                    self?.cancel(restoreFocus: true)
                 }
             )
             sessions.append(session)
@@ -60,16 +64,26 @@ final class ScreenshotCaptureController {
     }
 
     func cancel() {
+        cancel(restoreFocus: true)
+    }
+
+    private func cancel(restoreFocus: Bool) {
         let wasActive = !sessions.isEmpty
         sessions.forEach { $0.close() }
         sessions.removeAll()
         if wasActive {
             onActiveChange?(false)
         }
+        if restoreFocus {
+            restorePreviousFrontmostApplication()
+        } else {
+            previousFrontmostApplication = nil
+        }
     }
 
     private func finish(with result: ScreenshotCaptureResult) {
-        cancel()
+        // Close the overlay first, restore the prior app, then show a non-activating toast.
+        cancel(restoreFocus: true)
         do {
             var savedURL: URL?
             if settings.saveScreenshotToDisk || result.copyOnly {
@@ -89,6 +103,26 @@ final class ScreenshotCaptureController {
         } catch {
             onStatus?("Screenshot Error", error.localizedDescription)
         }
+    }
+
+    private func rememberPreviousFrontmostApplication() {
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        if frontmost?.bundleIdentifier == Bundle.main.bundleIdentifier {
+            previousFrontmostApplication = nil
+            return
+        }
+        previousFrontmostApplication = frontmost
+    }
+
+    private func restorePreviousFrontmostApplication() {
+        guard let previous = previousFrontmostApplication,
+              previous.bundleIdentifier != Bundle.main.bundleIdentifier,
+              !previous.isTerminated else {
+            previousFrontmostApplication = nil
+            return
+        }
+        previousFrontmostApplication = nil
+        previous.activate(options: [.activateIgnoringOtherApps])
     }
 
     private func writeClipboard(image: NSImage, pngData: Data, fileURL: URL?) {
@@ -210,7 +244,7 @@ private final class ScreenshotOverlaySession: NSObject {
     private let onFinished: (ScreenshotCaptureResult) -> Void
     private let onCancel: () -> Void
 
-    private var window: NSWindow?
+    private var window: NSPanel?
     private var overlayView: ScreenshotOverlayView?
 
     init(
@@ -230,9 +264,11 @@ private final class ScreenshotOverlaySession: NSObject {
     }
 
     func show() {
+        // Floating HUD panel: stays above content, skips Mission Control / Window menu layout,
+        // but can still become key so Return/Escape and text tools work during annotation.
         let window = ScreenshotOverlayWindow(
             contentRect: screen.frame,
-            styleMask: .borderless,
+            styleMask: [.borderless, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -240,8 +276,16 @@ private final class ScreenshotOverlaySession: NSObject {
         window.isOpaque = false
         window.backgroundColor = .clear
         window.level = .screenSaver
+        window.isFloatingPanel = true
+        window.hidesOnDeactivate = false
         window.ignoresMouseEvents = false
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        window.collectionBehavior = [
+            .canJoinAllSpaces,
+            .fullScreenAuxiliary,
+            .stationary,
+            .transient,
+            .ignoresCycle
+        ]
         window.hasShadow = false
         window.acceptsMouseMovedEvents = true
 
@@ -293,9 +337,9 @@ private final class ScreenshotOverlaySession: NSObject {
     }
 }
 
-private final class ScreenshotOverlayWindow: NSWindow {
+private final class ScreenshotOverlayWindow: NSPanel {
     override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
+    override var canBecomeMain: Bool { false }
 }
 
 @MainActor
