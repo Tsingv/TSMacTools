@@ -168,9 +168,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private var modelPopup: NSPopUpButton?
     private var thinkingLevelPopup: NSPopUpButton?
     private var modelsStatusLabel: NSTextField?
+    private weak var modelsRefreshButton: NSButton?
     private var modelLimitsLabel: NSTextField?
     private var llmModels: [LLMModelDescriptor] = []
     private var modelsFetchGeneration = 0
+    private var isRefreshingModels = false
 
     private var presetPopup: NSPopUpButton?
     private var presetSummary: NSTextField?
@@ -1528,9 +1530,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         configuration.translation.provider = provider
         persist { $0.translation.provider = provider }
         applyConditionalVisibility(for: selectedPage)
-        if provider == "llm" {
-            refreshLLMModels(userInitiated: false)
-        }
     }
 
     private func makeModelPicker() -> NSPopUpButton {
@@ -1547,7 +1546,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
         modelPopup = popup
         rebuildModelPopup()
-        refreshLLMModels(userInitiated: false)
         return popup
     }
 
@@ -1569,6 +1567,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         let button = NSButton(title: "Refresh models", target: self, action: #selector(refreshModelsClicked(_:)))
         button.bezelStyle = .rounded
         button.controlSize = .small
+        button.isEnabled = !isRefreshingModels
+        modelsRefreshButton = button
 
         let status = NSTextField(labelWithString: "")
         status.font = .systemFont(ofSize: 11)
@@ -1633,13 +1633,19 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         applyThinkingLevel(level)
     }
 
-    private func applySelectedModel(_ modelID: String, updateBudgets: Bool) {
+        private func applySelectedModel(_ modelID: String, updateBudgets: Bool) {
+        let previous = configuration.translation
         configuration.translation.model = modelID
+        var budgetsChanged = false
         if let model = llmModels.first(where: { $0.id == modelID }) {
             if model.supportsReasoningParameter {
                 configuration.translation.thinkingParameter = "reasoning"
             }
             if updateBudgets, let budget = TranslationTokenBudget.derived(from: model) {
+                budgetsChanged =
+                    previous.contextWindowTokens != budget.contextWindowTokens
+                    || previous.outputTokenLimit != budget.outputTokenLimit
+                    || previous.requestTokenLimit != budget.requestTokenLimit
                 configuration.translation.contextWindowTokens = budget.contextWindowTokens
                 configuration.translation.outputTokenLimit = budget.outputTokenLimit
                 configuration.translation.requestTokenLimit = budget.requestTokenLimit
@@ -1656,27 +1662,36 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             } else if levels.contains(current) {
                 resolved = current
             } else {
-                resolved = levels.contains("none") ? "none" : (levels.first ?? current)
+                resolved = levels.contains("none") ? "none" : (levels.last ?? "none")
             }
             configuration.translation.thinkingLevel = resolved
             configuration.translation.thinkingEnabled = TranslationThinking.isEnabled(level: resolved)
         }
-        persist { latest in
-            latest.translation.model = modelID
-            latest.translation.thinkingParameter = self.configuration.translation.thinkingParameter
-            latest.translation.thinkingLevel = self.configuration.translation.thinkingLevel
-            latest.translation.thinkingEnabled = self.configuration.translation.thinkingEnabled
-            if updateBudgets {
-                latest.translation.contextWindowTokens = self.configuration.translation.contextWindowTokens
-                latest.translation.outputTokenLimit = self.configuration.translation.outputTokenLimit
-                latest.translation.requestTokenLimit = self.configuration.translation.requestTokenLimit
+
+        let translationChanged =
+            previous.model != configuration.translation.model
+            || previous.thinkingParameter != configuration.translation.thinkingParameter
+            || previous.thinkingLevel != configuration.translation.thinkingLevel
+            || previous.thinkingEnabled != configuration.translation.thinkingEnabled
+            || budgetsChanged
+        if translationChanged {
+            persist { latest in
+                latest.translation.model = self.configuration.translation.model
+                latest.translation.thinkingParameter = self.configuration.translation.thinkingParameter
+                latest.translation.thinkingLevel = self.configuration.translation.thinkingLevel
+                latest.translation.thinkingEnabled = self.configuration.translation.thinkingEnabled
+                if updateBudgets {
+                    latest.translation.contextWindowTokens = self.configuration.translation.contextWindowTokens
+                    latest.translation.outputTokenLimit = self.configuration.translation.outputTokenLimit
+                    latest.translation.requestTokenLimit = self.configuration.translation.requestTokenLimit
+                }
             }
         }
         rebuildThinkingLevelPopup()
         refreshModelLimitsLabel()
     }
 
-    private func applyThinkingLevel(_ level: String) {
+private func applyThinkingLevel(_ level: String) {
         let normalized = TranslationThinking.normalizedLevel(
             thinkingLevel: level,
             thinkingEnabled: TranslationThinking.isEnabled(level: level)
@@ -1776,6 +1791,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
         modelsFetchGeneration += 1
         let generation = modelsFetchGeneration
+        isRefreshingModels = true
+        modelsRefreshButton?.isEnabled = false
         if userInitiated {
             modelsStatusLabel?.stringValue = "Loading…"
         }
@@ -1800,6 +1817,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             }
             DispatchQueue.main.async {
                 guard let self, generation == self.modelsFetchGeneration else { return }
+                self.isRefreshingModels = false
+                self.modelsRefreshButton?.isEnabled = true
                 switch result {
                 case .success(let models):
                     self.llmModels = models
@@ -1807,8 +1826,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                     self.modelsStatusLabel?.stringValue = "\(chatModels.count) chat models"
                     self.rebuildModelPopup()
                     if chatModels.contains(where: { $0.id == self.configuration.translation.model }) {
-                        // Always rewrite token budgets from /v1/models so Settings never keeps a stale manual value.
-                        self.applySelectedModel(self.configuration.translation.model, updateBudgets: true)
+                        // Only persist derived budgets when /v1/models actually changes them.
+                        // Rewriting identical values still schedules page reconciliation and used to
+                        // rebuild General, auto-fetch again, and make Refresh models flicker.
+                        self.applySelectedModel(
+                            self.configuration.translation.model,
+                            updateBudgets: true
+                        )
                     } else {
                         self.rebuildThinkingLevelPopup()
                         self.refreshModelLimitsLabel()
@@ -1899,7 +1923,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             let value = try TranslationEndpoint.requestURL(rawValue)
             configuration.translation.endpoint = value
             persist { $0.translation.endpoint = value }
-            refreshLLMModels(userInitiated: true)
         case .model:
             let value = try requiredText(rawValue, name: "LLM model")
             configuration.translation.model = value
@@ -1925,7 +1948,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .apiKey:
             configuration.translation.apiKey = rawValue
             persist { $0.translation.apiKey = rawValue }
-            refreshLLMModels(userInitiated: true)
         case .googleAPIKey:
             configuration.translation.googleApiKey = rawValue
             persist { $0.translation.googleApiKey = rawValue }

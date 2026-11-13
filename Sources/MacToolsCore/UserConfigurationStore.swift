@@ -933,7 +933,6 @@ public final class UserConfigurationStore {
 
         body = {
             "model": translation["model"],
-            "temperature": translation["temperature"],
             "messages": messages,
         }
         output_token_limit = int(translation.get("outputTokenLimit", 2048) or 0)

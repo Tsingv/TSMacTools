@@ -478,7 +478,6 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
     public var contextWindowTokens: Int
     public var outputTokenLimit: Int
     public var requestTokenLimit: Int
-    public var temperature: Double
     public var promptTemplate: String
     public var systemPrompt: String
     public var copyKeystrokeDelay: Double
@@ -504,7 +503,6 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         contextWindowTokens: Int = 262144,
         outputTokenLimit: Int = 2048,
         requestTokenLimit: Int = 0,
-        temperature: Double,
         promptTemplate: String,
         systemPrompt: String,
         copyKeystrokeDelay: Double,
@@ -529,7 +527,6 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         self.contextWindowTokens = contextWindowTokens
         self.outputTokenLimit = outputTokenLimit
         self.requestTokenLimit = requestTokenLimit
-        self.temperature = temperature
         self.promptTemplate = promptTemplate
         self.systemPrompt = systemPrompt
         self.copyKeystrokeDelay = copyKeystrokeDelay
@@ -556,7 +553,7 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         case contextWindowTokens
         case outputTokenLimit
         case requestTokenLimit
-        case temperature
+        case temperature // legacy ignored
         case promptTemplate
         case systemPrompt
         case copyKeystrokeDelay
@@ -584,7 +581,8 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         self.contextWindowTokens = try container.decodeIfPresent(Int.self, forKey: .contextWindowTokens) ?? 262144
         self.outputTokenLimit = try container.decodeIfPresent(Int.self, forKey: .outputTokenLimit) ?? 2048
         self.requestTokenLimit = try container.decodeIfPresent(Int.self, forKey: .requestTokenLimit) ?? 0
-        self.temperature = try container.decode(Double.self, forKey: .temperature)
+        // Legacy sampling knobs such as temperature are ignored for modern chat models.
+        _ = try container.decodeIfPresent(Double.self, forKey: .temperature)
         self.promptTemplate = try container.decode(String.self, forKey: .promptTemplate)
         self.systemPrompt = try container.decode(String.self, forKey: .systemPrompt)
         self.copyKeystrokeDelay = try container.decode(Double.self, forKey: .copyKeystrokeDelay)
@@ -618,7 +616,6 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         try container.encode(contextWindowTokens, forKey: .contextWindowTokens)
         try container.encode(outputTokenLimit, forKey: .outputTokenLimit)
         try container.encode(requestTokenLimit, forKey: .requestTokenLimit)
-        try container.encode(temperature, forKey: .temperature)
         try container.encode(promptTemplate, forKey: .promptTemplate)
         try container.encode(systemPrompt, forKey: .systemPrompt)
         try container.encode(copyKeystrokeDelay, forKey: .copyKeystrokeDelay)
@@ -718,7 +715,6 @@ public extension UserConfiguration {
                 contextWindowTokens: 262144,
                 outputTokenLimit: 2048,
                 requestTokenLimit: 0,
-                temperature: 0.2,
                 promptTemplate: """
                 You are a professional English translator with strong knowledge of computing terms.
                 If the source text is Chinese, translate it into natural English.

@@ -316,26 +316,54 @@ public final class SmoothScrollController: @unchecked Sendable {
     }
 
     private func handleTapInput(_ input: ScrollTapInput) -> ScrollTapDisposition {
-        precondition(Thread.isMainThread)
-        operationLock.lock()
-        defer { operationLock.unlock() }
-        guard withState({ $0.lifecycle == .running }) else { return .passThrough }
+        // Wheel callbacks run on the dedicated tap run-loop thread so AppKit main-thread
+        // stalls cannot delay consume/pass decisions. Lifecycle install/recovery stay on main.
         switch input {
         case .cancelMotion:
+            operationLock.lock()
+            defer { operationLock.unlock() }
+            guard withState({ $0.lifecycle == .running }) else { return .passThrough }
             resetSession()
             cancelIdleDisplayStop()
             displayDriver.stop()
             return .passThrough
         case .disabled:
-            resetSession()
-            cancelIdleDisplayStop()
-            displayDriver.stop()
-            scheduleEventTapHealthCheck()
-            recoverEventTapIfPermitted()
-            return .passThrough
+            if Thread.isMainThread {
+                operationLock.lock()
+                defer { operationLock.unlock() }
+                guard withState({ $0.lifecycle == .running }) else { return .passThrough }
+                resetSession()
+                cancelIdleDisplayStop()
+                displayDriver.stop()
+                scheduleEventTapHealthCheck()
+                recoverEventTapIfPermitted()
+                return .passThrough
+            }
+            var disposition: ScrollTapDisposition = .passThrough
+            DispatchQueue.main.sync {
+                disposition = self.handleTapInput(.disabled)
+            }
+            return disposition
         case let .scroll(event):
             return handleScrollEvent(event) ? .consume : .passThrough
         }
+    }
+
+    /// Display-link prepare/start remain main-thread-only. Never call this while already
+    /// holding `operationLock` from a non-main thread: hopping to main under that lock deadlocks.
+    private func ensureDisplayReadyForSmoothing() -> Bool {
+        if Thread.isMainThread {
+            operationLock.lock()
+            defer { operationLock.unlock() }
+            return displayDriver.start() && displayDriver.hasDeliveredFrame
+        }
+        var ready = false
+        DispatchQueue.main.sync {
+            self.operationLock.lock()
+            defer { self.operationLock.unlock() }
+            ready = self.displayDriver.start() && self.displayDriver.hasDeliveredFrame
+        }
+        return ready
     }
 
     private func recoverEventTapIfPermitted() {
@@ -394,7 +422,8 @@ public final class SmoothScrollController: @unchecked Sendable {
     }
 
     private func handleScrollEvent(_ event: CGEvent) -> Bool {
-        precondition(Thread.isMainThread)
+        operationLock.lock()
+        defer { operationLock.unlock() }
         if event.getIntegerValueField(.eventSourceUserData) == smoothScrollSyntheticMarker {
             return false
         }
@@ -459,8 +488,13 @@ public final class SmoothScrollController: @unchecked Sendable {
             )
             return false
         }
+        // Cancel idle-stop under the controller lock, then drop it before hopping to main for
+        // display-link start so a busy main thread cannot deadlock against this tap callback.
         cancelIdleDisplayStop()
-        guard displayDriver.start(), displayDriver.hasDeliveredFrame else {
+        operationLock.unlock()
+        let displayReady = ensureDisplayReadyForSmoothing()
+        operationLock.lock()
+        guard displayReady else {
             resetSession()
             logPhysicalEvent(
                 event,
@@ -476,6 +510,7 @@ public final class SmoothScrollController: @unchecked Sendable {
             )
             return false
         }
+        guard withState({ $0.lifecycle == .running }) else { return false }
 
         let smoothedInput = ScrollVector(x: smoothX ? input.x : 0, y: smoothY ? input.y : 0)
         let timestamp = environment.now()
@@ -1012,11 +1047,87 @@ private func smoothScrollEventTapCallback(
 }
 
 private final class CGScrollEventTapDriver: ScrollEventTapDriving, @unchecked Sendable {
+    private final class RunLoopContext: @unchecked Sendable {
+        let tap: CFMachPort
+        let source: CFRunLoopSource
+        let ready = DispatchSemaphore(value: 0)
+        let stopped = DispatchSemaphore(value: 0)
+
+        private let lock = NSLock()
+        private var runLoop: CFRunLoop?
+        private var stopRequested = false
+        private var running = false
+
+        init(tap: CFMachPort, source: CFRunLoopSource) {
+            self.tap = tap
+            self.source = source
+        }
+
+        func run() {
+            autoreleasepool {
+                let currentRunLoop = CFRunLoopGetCurrent()
+                lock.lock()
+                if stopRequested {
+                    lock.unlock()
+                    ready.signal()
+                    stopped.signal()
+                    return
+                }
+                runLoop = currentRunLoop
+                running = true
+                lock.unlock()
+
+                CFRunLoopAddSource(currentRunLoop, source, .commonModes)
+                CGEvent.tapEnable(tap: tap, enable: true)
+                ready.signal()
+                CFRunLoopRun()
+                CGEvent.tapEnable(tap: tap, enable: false)
+                if CFRunLoopContainsSource(currentRunLoop, source, .commonModes) {
+                    CFRunLoopRemoveSource(currentRunLoop, source, .commonModes)
+                }
+
+                lock.lock()
+                running = false
+                runLoop = nil
+                lock.unlock()
+                stopped.signal()
+            }
+        }
+
+        func stop() {
+            lock.lock()
+            stopRequested = true
+            let currentRunLoop = runLoop
+            lock.unlock()
+            CGEvent.tapEnable(tap: tap, enable: false)
+            if let currentRunLoop {
+                CFRunLoopStop(currentRunLoop)
+                CFRunLoopWakeUp(currentRunLoop)
+            }
+        }
+
+        func enable() {
+            lock.lock()
+            let shouldEnable = running && !stopRequested
+            lock.unlock()
+            if shouldEnable {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+        }
+
+        var isRunning: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return running && !stopRequested
+        }
+    }
+
     private let handler: @Sendable (ScrollTapInput) -> ScrollTapDisposition
     private let token: UInt
     private let lock = NSLock()
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var runLoopContext: RunLoopContext?
     private var invalidated = false
 
     init(handler: @escaping @Sendable (ScrollTapInput) -> ScrollTapDisposition) {
@@ -1030,7 +1141,7 @@ private final class CGScrollEventTapDriver: ScrollEventTapDriving, @unchecked Se
     }
 
     var isInstalled: Bool {
-        lock.withLock { eventTap != nil && runLoopSource != nil && !invalidated }
+        lock.withLock { eventTap != nil && runLoopSource != nil && runLoopContext != nil && !invalidated }
     }
 
     var isEnabled: Bool {
@@ -1042,69 +1153,101 @@ private final class CGScrollEventTapDriver: ScrollEventTapDriving, @unchecked Se
 
     func install() -> Bool {
         precondition(Thread.isMainThread)
-        return lock.withLock {
-            guard !invalidated else { return false }
-            if let eventTap, runLoopSource != nil {
-                CGEvent.tapEnable(tap: eventTap, enable: true)
-                return CGEvent.tapIsEnabled(tap: eventTap)
+        let existing = lock.withLock { () -> (CFMachPort?, RunLoopContext?)? in
+            guard !invalidated else { return nil }
+            if let eventTap, let runLoopContext, runLoopSource != nil {
+                return (eventTap, runLoopContext)
             }
-            guard let context = UnsafeMutableRawPointer(bitPattern: token) else { return false }
-            let mask = CGEventMask(1 << CGEventType.scrollWheel.rawValue)
-                | CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
-                | CGEventMask(1 << CGEventType.rightMouseDown.rawValue)
-                | CGEventMask(1 << CGEventType.otherMouseDown.rawValue)
-            guard let tap = CGEvent.tapCreate(
-                tap: .cgSessionEventTap,
-                place: .headInsertEventTap,
-                options: .defaultTap,
-                eventsOfInterest: mask,
-                callback: smoothScrollEventTapCallback,
-                userInfo: context
-            ), let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
-                return false
-            }
+            return (nil, nil)
+        }
+        guard let existing else { return false }
+        if let eventTap = existing.0, let context = existing.1 {
+            context.enable()
+            return CGEvent.tapIsEnabled(tap: eventTap)
+        }
+
+        guard let userInfo = UnsafeMutableRawPointer(bitPattern: token) else { return false }
+        let mask = CGEventMask(1 << CGEventType.scrollWheel.rawValue)
+            | CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+            | CGEventMask(1 << CGEventType.rightMouseDown.rawValue)
+            | CGEventMask(1 << CGEventType.otherMouseDown.rawValue)
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: smoothScrollEventTapCallback,
+            userInfo: userInfo
+        ), let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            return false
+        }
+
+        let context = RunLoopContext(tap: tap, source: source)
+        lock.withLock {
             eventTap = tap
             runLoopSource = source
-            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-            CGEvent.tapEnable(tap: tap, enable: true)
-            return CGEvent.tapIsEnabled(tap: tap)
+            runLoopContext = context
         }
+
+        let thread = Thread {
+            context.run()
+        }
+        thread.name = "TSMacTools.SmoothScrollEventTap"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+
+        guard context.ready.wait(timeout: .now() + 1) == .success,
+              context.isRunning,
+              CGEvent.tapIsEnabled(tap: tap) else {
+            remove()
+            return false
+        }
+        return true
     }
 
     func setEnabled(_ enabled: Bool) {
         precondition(Thread.isMainThread)
-        lock.withLock {
-            guard !invalidated, let eventTap else { return }
-            CGEvent.tapEnable(tap: eventTap, enable: enabled)
+        let package = lock.withLock { () -> (CFMachPort?, RunLoopContext?) in
+            guard !invalidated else { return (nil, nil) }
+            return (eventTap, runLoopContext)
+        }
+        guard let eventTap = package.0 else { return }
+        if enabled {
+            package.1?.enable()
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+        } else {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
         }
     }
 
     func remove() {
-        let resources = lock.withLock { () -> (CFMachPort?, CFRunLoopSource?) in
-            let resources = (eventTap, runLoopSource)
+        let package = lock.withLock { () -> (CFMachPort?, CFRunLoopSource?, RunLoopContext?) in
+            let package = (eventTap, runLoopSource, runLoopContext)
             eventTap = nil
             runLoopSource = nil
-            return resources
+            runLoopContext = nil
+            return package
         }
-        tearDown(tap: resources.0, source: resources.1)
+        tearDown(tap: package.0, source: package.1, context: package.2)
     }
 
     func invalidate() {
-        let resources: (CFMachPort?, CFRunLoopSource?)? = lock.withLock {
+        let package: (CFMachPort?, CFRunLoopSource?, RunLoopContext?)? = lock.withLock {
             guard !invalidated else { return nil }
             invalidated = true
-            let resources = (eventTap, runLoopSource)
+            let package = (eventTap, runLoopSource, runLoopContext)
             eventTap = nil
             runLoopSource = nil
-            return resources
+            runLoopContext = nil
+            return package
         }
-        guard let resources else { return }
+        guard let package else { return }
         CGScrollEventTapRegistry.shared.unregister(token)
-        tearDown(tap: resources.0, source: resources.1)
+        tearDown(tap: package.0, source: package.1, context: package.2)
     }
 
     func handle(type: CGEventType, event: CGEvent) -> ScrollTapDisposition {
-        guard lock.withLock({ !invalidated && eventTap != nil && runLoopSource != nil }) else {
+        guard lock.withLock({ !invalidated && eventTap != nil && runLoopSource != nil && runLoopContext != nil }) else {
             return .passThrough
         }
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -1117,11 +1260,18 @@ private final class CGScrollEventTapDriver: ScrollEventTapDriving, @unchecked Se
         return handler(.scroll(event))
     }
 
-    private func tearDown(tap: CFMachPort?, source: CFRunLoopSource?) {
+    private func tearDown(tap: CFMachPort?, source: CFRunLoopSource?, context: RunLoopContext?) {
+        if let context {
+            context.stop()
+            _ = context.stopped.wait(timeout: .now() + 1)
+            return
+        }
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
-        if let source,
-           CFRunLoopContainsSource(CFRunLoopGetMain(), source, .commonModes) {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        if let source {
+            let mainLoop = CFRunLoopGetMain()
+            if CFRunLoopContainsSource(mainLoop, source, .commonModes) {
+                CFRunLoopRemoveSource(mainLoop, source, .commonModes)
+            }
         }
     }
 }

@@ -300,7 +300,6 @@
       "width": 720
     },
     "promptTemplate": "你是一个专业的英语翻译人员，尤其是知晓计算机领域的各种术语，接下来我会提供你一段文本，你需要如下操作：\n- 识别提供的文本，如果中文，翻译为地道的英文；如果是英文或其他语言，翻译为中文\n- 直接简短提示我是什么原始语言，翻译成了什么语言，随后换2行并跟上翻译后的文本，不要其他的多余内容\n- 不得增删任何内容，不得压缩内容，不要遗漏翻译任何内容\n---\n\n{{sourceText}}", // {{sourceText}} is replaced by selected text.
-    "systemPrompt": "", // Optional system message.
-    "temperature": 0.2 // Sampling temperature.
+    "systemPrompt": "" // Optional system message.
   }
 }

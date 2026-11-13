@@ -37,6 +37,26 @@ final class SmoothScrollControllerTests: XCTestCase {
         controller.shutdown()
     }
 
+    func testScrollHotPathAcceptsOffMainTapDelivery() throws {
+        let fixture = Fixture()
+        let controller = fixture.makeController()
+        controller.start()
+        let event = try makeScrollEvent(targetPID: 101)
+
+        let expectation = expectation(description: "off-main scroll tap")
+        var disposition: ScrollTapDisposition?
+        DispatchQueue.global(qos: .userInteractive).async {
+            disposition = fixture.tap.trigger(.scroll(event))
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: 1)
+
+        XCTAssertEqual(disposition, .consume)
+        fixture.frame.fire(at: 0.02)
+        XCTAssertFalse(fixture.posts.values.isEmpty)
+        controller.shutdown()
+    }
+
     func testDisplayStartWithoutFirstCallbackPassesThroughUntilReady() throws {
         let fixture = Fixture()
         fixture.frame.hasDeliveredFrame = false
