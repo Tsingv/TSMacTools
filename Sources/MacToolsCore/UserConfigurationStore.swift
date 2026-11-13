@@ -488,8 +488,13 @@ public final class UserConfigurationStore {
                 for _ in 0 ..< 3 {
                     let original = try Data(contentsOf: coordinatedURL)
                     var configuration = try decodeConfiguration(from: original)
+                    let unmutated = configuration
                     let previousFans = configuration.fans
                     try mutation(&configuration)
+                    // A mutation that leaves the decoded model unchanged must not rewrite the
+                    // file, even when the layout merge would re-render some bytes differently,
+                    // so file watchers, modification dates, and text editors are undisturbed.
+                    if configuration == unmutated { return configuration }
                     let oldCounts = Dictionary(grouping: previousFans.rules, by: \.fan).mapValues(\.count)
                     let newCounts = Dictionary(grouping: configuration.fans.rules, by: \.fan).mapValues(\.count)
                     guard newCounts.allSatisfy({ $0.value <= max(1, oldCounts[$0.key] ?? 0) }) else {
@@ -518,6 +523,7 @@ public final class UserConfigurationStore {
                     // NSFileCoordinator serializes cooperating editors. The byte comparison also
                     // catches command-line/non-coordinating writers before the atomic replace.
                     guard try Data(contentsOf: coordinatedURL) == original else { continue }
+                    if updated == original { return configuration }
                     try updated.write(to: coordinatedURL, options: [.atomic])
                     return configuration
                 }
@@ -1028,6 +1034,12 @@ public struct ConfigurationPatch: @unchecked Sendable {
     public init(before: UserConfiguration, after: UserConfiguration) throws {
         self.before = try JSONSerialization.jsonObject(with: JSONEncoder().encode(before)) as! [String: Any]
         self.after = try JSONSerialization.jsonObject(with: JSONEncoder().encode(after)) as! [String: Any]
+    }
+
+    /// True when the proposed configuration has no leaf differences from its baseline, so
+    /// applying the patch cannot change the file.
+    public var isEmpty: Bool {
+        (before as NSDictionary).isEqual(to: after)
     }
 
     public func apply(to configuration: inout UserConfiguration) throws {

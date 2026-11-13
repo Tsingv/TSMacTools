@@ -906,6 +906,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showSettings() {
+        if let settingsWindowController, settingsWindowController.isPresented {
+            settingsWindowController.bringToFront()
+            return
+        }
         do {
             let previousConfiguration = configurationBootstrap?.configuration
             let result = try configurationStore.bootstrap()
