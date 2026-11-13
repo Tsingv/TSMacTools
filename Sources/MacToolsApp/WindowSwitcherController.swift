@@ -227,6 +227,17 @@ private final class WindowSwitcherInputEventQueue: @unchecked Sendable {
         return batch
     }
 
+    func hasPendingCommandRelease() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return events.contains { event in
+            if case let .flagsChanged(commandPressed, _) = event {
+                return !commandPressed
+            }
+            return false
+        }
+    }
+
     func reset() {
         lock.lock()
         events.removeAll(keepingCapacity: true)
@@ -447,6 +458,8 @@ final class WindowSwitcherController {
         var storedMinimized: Bool?
         var storedFocused: Bool?
         var storedMain: Bool?
+        /// When a focus/main state was recorded from a live focus observation.
+        var recordedAt: CFAbsoluteTime? = nil
     }
 
     private struct AXWindowListEntry {
@@ -563,6 +576,14 @@ final class WindowSwitcherController {
         )
     }
     private var backwardRepeatWorkItem: DispatchWorkItem?
+    private var shiftStepAwaitingTab = false
+    private var backgroundFocusRecordScheduled = false
+    private var backgroundFocusRecordGeneration: UInt64 = 0
+    private var lastBackgroundFocusRecordAt: CFAbsoluteTime = 0
+    private var pendingBackgroundFocusRecordRequest: (expectedProcessIdentifier: pid_t?, preferMainWindow: Bool)?
+    private let backgroundFocusRecordInterval: CFAbsoluteTime = 0.20
+    private let recordedFocusTrustInterval: CFAbsoluteTime = 1.0
+    private let ownProcessIdentifier = ProcessInfo.processInfo.processIdentifier
     private let overlayStack = NSStackView()
     private var workspaceObservers: [NSObjectProtocol] = []
     private var axApplicationObservers: [pid_t: AXApplicationObservation] = [:]
@@ -587,6 +608,7 @@ final class WindowSwitcherController {
     private var axWindowListPIDGenerations: [pid_t: UInt64] = [:]
     private var cgWindowInfoCache: (infos: [[String: Any]], fetchedAt: CFAbsoluteTime)?
     private var overlayRebuildPending = false
+    private var lastOverlayScreen: NSScreen?
     private var overlayRowCache: [String: OverlayRowViews] = [:]
     private var overlayRowCacheWidth: CGFloat?
     private var arrangedOverlayRowKeys: [String] = []
@@ -653,6 +675,8 @@ final class WindowSwitcherController {
         removeAXObservers()
         pendingAXObserverInstallationKeys.removeAll()
         pendingFocusVerification = nil
+        backgroundFocusRecordGeneration &+= 1
+        pendingBackgroundFocusRecordRequest = nil
         axWindowListRefreshGeneration &+= 1
         axWindowListCache.removeAll()
         inFlightAXWindowListPIDs.removeAll()
@@ -669,6 +693,12 @@ final class WindowSwitcherController {
 
     nonisolated func reenableEventTapFromCallback() {
         eventTapRunLoop.enable()
+        // Events delivered while the tap was disabled are lost, including a
+        // Command release that would otherwise commit the switch.
+        DispatchQueue.main.async {
+            self.drainInputEvents()
+            self.reconcileLostCommandRelease()
+        }
     }
 
     nonisolated func handleEvent(
@@ -688,8 +718,8 @@ final class WindowSwitcherController {
         )
 
         if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                self.recordFocusedWindow()
+            DispatchQueue.main.async {
+                self.scheduleBackgroundFocusRecord()
             }
             return commandModifierShouldSuppress
         }
@@ -727,11 +757,22 @@ final class WindowSwitcherController {
 
     private func drainInputEvents() {
         while let batch = inputEventQueue.takeBatch() {
-            for event in batch {
+            for (index, event) in batch.enumerated() {
                 switch event {
                 case let .step(sameApplication, reverse):
                     log("event step sameApplication=\(sameApplication) reverse=\(reverse)")
+                    let releaseQueued = batch[(index + 1)...].contains { later in
+                        if case let .flagsChanged(commandPressed, _) = later {
+                            return !commandPressed
+                        }
+                        return false
+                    } || inputEventQueue.hasPendingCommandRelease()
                     step(sameApplication: sameApplication, reverse: reverse)
+                    if !releaseQueued {
+                        // A Command release lost while the tap was disabled would
+                        // otherwise leave the overlay up until the next release.
+                        reconcileLostCommandRelease()
+                    }
                 case let .flagsChanged(commandPressed, shiftPressed):
                     handleFlagsChanged(commandPressed: commandPressed, shiftPressed: shiftPressed)
                 }
@@ -751,8 +792,14 @@ final class WindowSwitcherController {
             // the main actor; activation/focus notifications keep recentChoices warm and
             // buildChoices has a focused-window fallback when that cache is stale.
             choices = buildChoices(sameApplication: sameApplication, preferFreshWindowInfo: true)
-            selectedIndex = choices.count > 1 ? 1 : 0
+            selectedIndex = reverse ? max(choices.count - 1, 0) : (choices.count > 1 ? 1 : 0)
             log("build choices sameApplication=\(sameApplication) count=\(choices.count) selectedIndex=\(selectedIndex)")
+        } else if reverse, shiftStepAwaitingTab {
+            // Shift-down while the overlay was visible already moved one row
+            // up; the Tab of the same Shift+Tab chord must not move again.
+            shiftStepAwaitingTab = false
+            cancelBackwardRepeat()
+            log("step reverse consumed by preceding Shift step selectedIndex=\(selectedIndex)")
         } else if !choices.isEmpty {
             selectedIndex = reverse
                 ? (selectedIndex - 1 + choices.count) % choices.count
@@ -780,6 +827,7 @@ final class WindowSwitcherController {
 
         if !commandPressed || !shiftPressed {
             cancelBackwardRepeat()
+            shiftStepAwaitingTab = false
         }
 
         if wasCommandPressed, !commandPressed {
@@ -796,6 +844,7 @@ final class WindowSwitcherController {
             return
         }
         stepBackwardSelection()
+        shiftStepAwaitingTab = true
         scheduleBackwardRepeat(after: backwardRepeatPolicy.initialDelay)
     }
 
@@ -805,6 +854,7 @@ final class WindowSwitcherController {
                 return
             }
             self.backwardRepeatWorkItem = nil
+            self.shiftStepAwaitingTab = false
             guard self.overlayWindow?.isVisible == true,
                   self.commandPressed,
                   self.shiftPressed else {
@@ -831,6 +881,29 @@ final class WindowSwitcherController {
     private func cancelBackwardRepeat() {
         backwardRepeatWorkItem?.cancel()
         backwardRepeatWorkItem = nil
+    }
+
+    /// Commits the switch when Command is no longer physically held but its
+    /// release never reached the tap (for example while the tap was disabled).
+    @discardableResult
+    private func reconcileLostCommandRelease() -> Bool {
+        guard !choices.isEmpty || overlayWindow?.isVisible == true || overlayDisplayWorkItem != nil else {
+            return false
+        }
+        // The HID state covers a physical Command whose session event this tap
+        // deferred; the combined session state covers remote/synthetic input.
+        let flags = CGEventSource.flagsState(.combinedSessionState)
+        guard !flags.contains(.maskCommand),
+              !CGEventSource.flagsState(.hidSystemState).contains(.maskCommand) else {
+            return false
+        }
+        log("lost Command release detected; committing selection")
+        commandPressed = false
+        shiftPressed = flags.contains(.maskShift)
+        shiftStepAwaitingTab = false
+        commitSelectionIfNeeded()
+        choices.removeAll()
+        return true
     }
 
     private func commitSelectionIfNeeded() {
@@ -865,8 +938,9 @@ final class WindowSwitcherController {
                   !self.choices.isEmpty else {
                 return
             }
+            // Shift already held when the overlay appears does not start the
+            // repeat; only a Shift-down transition while visible does.
             self.renderOverlay()
-            self.startBackwardRepeatIfPossible()
         }
         overlayDisplayWorkItem = workItem
         DispatchQueue.main.asyncAfter(
@@ -904,7 +978,7 @@ final class WindowSwitcherController {
                   let pid = info[kCGWindowOwnerPID as String] as? pid_t,
                   let ownerName = info[kCGWindowOwnerName as String] as? String,
                   !ignoredNames.contains(ownerName),
-                  isRealWindow(info: info) else {
+                  Self.isRealWindow(info: info) else {
                 return
             }
             counts[pid, default: 0] += 1
@@ -915,6 +989,7 @@ final class WindowSwitcherController {
         var freshAXCandidateProcessIdentifiers = Set<pid_t>()
         var unavailableAXWindowLists = Set<pid_t>()
         var axListRefreshPIDs = Set<pid_t>()
+        var unmatchedAXWindowPIDs = Set<pid_t>()
         let now = CFAbsoluteTimeGetCurrent()
         let enumerated = windowInfo.compactMap { info -> WindowChoice? in
             guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
@@ -923,7 +998,7 @@ final class WindowSwitcherController {
                   !ignoredNames.contains(ownerName) else {
                 return nil
             }
-            guard isRealWindow(info: info) else {
+            guard Self.isRealWindow(info: info) else {
                 log("skip CGWindow owner=\(ownerName) pid=\(pid) reason=not-real-cg attrs=\(debugWindowInfo(info))")
                 return nil
             }
@@ -941,9 +1016,24 @@ final class WindowSwitcherController {
                 return nil
             }
 
-            let cgTitle = cgTitle(from: info)
-            let bounds = cgBounds(from: info)
+            let cgTitle = Self.cgTitle(from: info)
+            let bounds = Self.cgBounds(from: info)
             let cgWindowIdentifier = info[kCGWindowNumber as String] as? CGWindowID
+            if pid == ownProcessIdentifier {
+                // Self-targeted AX enters AppKit synchronously; use the owned NSWindow.
+                guard let ownedChoice = ownedWindowChoice(
+                    cgWindowIdentifier: cgWindowIdentifier,
+                    cgTitle: cgTitle,
+                    bounds: bounds,
+                    app: app,
+                    ownerName: ownerName
+                ), !seen.contains(ownedChoice.key) else {
+                    return nil
+                }
+                seen.insert(ownedChoice.key)
+                return ownedChoice
+            }
+
             if var cachedChoice = cachedRecentChoice(
                 processIdentifier: pid,
                 title: cgTitle,
@@ -994,6 +1084,7 @@ final class WindowSwitcherController {
                 excludingKeys: seen
             ) else {
                 log("skip AX owner=\(ownerName) pid=\(pid) cgTitle=\(cgTitle) reason=no-ax-window attrs=\(debugWindowInfo(info))")
+                unmatchedAXWindowPIDs.insert(pid)
                 return nil
             }
 
@@ -1060,11 +1151,14 @@ final class WindowSwitcherController {
 
         var currentChoiceSource = "none"
         var currentFrontmostWindow: WindowChoice? = nil
+        let recordedCurrentKey = frontmostPID.flatMap {
+            recordedFrontmostCurrentKey(processIdentifier: $0, enumerated: enumerated)
+        }
+        let recordedCurrentIsFresh = recordedCurrentKey
+            .flatMap { recentChoices[$0]?.recordedAt }
+            .map { now - $0 <= recordedFocusTrustInterval } ?? false
         if let frontmostPID {
-            if let recordedCurrentKey = recordedFrontmostCurrentKey(
-                processIdentifier: frontmostPID,
-                enumerated: enumerated
-            ) {
+            if let recordedCurrentKey, recordedCurrentIsFresh {
                 currentChoiceSource = "recorded-focus"
                 currentFrontmostWindow = choicesByKey[recordedCurrentKey]
             } else if let focusedChoice = enumerated.first(where: {
@@ -1077,6 +1171,17 @@ final class WindowSwitcherController {
             }) {
                 currentChoiceSource = "fresh-ax-main"
                 currentFrontmostWindow = mainChoice
+            } else if let recordedCurrentKey {
+                currentChoiceSource = "recorded-focus-stale"
+                currentFrontmostWindow = choicesByKey[recordedCurrentKey]
+            } else if frontmostPID == ownProcessIdentifier {
+                currentChoiceSource = "owned-key-window"
+                let keyNumber = (NSApp.keyWindow ?? NSApp.mainWindow)?.windowNumber
+                currentFrontmostWindow = enumerated.first {
+                    $0.processIdentifier == frontmostPID
+                        && keyNumber != nil
+                        && $0.cgWindowIdentifier.map { Int($0) } == keyNumber
+                } ?? enumerated.first(where: { $0.processIdentifier == frontmostPID })
             } else if let focusedChoice = sameAppCurrentChoice(
                 processIdentifier: frontmostPID,
                 enumerated: enumerated
@@ -1108,6 +1213,11 @@ final class WindowSwitcherController {
            let currentFrontmostWindow,
            firstEnumerated.key != currentFrontmostWindow.key {
             log("choices current-window corrected source=\(currentChoiceSource) cgTop=\(describe(firstEnumerated)) current=\(describe(currentFrontmostWindow))")
+        }
+        // An unbound CG window means the AX list is missing it; refresh unless
+        // that list was fetched moments ago (avoids a refresh on every switch).
+        for pid in unmatchedAXWindowPIDs where now - (axWindowListCache[pid]?.fetchedAt ?? 0) >= axWindowListRefreshInterval {
+            axListRefreshPIDs.insert(pid)
         }
         scheduleAXWindowListRefresh(for: axListRefreshPIDs, force: true)
         scheduleAXWindowListRefresh(for: Set(recentChoices.values.map(\.processIdentifier)).subtracting(axListRefreshPIDs))
@@ -1282,8 +1392,11 @@ final class WindowSwitcherController {
             return
         }
         let now = CFAbsoluteTimeGetCurrent()
+        let ownProcessIdentifier = self.ownProcessIdentifier
         let processIdentifiers = pids.filter { processIdentifier in
-            guard !inFlightAXWindowListPIDs.contains(processIdentifier) else {
+            // Never enumerate this process through AX off the main actor.
+            guard processIdentifier != ownProcessIdentifier,
+                  !inFlightAXWindowListPIDs.contains(processIdentifier) else {
                 return false
             }
             guard !force else {
@@ -1524,13 +1637,14 @@ final class WindowSwitcherController {
             return (matchingBounds.window, matchingBounds.snapshot)
         }
 
-        guard let first = available.first else {
+        // Positional fallback only when it cannot bind the wrong window.
+        guard title.isEmpty, available.count == 1, let only = available.first else {
             return nil
         }
-        return (first.window, first.snapshot)
+        return (only.window, only.snapshot)
     }
 
-    private func isRealWindow(info: [String: Any]) -> Bool {
+    private nonisolated static func isRealWindow(info: [String: Any]) -> Bool {
         if let alpha = info[kCGWindowAlpha as String] as? Double, alpha <= 0.05 {
             return false
         }
@@ -1569,6 +1683,12 @@ final class WindowSwitcherController {
         }
         if application.isHidden {
             return .dormant
+        }
+        if choice.processIdentifier == ownProcessIdentifier {
+            guard let window = ownedWindow(for: choice) else {
+                return .destroyed
+            }
+            return window.isMiniaturized ? .dormant : (window.isVisible ? .active : .destroyed)
         }
         if let minimized = choice.storedMinimized {
             return minimized ? .dormant : .active
@@ -1612,29 +1732,7 @@ final class WindowSwitcherController {
         return size
     }
 
-    private func axPosition(for element: AXUIElement) -> CGPoint? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &value) == .success,
-              let axValue = value,
-              CFGetTypeID(axValue) == AXValueGetTypeID() else {
-            return nil
-        }
-        var position = CGPoint.zero
-        guard AXValueGetValue((axValue as! AXValue), .cgPoint, &position) else {
-            return nil
-        }
-        return position
-    }
-
-    private func axBounds(for element: AXUIElement) -> CGRect? {
-        guard let position = axPosition(for: element),
-              let size = Self.axSize(for: element) else {
-            return nil
-        }
-        return CGRect(origin: position, size: size)
-    }
-
-    private func cgBounds(from info: [String: Any]) -> CGRect? {
+    private nonisolated static func cgBounds(from info: [String: Any]) -> CGRect? {
         guard let bounds = info[kCGWindowBounds as String] as? [String: Any],
               let x = bounds["X"] as? Double,
               let y = bounds["Y"] as? Double,
@@ -1652,7 +1750,7 @@ final class WindowSwitcherController {
             && abs(lhs.size.height - rhs.size.height) <= 12
     }
 
-    private func cgTitle(from info: [String: Any]) -> String {
+    private nonisolated static func cgTitle(from info: [String: Any]) -> String {
         (info[kCGWindowName as String] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
@@ -1680,11 +1778,13 @@ final class WindowSwitcherController {
         var updatedChoice = choice
         updatedChoice.storedFocused = true
         updatedChoice.storedMain = true
+        updatedChoice.recordedAt = CFAbsoluteTimeGetCurrent()
         // Focus always clears minimization; keep the recency model responsive
         // while the asynchronous AX operation is in flight.
         updatedChoice.storedMinimized = false
 
         focusGeneration &+= 1
+        backgroundFocusRecordGeneration &+= 1
         let generation = focusGeneration
         focusOperationGate.activate(generation)
         let started = CFAbsoluteTimeGetCurrent()
@@ -1692,16 +1792,11 @@ final class WindowSwitcherController {
         let targetWindow = WindowSwitcherAXElement(choice.axWindow)
         let focusOperationGate = self.focusOperationGate
         log("focus begin \(describe(choice)) frontmostBefore=\(frontmostDescription())")
-        expectFocusedWindowChange(to: choice, generation: generation)
-        scheduleAXObserverInstallation(for: choice)
 
         // AX calls against this process execute AppKit synchronously on the caller.
         // Use the owned NSWindow on the main actor, including minimized Settings.
-        if processIdentifier == ProcessInfo.processInfo.processIdentifier {
-            let ownedWindow = NSApp.windows.first { window in
-                choice.cgWindowIdentifier.map { window.windowNumber == Int($0) } ?? false
-            } ?? NSApp.windows.first { $0.title == choice.title && ($0.isVisible || $0.isMiniaturized) }
-            if let ownedWindow {
+        if processIdentifier == ownProcessIdentifier {
+            if let ownedWindow = ownedWindow(for: choice) {
                 if ownedWindow.isMiniaturized { ownedWindow.deminiaturize(nil) }
                 NSApp.activate(ignoringOtherApps: true)
                 ownedWindow.makeKeyAndOrderFront(nil)
@@ -1710,6 +1805,9 @@ final class WindowSwitcherController {
             }
             return updatedChoice
         }
+
+        expectFocusedWindowChange(to: choice, generation: generation)
+        scheduleAXObserverInstallation(for: choice)
 
         focusQueue.async { [weak self] in
             guard focusOperationGate.isCurrent(generation) else {
@@ -1896,11 +1994,18 @@ final class WindowSwitcherController {
         }
         let arrangedKeys = arrangedRows.map(\.key)
         if arrangedOverlayRowKeys != arrangedKeys {
-            overlayStack.arrangedSubviews.forEach {
-                overlayStack.removeArrangedSubview($0)
-                $0.removeFromSuperview()
+            // Rows leaving the visible range were removed from the stack above;
+            // only insert entering rows or move rows whose position changed.
+            for (index, entry) in arrangedRows.enumerated() {
+                let current = overlayStack.arrangedSubviews
+                if index < current.count, current[index] === entry.row.container {
+                    continue
+                }
+                if current.contains(where: { $0 === entry.row.container }) {
+                    overlayStack.removeArrangedSubview(entry.row.container)
+                }
+                overlayStack.insertArrangedSubview(entry.row.container, at: index)
             }
-            arrangedRows.forEach { overlayStack.addArrangedSubview($0.row.container) }
             arrangedOverlayRowKeys = arrangedKeys
         }
 
@@ -1912,10 +2017,13 @@ final class WindowSwitcherController {
     }
 
     private func makeOverlayWindow() -> NSWindow {
-        let contentView = NSView()
-        contentView.wantsLayer = true
-        contentView.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
-        contentView.layer?.cornerRadius = 14
+        // A visual-effect material resolves its colors from the effective
+        // appearance, so the overlay follows light/dark changes while running.
+        let contentView = NSVisualEffectView()
+        contentView.material = .hudWindow
+        contentView.blendingMode = .behindWindow
+        contentView.state = .active
+        contentView.maskImage = Self.overlayMaskImage(cornerRadius: 14)
 
         overlayStack.orientation = .vertical
         overlayStack.alignment = .leading
@@ -1943,6 +2051,18 @@ final class WindowSwitcherController {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         overlayWindow = window
         return window
+    }
+
+    private static func overlayMaskImage(cornerRadius: CGFloat) -> NSImage {
+        let edge = cornerRadius * 2 + 1
+        let image = NSImage(size: NSSize(width: edge, height: edge), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(top: cornerRadius, left: cornerRadius, bottom: cornerRadius, right: cornerRadius)
+        image.resizingMode = .stretch
+        return image
     }
 
     private func makeOverlayRow(rowWidth: CGFloat) -> OverlayRowViews {
@@ -2026,16 +2146,24 @@ final class WindowSwitcherController {
         }
     }
 
+    /// Rows that actually fit in the configured overlay height (48 pt rows,
+    /// 6 pt spacing, 14 pt insets), so the selection is never clipped.
+    private func effectiveVisibleRows() -> Int {
+        let height = CGFloat(max(120, configuration.windowSwitcher.height))
+        let rowsFittingHeight = Int((height - 28 + 6) / 54)
+        return max(1, min(configuration.windowSwitcher.maxVisibleRows, max(choices.count, 1), rowsFittingHeight))
+    }
+
     private func visibleRangeForSelection() -> Range<Int> {
         guard !choices.isEmpty else {
             return 0..<0
         }
-        let maxRows = max(1, configuration.windowSwitcher.maxVisibleRows)
+        let maxRows = effectiveVisibleRows()
         guard choices.count > maxRows else {
             return 0..<choices.count
         }
 
-        let buffer = 1
+        let buffer = maxRows >= 3 ? 1 : 0
         var start = max(0, selectedIndex - (maxRows - buffer - 1))
         if selectedIndex <= start + buffer {
             start = max(0, selectedIndex - buffer)
@@ -2048,7 +2176,7 @@ final class WindowSwitcherController {
     private func overlayFrame() -> NSRect {
         let screenFrame = overlayScreen()?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let width = CGFloat(max(320, configuration.windowSwitcher.width))
-        let rows = max(1, min(configuration.windowSwitcher.maxVisibleRows, max(choices.count, 1)))
+        let rows = effectiveVisibleRows()
         let height = min(CGFloat(max(120, configuration.windowSwitcher.height)), CGFloat(rows * 54 + 28))
         return NSRect(
             x: screenFrame.midX - width / 2,
@@ -2059,10 +2187,13 @@ final class WindowSwitcherController {
     }
 
     private func overlayScreen() -> NSScreen? {
-        let fallback = NSScreen.main ?? NSScreen.screens.first
+        // Rendering runs on every selection change; never read AX geometry here.
+        let fallback = lastOverlayScreen.flatMap { screen in
+            NSScreen.screens.contains(screen) ? screen : nil
+        } ?? NSScreen.main ?? NSScreen.screens.first
         guard configuration.windowSwitcher.followFocusedScreen,
               choices.indices.contains(selectedIndex),
-              let windowBounds = choices[selectedIndex].lastKnownBounds ?? axBounds(for: choices[selectedIndex].axWindow) else {
+              let windowBounds = choices[selectedIndex].lastKnownBounds else {
             return fallback
         }
         let ranked = NSScreen.screens.compactMap { screen -> (NSScreen, CGFloat)? in
@@ -2075,12 +2206,15 @@ final class WindowSwitcherController {
             return (screen, intersection.width * intersection.height)
         }
         guard let best = ranked.max(by: { $0.1 < $1.1 }), best.1 > 0 else { return fallback }
+        lastOverlayScreen = best.0
         return best.0
     }
 
     private func hideOverlay() {
         cancelBackwardRepeat()
         cancelScheduledOverlay()
+        shiftStepAwaitingTab = false
+        lastOverlayScreen = nil
         overlayWindow?.orderOut(nil)
     }
 
@@ -2090,6 +2224,8 @@ final class WindowSwitcherController {
         preferMainWindow: Bool = false
     ) -> Bool {
         let started = CFAbsoluteTimeGetCurrent()
+        // A synchronous record is newer than any in-flight background read.
+        backgroundFocusRecordGeneration &+= 1
         defer {
             logSlowAX("recordFocusedWindow", since: started)
         }
@@ -2136,11 +2272,210 @@ final class WindowSwitcherController {
             lastKnownBounds: cgIdentity?.bounds,
             storedMinimized: snapshot?.minimized,
             storedFocused: true,
-            storedMain: preferMainWindow
+            storedMain: preferMainWindow,
+            recordedAt: CFAbsoluteTimeGetCurrent()
         )
         remember(choice)
         scheduleAXObserverInstallation(for: choice)
         return true
+    }
+
+    private func ownedWindow(for choice: WindowChoice) -> NSWindow? {
+        NSApp.windows.first { window in
+            window !== overlayWindow
+                && (choice.cgWindowIdentifier.map { window.windowNumber == Int($0) } ?? false)
+        } ?? NSApp.windows.first { window in
+            window !== overlayWindow
+                && window.title == choice.title
+                && (window.isVisible || window.isMiniaturized)
+        }
+    }
+
+    private func ownedWindowChoice(
+        cgWindowIdentifier: CGWindowID?,
+        cgTitle: String,
+        bounds: CGRect?,
+        app: NSRunningApplication?,
+        ownerName: String
+    ) -> WindowChoice? {
+        guard let cgWindowIdentifier,
+              let window = NSApp.windows.first(where: { $0.windowNumber == Int(cgWindowIdentifier) }),
+              window !== overlayWindow,
+              window.canBecomeKey || window.canBecomeMain else {
+            return nil
+        }
+        let appName = app?.localizedName ?? ownerName
+        return WindowChoice(
+            key: "\(ownProcessIdentifier):ns:\(window.windowNumber)",
+            title: displayTitle(
+                cgTitle: cgTitle,
+                axTitle: window.title.trimmingCharacters(in: .whitespacesAndNewlines),
+                appName: appName
+            ),
+            appName: appName,
+            bundleIdentifier: app?.bundleIdentifier ?? "",
+            processIdentifier: ownProcessIdentifier,
+            icon: app?.icon,
+            // Placeholder identity only: this process is never messaged through AX.
+            axWindow: AXUIElementCreateApplication(ownProcessIdentifier),
+            cgWindowIdentifier: cgWindowIdentifier,
+            lastKnownBounds: bounds,
+            storedMinimized: window.isMiniaturized,
+            storedFocused: window.isKeyWindow,
+            storedMain: window.isMainWindow,
+            recordedAt: window.isKeyWindow ? CFAbsoluteTimeGetCurrent() : nil
+        )
+    }
+
+    private struct BackgroundFocusRecord: @unchecked Sendable {
+        let window: AXUIElement
+        let snapshot: AXWindowSnapshot?
+        let title: String
+        let cgWindowIdentifier: CGWindowID?
+        let bounds: CGRect?
+    }
+
+    /// Coalesced variant of `recordFocusedWindow` for bursty triggers (mouse-down,
+    /// window creation). AX and CGWindowList reads run on the serial focus queue;
+    /// the result is applied on the main actor only if no newer request started.
+    private func scheduleBackgroundFocusRecord(
+        expectedProcessIdentifier: pid_t? = nil,
+        preferMainWindow: Bool = false
+    ) {
+        if let pending = pendingBackgroundFocusRecordRequest {
+            pendingBackgroundFocusRecordRequest = (
+                pending.expectedProcessIdentifier == expectedProcessIdentifier ? expectedProcessIdentifier : nil,
+                preferMainWindow
+            )
+        } else {
+            pendingBackgroundFocusRecordRequest = (expectedProcessIdentifier, preferMainWindow)
+        }
+        guard !backgroundFocusRecordScheduled else {
+            return
+        }
+        backgroundFocusRecordScheduled = true
+        let now = CFAbsoluteTimeGetCurrent()
+        let delay = max(0.05, lastBackgroundFocusRecordAt + backgroundFocusRecordInterval - now)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.runBackgroundFocusRecord()
+        }
+    }
+
+    private func runBackgroundFocusRecord() {
+        backgroundFocusRecordScheduled = false
+        lastBackgroundFocusRecordAt = CFAbsoluteTimeGetCurrent()
+        guard let request = pendingBackgroundFocusRecordRequest else {
+            return
+        }
+        pendingBackgroundFocusRecordRequest = nil
+        guard eventTapRunLoop.isActive,
+              let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != ownProcessIdentifier,
+              app.bundleIdentifier != Bundle.main.bundleIdentifier,
+              request.expectedProcessIdentifier.map({ $0 == app.processIdentifier }) ?? true else {
+            return
+        }
+        backgroundFocusRecordGeneration &+= 1
+        let generation = backgroundFocusRecordGeneration
+        let processIdentifier = app.processIdentifier
+        let preferMainWindow = request.preferMainWindow
+        let started = CFAbsoluteTimeGetCurrent()
+        focusQueue.async { [weak self] in
+            let record = Self.readFocusedWindow(
+                processIdentifier: processIdentifier,
+                preferMainWindow: preferMainWindow
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.backgroundFocusRecordGeneration == generation,
+                      self.eventTapRunLoop.isActive,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier,
+                      let record,
+                      let app = NSRunningApplication(processIdentifier: processIdentifier) else {
+                    return
+                }
+                self.logSlowAX("background recordFocusedWindow", since: started)
+                let choice = WindowChoice(
+                    key: self.windowKey(processIdentifier: processIdentifier, axWindow: record.window),
+                    title: record.title.isEmpty ? "\(app.localizedName ?? "Application") Window" : record.title,
+                    appName: app.localizedName ?? app.bundleIdentifier ?? "Application",
+                    bundleIdentifier: app.bundleIdentifier ?? "",
+                    processIdentifier: processIdentifier,
+                    icon: app.icon,
+                    axWindow: record.window,
+                    cgWindowIdentifier: record.cgWindowIdentifier,
+                    lastKnownBounds: record.bounds,
+                    storedMinimized: record.snapshot?.minimized,
+                    storedFocused: true,
+                    storedMain: preferMainWindow,
+                    recordedAt: CFAbsoluteTimeGetCurrent()
+                )
+                self.remember(choice)
+                self.scheduleAXObserverInstallation(for: choice)
+            }
+        }
+    }
+
+    private nonisolated static func readFocusedWindow(
+        processIdentifier: pid_t,
+        preferMainWindow: Bool
+    ) -> BackgroundFocusRecord? {
+        let app = AXUIElementCreateApplication(processIdentifier)
+        AXUIElementSetMessagingTimeout(app, axMessagingTimeout)
+        func copyWindow(_ attribute: String) -> AXUIElement? {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(app, attribute as CFString, &value) == .success,
+                  let value,
+                  CFGetTypeID(value) == AXUIElementGetTypeID() else {
+                return nil
+            }
+            let window = value as! AXUIElement
+            AXUIElementSetMessagingTimeout(window, axMessagingTimeout)
+            return window
+        }
+        let preferredAttribute = preferMainWindow ? kAXMainWindowAttribute : kAXFocusedWindowAttribute
+        let fallbackAttribute = preferMainWindow ? kAXFocusedWindowAttribute : kAXMainWindowAttribute
+        guard let window = copyWindow(preferredAttribute) ?? copyWindow(fallbackAttribute) else {
+            return nil
+        }
+        let snapshot = copyAXWindowSnapshot(window)
+        if let snapshot {
+            guard snapshot.isSwitchable else {
+                return nil
+            }
+        } else {
+            guard isSwitchableAXWindow(window) else {
+                return nil
+            }
+        }
+        let title = (snapshot?.title ?? axStringAttribute(kAXTitleAttribute, for: window) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var cgWindowIdentifier: CGWindowID?
+        var bounds: CGRect?
+        if let infos = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] {
+            let candidates = infos.filter { info in
+                (info[kCGWindowLayer as String] as? Int) == 0
+                    && (info[kCGWindowOwnerPID as String] as? pid_t) == processIdentifier
+                    && isRealWindow(info: info)
+            }
+            let match = (!title.isEmpty ? candidates.first(where: { cgTitle(from: $0) == title }) : nil)
+                ?? (candidates.count == 1 ? candidates[0] : nil)
+            if let match {
+                cgWindowIdentifier = match[kCGWindowNumber as String] as? CGWindowID
+                bounds = cgBounds(from: match)
+            }
+        }
+        return BackgroundFocusRecord(
+            window: window,
+            snapshot: snapshot,
+            title: title,
+            cgWindowIdentifier: cgWindowIdentifier,
+            bounds: bounds
+        )
     }
 
     private func visibleCGWindowIdentity(
@@ -2153,19 +2488,19 @@ final class WindowSwitcherController {
         let candidates = windowInfo.filter { info in
             (info[kCGWindowLayer as String] as? Int) == 0
                 && (info[kCGWindowOwnerPID as String] as? pid_t) == processIdentifier
-                && isRealWindow(info: info)
+                && Self.isRealWindow(info: info)
         }
         if !title.isEmpty,
-           let titleMatch = candidates.first(where: { cgTitle(from: $0) == title }) {
+           let titleMatch = candidates.first(where: { Self.cgTitle(from: $0) == title }) {
             return (
                 titleMatch[kCGWindowNumber as String] as? CGWindowID,
-                cgBounds(from: titleMatch)
+                Self.cgBounds(from: titleMatch)
             )
         }
         if candidates.count == 1 {
             return (
                 candidates[0][kCGWindowNumber as String] as? CGWindowID,
-                cgBounds(from: candidates[0])
+                Self.cgBounds(from: candidates[0])
             )
         }
         return nil
@@ -2212,6 +2547,7 @@ final class WindowSwitcherController {
             recentKeys.removeLast(recentKeys.count - 80)
             for key in removed {
                 recentChoices[key] = nil
+                removeAXObserver(forWindowKey: key)
             }
         }
     }
@@ -2277,6 +2613,7 @@ final class WindowSwitcherController {
             }
             Task { @MainActor in
                 self?.removeAXObserver(processIdentifier: application.processIdentifier)
+                self?.removeAXWindowObservers(processIdentifier: application.processIdentifier)
                 self?.axWindowListCache[application.processIdentifier] = nil
                 self?.pruneRecentWindows()
             }
@@ -2342,9 +2679,9 @@ final class WindowSwitcherController {
         let dormantKeys = Set(recentKeys.filter { key in
             recentChoices[key].map(isDormantRecentChoice) ?? false
         })
-        recentKeys.sort { lhs, rhs in
-            dormantKeys.contains(lhs) && !dormantKeys.contains(rhs)
-        }
+        // Stable partition: active windows keep their recency, dormant ones go last.
+        recentKeys = recentKeys.filter { !dormantKeys.contains($0) }
+            + recentKeys.filter { dormantKeys.contains($0) }
         if overlayWindow?.isVisible == true {
             scheduleOverlayRebuild()
         }
@@ -2356,6 +2693,9 @@ final class WindowSwitcherController {
         }
         if application.isHidden {
             return true
+        }
+        if choice.processIdentifier == ownProcessIdentifier {
+            return ownedWindow(for: choice)?.isMiniaturized ?? true
         }
         if let minimized = choice.storedMinimized {
             return minimized
@@ -2413,7 +2753,8 @@ final class WindowSwitcherController {
     }
 
     private func scheduleAXObserverInstallation(for choice: WindowChoice) {
-        guard !pendingAXObserverInstallationKeys.contains(choice.key) else {
+        guard choice.processIdentifier != ownProcessIdentifier,
+              !pendingAXObserverInstallationKeys.contains(choice.key) else {
             return
         }
         pendingAXObserverInstallationKeys.insert(choice.key)
@@ -2480,6 +2821,13 @@ final class WindowSwitcherController {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observation.observer), .commonModes)
     }
 
+    private func removeAXWindowObservers(processIdentifier: pid_t) {
+        let prefix = "\(processIdentifier):"
+        for key in axWindowObservers.keys where key.hasPrefix(prefix) {
+            removeAXObserver(forWindowKey: key)
+        }
+    }
+
     private func removeAXObservers() {
         for observation in axApplicationObservers.values {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observation.observer), .commonModes)
@@ -2495,8 +2843,7 @@ final class WindowSwitcherController {
         log("AX notification=\(notification) pid=\(processIdentifier) elementHash=\(elementHash)")
         switch notification {
         case kAXUIElementDestroyedNotification:
-            axWindowListCache[processIdentifier] = nil
-            axWindowListPIDGenerations[processIdentifier, default: 0] &+= 1
+            markAXWindowListStale(processIdentifier: processIdentifier, removingElementHash: elementHash)
             let keys = recentKeys.filter { key in
                 recentChoices[key].map {
                     $0.processIdentifier == processIdentifier && CFHash($0.axWindow) == elementHash
@@ -2523,9 +2870,8 @@ final class WindowSwitcherController {
              kAXApplicationShownNotification:
             moveDormantWindowsToEnd()
         case kAXWindowCreatedNotification:
-            axWindowListCache[processIdentifier] = nil
-            axWindowListPIDGenerations[processIdentifier, default: 0] &+= 1
-            recordFocusedWindow(expectedProcessIdentifier: processIdentifier)
+            markAXWindowListStale(processIdentifier: processIdentifier, removingElementHash: nil)
+            scheduleBackgroundFocusRecord(expectedProcessIdentifier: processIdentifier)
         case kAXFocusedWindowChangedNotification:
             verifyFocusedWindowChangeIfNeeded(processIdentifier: processIdentifier, source: "notification")
             recordFocusedWindow(expectedProcessIdentifier: processIdentifier)
@@ -2541,6 +2887,20 @@ final class WindowSwitcherController {
         if overlayWindow?.isVisible == true {
             scheduleOverlayRebuild()
         }
+    }
+
+    /// Keeps the last-known-good AX list after a lifecycle change but forces the
+    /// next resolution to refresh it in the background.
+    private func markAXWindowListStale(processIdentifier: pid_t, removingElementHash elementHash: CFHashCode?) {
+        axWindowListPIDGenerations[processIdentifier, default: 0] &+= 1
+        if var entry = axWindowListCache[processIdentifier] {
+            if let elementHash {
+                entry.candidates.removeAll { CFHash($0.window) == elementHash }
+            }
+            entry.fetchedAt = 0
+            axWindowListCache[processIdentifier] = entry
+        }
+        scheduleAXWindowListRefresh(for: [processIdentifier])
     }
 
     private func updateStoredMinimizedState(
