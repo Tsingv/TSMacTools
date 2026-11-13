@@ -58,6 +58,9 @@ private final class MouseHotkeyTap {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var triggers = Set<HotkeyMouseShortcut>()
+    /// Buttons whose down event was consumed as a trigger. Their matching drag/up events are
+    /// suppressed too so the target application never sees an unpaired mouse-up.
+    private var consumedButtons = Set<Int64>()
     var onTrigger: ((HotkeyMouseShortcut) -> Void)?
 
     func apply(triggers: Set<HotkeyMouseShortcut>) -> Bool {
@@ -74,7 +77,9 @@ private final class MouseHotkeyTap {
             releaseTap()
         }
         if tap == nil {
-            let mask = CGEventMask(1) << CGEventType.otherMouseDown.rawValue
+            let mask = (CGEventMask(1) << CGEventType.otherMouseDown.rawValue)
+                | (CGEventMask(1) << CGEventType.otherMouseUp.rawValue)
+                | (CGEventMask(1) << CGEventType.otherMouseDragged.rawValue)
             let userInfo = Unmanaged.passUnretained(self).toOpaque()
             // Prefer the session stream used by the app's other event taps and by the
             // Hammerspoon behavior reference. Keep HID as a fallback for unusual hosts.
@@ -112,8 +117,14 @@ private final class MouseHotkeyTap {
             return false
         }
         if type == .tapDisabledByUserInput { return false }
-        guard type == .otherMouseDown else { return false }
         let button = event.getIntegerValueField(.mouseEventButtonNumber)
+        if type == .otherMouseUp {
+            return consumedButtons.remove(button) != nil
+        }
+        if type == .otherMouseDragged {
+            return consumedButtons.contains(button)
+        }
+        guard type == .otherMouseDown else { return false }
         let trigger = HotkeyMouseShortcut(
             button: Int(button),
             modifiers: hotkeyModifiers(from: event.flags)
@@ -126,12 +137,14 @@ private final class MouseHotkeyTap {
             trigger.modifiers.joined(separator: "+")
         )
         #endif
+        consumedButtons.insert(button)
         onTrigger?(trigger)
         return true
     }
 
     func invalidate() {
         triggers.removeAll()
+        consumedButtons.removeAll()
         releaseTap()
         onTrigger = nil
     }
@@ -142,6 +155,23 @@ private final class MouseHotkeyTap {
         if let tap { CFMachPortInvalidate(tap) }
         source = nil
         tap = nil
+    }
+}
+
+private final class ScriptTimeoutFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
     }
 }
 
@@ -597,26 +627,54 @@ final class GlobalHotkeyController {
             return
         }
 
-        let homeURL = normalizedFileURL(FileManager.default.homeDirectoryForCurrentUser)
-        let homePath = normalizedFilePath(homeURL)
-        let appElement = AXUIElementCreateApplication(finder.processIdentifier)
+        let homeURL = Self.normalizedFileURL(FileManager.default.homeDirectoryForCurrentUser)
+        let pid = finder.processIdentifier
+        // Finder AX reads can each take up to the messaging timeout. Run them off the main actor,
+        // examine at most a bounded number of windows, and apply the result back on main.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Self.resolveFinderHomeWindow(pid: pid, homePath: Self.normalizedFilePath(homeURL))
+            DispatchQueue.main.async {
+                switch result {
+                case .focusedIsHome:
+                    Self.sendCommandN()
+                case let .homeWindow(window, appElement):
+                    Self.focusFinderWindow(window.element, appElement: appElement.element)
+                case .none:
+                    _ = NSWorkspace.shared.open(homeURL)
+                }
+            }
+        }
+    }
+
+    private struct UncheckedAXElement: @unchecked Sendable {
+        let element: AXUIElement
+    }
+
+    private enum FinderHomeWindowResult: Sendable {
+        case focusedIsHome
+        case homeWindow(UncheckedAXElement, UncheckedAXElement)
+        case none
+    }
+
+    nonisolated private static let maxFinderWindowsInspected = 12
+
+    nonisolated private static func resolveFinderHomeWindow(pid: pid_t, homePath: String) -> FinderHomeWindowResult {
+        let appElement = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(appElement, 0.2)
 
         if let focusedWindow = focusedWindow(in: appElement),
            finderWindowURL(focusedWindow).map(normalizedFilePath) == homePath {
-            sendCommandN()
-            return
+            return .focusedIsHome
         }
 
-        if let homeWindow = finderWindows(in: appElement).first(where: { finderWindowURL($0).map(normalizedFilePath) == homePath }) {
-            focusFinderWindow(homeWindow, appElement: appElement)
-            return
+        let candidates = finderWindows(in: appElement).prefix(maxFinderWindowsInspected)
+        if let homeWindow = candidates.first(where: { finderWindowURL($0).map(normalizedFilePath) == homePath }) {
+            return .homeWindow(UncheckedAXElement(element: homeWindow), UncheckedAXElement(element: appElement))
         }
-
-        _ = NSWorkspace.shared.open(homeURL)
+        return .none
     }
 
-    private func focusedWindow(in appElement: AXUIElement) -> AXUIElement? {
+    nonisolated private static func focusedWindow(in appElement: AXUIElement) -> AXUIElement? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &value) == .success,
               let value,
@@ -626,7 +684,7 @@ final class GlobalHotkeyController {
         return (value as! AXUIElement)
     }
 
-    private func finderWindows(in appElement: AXUIElement) -> [AXUIElement] {
+    nonisolated private static func finderWindows(in appElement: AXUIElement) -> [AXUIElement] {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
               let windows = value as? [AXUIElement] else {
@@ -636,7 +694,7 @@ final class GlobalHotkeyController {
         return windows
     }
 
-    private func finderWindowURL(_ window: AXUIElement) -> URL? {
+    nonisolated private static func finderWindowURL(_ window: AXUIElement) -> URL? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(window, kAXDocumentAttribute as CFString, &value) == .success,
               let value else {
@@ -656,22 +714,22 @@ final class GlobalHotkeyController {
         return URL(fileURLWithPath: string)
     }
 
-    private func normalizedFileURL(_ url: URL) -> URL {
+    nonisolated private static func normalizedFileURL(_ url: URL) -> URL {
         url.standardizedFileURL.resolvingSymlinksInPath()
     }
 
-    private func normalizedFilePath(_ url: URL) -> String {
+    nonisolated private static func normalizedFilePath(_ url: URL) -> String {
         normalizedFileURL(url).path
     }
 
-    private func focusFinderWindow(_ window: AXUIElement, appElement: AXUIElement) {
+    private static func focusFinderWindow(_ window: AXUIElement, appElement: AXUIElement) {
         _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
         _ = AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
         _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
         _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
     }
 
-    private func sendCommandN() {
+    private static func sendCommandN() {
         let source = CGEventSource(stateID: .hidSystemState)
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_N), keyDown: true)
         let keyUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_N), keyDown: false)
@@ -710,7 +768,11 @@ final class GlobalHotkeyController {
             showStatusWindow(title: "Translation Disabled", body: "Enable selected-text translation in Settings before using this shortcut.")
             return
         }
-        copySelectionToPasteboard { [weak self] selectedText in
+        let windowID = configuration.translation.nativeWindow.id
+        copySelectionToPasteboard(onCopied: { [weak self] in
+            // Show progress as soon as the copy lands instead of after the full fallback delay.
+            self?.showTranslationLoadingWindow(id: windowID)
+        }) { [weak self] selectedText in
             guard let self else {
                 return
             }
@@ -721,17 +783,16 @@ final class GlobalHotkeyController {
                 return
             }
 
-            self.showTranslationLoadingWindow(id: self.configuration.translation.nativeWindow.id)
             self.runScript(path: "scripts/translate_selection.py", function: "main", inputText: sourceText, title: "LLM Translate")
         }
     }
 
     private func runScriptAction(_ action: HotkeyAction) {
-        let run: (String) -> Void = { [weak self] inputText in
+        let run: (String, Bool) -> Void = { [weak self] inputText, loadingShown in
             guard let self else {
                 return
             }
-            if let nativeWindowID = action.nativeWindowID {
+            if let nativeWindowID = action.nativeWindowID, !loadingShown {
                 self.showTranslationLoadingWindow(id: nativeWindowID)
             }
             self.runScript(path: action.path, function: action.function, inputText: inputText, title: "Script")
@@ -739,25 +800,48 @@ final class GlobalHotkeyController {
 
         switch action.input {
         case "selectedText":
-            copySelectionToPasteboard { [weak self] selectedText in
+            copySelectionToPasteboard(onCopied: { [weak self] in
+                if let nativeWindowID = action.nativeWindowID {
+                    self?.showTranslationLoadingWindow(id: nativeWindowID)
+                }
+            }) { [weak self] selectedText in
                 let sourceText = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !sourceText.isEmpty else {
                     self?.showStatusWindow(title: "Script", body: "没有读取到选中文本")
                     return
                 }
-                run(sourceText)
+                run(sourceText, true)
             }
         default:
-            run("")
+            run("", false)
         }
     }
 
-    private func copySelectionToPasteboard(completion: @escaping @MainActor (String) -> Void) {
+    /// Snapshot of every pasteboard item with all of its types, so restoring after a synthetic
+    /// copy preserves images, files, and rich text rather than only the plain-string flavor.
+    private static func snapshotPasteboardItems(_ pasteboard: NSPasteboard) -> [NSPasteboardItem] {
+        (pasteboard.pasteboardItems ?? []).map { item in
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    copy.setData(data, forType: type)
+                }
+            }
+            return copy
+        }
+    }
+
+    private func copySelectionToPasteboard(
+        onCopied: (@MainActor () -> Void)? = nil,
+        completion: @escaping @MainActor (String) -> Void
+    ) {
         let started = CFAbsoluteTimeGetCurrent()
-        logHotkey("copySelection begin configuredDelay=\(configuration.translation.copyKeystrokeDelay)s")
+        let maximumWait = configuration.translation.copyKeystrokeDelay
+        logHotkey("copySelection begin maxWait=\(maximumWait)s")
         let pasteboard = NSPasteboard.general
-        let previous = pasteboard.string(forType: .string)
+        let previousItems = Self.snapshotPasteboardItems(pasteboard)
         pasteboard.clearContents()
+        let clearedChangeCount = pasteboard.changeCount
 
         let source = CGEventSource(stateID: .hidSystemState)
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_C), keyDown: true)
@@ -767,15 +851,27 @@ final class GlobalHotkeyController {
         keyDown?.post(tap: .cghidEventTap)
         keyUp?.post(tap: .cghidEventTap)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + configuration.translation.copyKeystrokeDelay) {
-            let copied = pasteboard.string(forType: .string) ?? ""
-            if let previous {
-                pasteboard.clearContents()
-                pasteboard.setString(previous, forType: .string)
+        let deadline = Date().addingTimeInterval(maximumWait)
+        // Poll changeCount so a fast copy completes early; `copyKeystrokeDelay` is the upper bound.
+        func poll() {
+            let changed = pasteboard.changeCount != clearedChangeCount
+            guard changed || Date() >= deadline else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { poll() }
+                return
             }
-            self.logHotkey("copySelection end elapsed=\(self.elapsedMilliseconds(since: started)) bytes=\(copied.utf8.count)")
+            let copied = changed ? (pasteboard.string(forType: .string) ?? "") : ""
+            // Restore every original item; an originally empty pasteboard is restored as empty.
+            pasteboard.clearContents()
+            if !previousItems.isEmpty {
+                pasteboard.writeObjects(previousItems)
+            }
+            self.logHotkey("copySelection end elapsed=\(self.elapsedMilliseconds(since: started)) changed=\(changed) bytes=\(copied.utf8.count)")
+            if !copied.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                onCopied?()
+            }
             completion(copied)
         }
+        DispatchQueue.main.async { poll() }
     }
 
     private func runScript(path: String?, function: String?, inputText: String, title: String) {
@@ -815,18 +911,19 @@ final class GlobalHotkeyController {
             }
         }
 
+        let payload: Data
         do {
-            try process.run()
-            logHotkey("runScript process started elapsed=\(elapsedMilliseconds(since: started)) pid=\(process.processIdentifier)")
             let context = ScriptExecutionContext(configuration: configuration, inputText: inputText)
-            let payload = try JSONEncoder().encode(context)
-            input.fileHandleForWriting.write(payload)
-            try input.fileHandleForWriting.close()
-        } catch {
-            showStatusWindow(title: title, body: error.localizedDescription)
+            payload = try JSONEncoder().encode(context)
+        } catch let encodeError {
+            output.fileHandleForReading.readabilityHandler = nil
+            error.fileHandleForReading.readabilityHandler = nil
+            showStatusWindow(title: title, body: encodeError.localizedDescription)
             return
         }
 
+        let timedOut = ScriptTimeoutFlag()
+        // Assign before run() so a script that exits immediately cannot race past the handler.
         process.terminationHandler = { [weak self] _ in
             output.fileHandleForReading.readabilityHandler = nil
             error.fileHandleForReading.readabilityHandler = nil
@@ -834,15 +931,23 @@ final class GlobalHotkeyController {
             outputBuffer.appendError(error.fileHandleForReading.readDataToEndOfFile())
             let data = outputBuffer.outputData()
             let errorText = outputBuffer.errorText()
+            let didTimeOut = timedOut.isSet
             Task { @MainActor in
                 guard let self else {
                     return
                 }
                 self.logHotkey(
-                    "runScript terminated elapsed=\(self.elapsedMilliseconds(since: started)) status=\(process.terminationStatus) stdoutBytes=\(data.count) stderrBytes=\(errorText.utf8.count)"
+                    "runScript terminated elapsed=\(self.elapsedMilliseconds(since: started)) status=\(process.terminationStatus) timedOut=\(didTimeOut) stdoutBytes=\(data.count) stderrBytes=\(errorText.utf8.count)"
                 )
                 if !errorText.isEmpty {
                     self.logHotkey("runScript stderr=\(errorText.prefix(1000))")
+                }
+                if didTimeOut {
+                    self.showStatusWindow(
+                        title: title,
+                        body: "Script timed out after \(Int(Self.scriptTimeout)) seconds and was terminated: \(scriptURL.lastPathComponent)"
+                    )
+                    return
                 }
                 do {
                     let command = try PythonScriptBridge().decodeCommand(from: data)
@@ -852,7 +957,39 @@ final class GlobalHotkeyController {
                 }
             }
         }
+
+        do {
+            try process.run()
+        } catch let launchError {
+            process.terminationHandler = nil
+            output.fileHandleForReading.readabilityHandler = nil
+            error.fileHandleForReading.readabilityHandler = nil
+            showStatusWindow(title: title, body: launchError.localizedDescription)
+            return
+        }
+        logHotkey("runScript process started elapsed=\(elapsedMilliseconds(since: started)) pid=\(process.processIdentifier)")
+
+        // A large payload can fill the stdin pipe; write it off main. SIGPIPE is ignored at app
+        // launch, so a script that exits early surfaces as a thrown write error instead of a crash.
+        let stdinHandle = input.fileHandleForWriting
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try stdinHandle.write(contentsOf: payload)
+                try stdinHandle.close()
+            } catch {
+                try? stdinHandle.close()
+                if process.isRunning { process.terminate() }
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.scriptTimeout) {
+            guard process.isRunning else { return }
+            timedOut.set()
+            process.terminate()
+        }
     }
+
+    private static let scriptTimeout: TimeInterval = 120
 
     private func scriptURL(for path: String) -> URL {
         if path.hasPrefix("/") {

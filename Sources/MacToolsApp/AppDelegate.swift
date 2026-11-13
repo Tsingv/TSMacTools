@@ -8,7 +8,13 @@ final class NativeWindowManager: NSObject, WindowManaging {
 
     private var windows: [NativeWindowID: NSWindow] = [:]
     private var pinButtons: [NativeWindowID: PinButton] = [:]
-    private let configurationStore = UserConfigurationStore()
+    /// Pushed by AppDelegate on configuration load, reload, and Settings save so showing or
+    /// resigning a window never re-reads the configuration file from disk.
+    private var translationWindow: TranslationWindowSettings?
+
+    func updateTranslationWindowSettings(_ settings: TranslationWindowSettings) {
+        translationWindow = settings
+    }
 
     func showWindow(id: NativeWindowID, content: NativeWindowContent) {
         let translationWindow = translationWindowSettings(for: id)
@@ -16,9 +22,13 @@ final class NativeWindowManager: NSObject, WindowManaging {
         let size = translationWindow.map { NSSize(width: $0.width, height: $0.height) } ?? NSSize(width: 640, height: 420)
         let pinned = pinButtons[id]?.isPinned ?? translationWindow?.pinByDefault ?? false
 
-        let contentView = isTranslationLoading(content.body) ? loadingView() : textContentView(for: content, size: size)
+        let existingWindow = windows[id]
+        let isNewWindow = existingWindow == nil
+        // Updates keep the user's current size; only a new window starts at the configured size.
+        let contentSize = existingWindow?.contentView?.bounds.size ?? size
+        let contentView = isTranslationLoading(content.body) ? loadingView() : textContentView(for: content, size: contentSize)
 
-        let window = windows[id] ?? NSWindow(
+        let window = existingWindow ?? NSWindow(
             contentRect: NSRect(x: 120, y: 120, width: size.width, height: size.height),
             styleMask: isTranslationWindow ? [.titled, .closable, .resizable, .utilityWindow] : [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
@@ -33,13 +43,33 @@ final class NativeWindowManager: NSObject, WindowManaging {
 
         if isTranslationWindow {
             installPinButton(for: id, in: window, pinned: pinned)
-            window.setContentSize(size)
         }
 
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        if isNewWindow {
+            window.setContentSize(size)
+            centerOnMouseScreen(window)
+            // Activate only on first presentation; content updates must not pull focus again.
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+        } else if !window.isVisible {
+            window.makeKeyAndOrderFront(nil)
+        }
         focusFirstTextView(in: window)
         windows[id] = window
+    }
+
+    private func centerOnMouseScreen(_ window: NSWindow) {
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else {
+            window.center()
+            return
+        }
+        let frame = window.frame
+        window.setFrameOrigin(NSPoint(
+            x: visible.midX - frame.width / 2,
+            y: visible.midY - frame.height / 2
+        ))
     }
 
     func closeWindow(id: NativeWindowID) {
@@ -53,13 +83,15 @@ final class NativeWindowManager: NSObject, WindowManaging {
             return CollapsibleThinkingContentView(content: content, size: size)
         }
 
-        let textView = NSTextView(frame: NSRect(origin: .zero, size: size))
+        let scrollView = NSTextView.scrollableTextView()
+        scrollView.frame = NSRect(origin: .zero, size: size)
+        guard let textView = scrollView.documentView as? NSTextView else {
+            return scrollView
+        }
         textView.isEditable = false
         textView.isSelectable = true
         textView.isRichText = true
         textView.textContainerInset = NSSize(width: 18, height: 18)
-        textView.autoresizingMask = [.width, .height]
-        textView.textContainer?.widthTracksTextView = true
         textView.font = .systemFont(ofSize: 14)
         textView.drawsBackground = true
         textView.backgroundColor = .textBackgroundColor
@@ -75,11 +107,9 @@ final class NativeWindowManager: NSObject, WindowManaging {
             textView.textStorage?.setAttributedString(dynamicColors(for: attributed))
         }
 
-        let scrollView = NSScrollView(frame: textView.frame)
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor
-        scrollView.documentView = textView
         return scrollView
     }
 
@@ -91,9 +121,7 @@ final class NativeWindowManager: NSObject, WindowManaging {
     }
 
     private func loadingView() -> NSView {
-        let container = NSView()
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
+        let container = DynamicLayerBackgroundView(color: .textBackgroundColor)
 
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -138,18 +166,16 @@ final class NativeWindowManager: NSObject, WindowManaging {
     }
 
     private func translationWindowSettings(for id: NativeWindowID) -> TranslationWindowSettings? {
-        guard let configuration = try? configurationStore.bootstrap().configuration,
-              configuration.translation.nativeWindow.id == id.rawValue else {
+        guard let translationWindow, translationWindow.id == id.rawValue else {
             return nil
         }
-        return configuration.translation.nativeWindow
+        return translationWindow
     }
 
     private func dynamicColors(for attributedString: NSAttributedString) -> NSAttributedString {
         let mutable = NSMutableAttributedString(attributedString: attributedString)
         let fullRange = NSRange(location: 0, length: mutable.length)
         mutable.addAttribute(.foregroundColor, value: NSColor.labelColor, range: fullRange)
-        mutable.addAttribute(.backgroundColor, value: NSColor.textBackgroundColor, range: fullRange)
         mutable.enumerateAttribute(.font, in: fullRange) { value, range, _ in
             if value == nil {
                 mutable.addAttribute(.font, value: NSFont.systemFont(ofSize: 14), range: range)
@@ -175,8 +201,7 @@ final class NativeWindowManager: NSObject, WindowManaging {
 
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 14),
-            .foregroundColor: NSColor.labelColor,
-            .backgroundColor: NSColor.textBackgroundColor
+            .foregroundColor: NSColor.labelColor
         ]
         return NSAttributedString(string: text, attributes: attributes)
     }
@@ -185,7 +210,6 @@ final class NativeWindowManager: NSObject, WindowManaging {
         let mutable = NSMutableAttributedString(attributedString: attributedString)
         let fullRange = NSRange(location: 0, length: mutable.length)
         mutable.addAttribute(.foregroundColor, value: NSColor.labelColor, range: fullRange)
-        mutable.addAttribute(.backgroundColor, value: NSColor.textBackgroundColor, range: fullRange)
         mutable.enumerateAttribute(.font, in: fullRange) { value, range, _ in
             if value == nil {
                 mutable.addAttribute(.font, value: NSFont.systemFont(ofSize: 14), range: range)
@@ -238,6 +262,44 @@ final class NativeWindowManager: NSObject, WindowManaging {
     }
 }
 
+/// Layer-backed view whose background follows light/dark changes. A `cgColor` captured once
+/// is a static snapshot, so it is resolved again in `updateLayer` for the current appearance.
+private class DynamicLayerBackgroundView: NSView {
+    var backgroundColor: NSColor {
+        didSet { needsDisplay = true }
+    }
+    private let cornerRadius: CGFloat
+
+    init(color: NSColor, cornerRadius: CGFloat = 0) {
+        backgroundColor = color
+        self.cornerRadius = cornerRadius
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        super.updateLayer()
+        var resolved = backgroundColor.cgColor
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            resolved = backgroundColor.cgColor
+        }
+        layer?.backgroundColor = resolved
+        layer?.cornerRadius = cornerRadius
+        layer?.masksToBounds = cornerRadius > 0
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
 private extension NSView {
     func firstDescendant<T: NSView>(ofType type: T.Type) -> T? {
         if let view = self as? T {
@@ -253,7 +315,7 @@ private extension NSView {
 }
 
 @MainActor
-private final class CollapsibleThinkingContentView: NSView {
+private final class CollapsibleThinkingContentView: DynamicLayerBackgroundView {
     private let body: NativeWindowContent.Body
     private let textView: NSTextView
     private let toggleButton: NSButton
@@ -263,7 +325,8 @@ private final class CollapsibleThinkingContentView: NSView {
         self.body = content.body
         self.textView = NSTextView(frame: NSRect(origin: .zero, size: size))
         self.toggleButton = NSButton(title: "", target: nil, action: nil)
-        super.init(frame: NSRect(origin: .zero, size: size))
+        super.init(color: .textBackgroundColor)
+        frame = NSRect(origin: .zero, size: size)
         buildView(size: size)
         updateContent()
     }
@@ -273,9 +336,6 @@ private final class CollapsibleThinkingContentView: NSView {
     }
 
     private func buildView(size: NSSize) {
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
-
         toggleButton.target = self
         toggleButton.action = #selector(toggleThinking)
         toggleButton.bezelStyle = .rounded
@@ -286,7 +346,14 @@ private final class CollapsibleThinkingContentView: NSView {
         textView.isSelectable = true
         textView.isRichText = true
         textView.textContainerInset = NSSize(width: 18, height: 18)
-        textView.autoresizingMask = [.width, .height]
+        // Standard scrollable text configuration: width tracks the clip view, height grows with
+        // content so long results scroll instead of being clipped.
+        textView.minSize = NSSize(width: 0, height: size.height)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.containerSize = NSSize(width: size.width, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = true
         textView.drawsBackground = true
         textView.backgroundColor = .textBackgroundColor
@@ -387,11 +454,10 @@ final class TransientAlertPresenter: NSObject, NSWindowDelegate {
         panel.isReleasedWhenClosed = false
         panel.delegate = self
 
-        let container = NSView()
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
-        container.layer?.cornerRadius = 12
-        container.layer?.masksToBounds = true
+        let container = DynamicLayerBackgroundView(
+            color: NSColor.windowBackgroundColor.withAlphaComponent(0.96),
+            cornerRadius: 12
+        )
 
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -512,6 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recordingStatusTimer: Timer?
     private var defaultStatusImage: NSImage?
     private var smoothScrollSuspendedForCapture = false
+    private let nativeWindowManager = NativeWindowManager()
 
     static func main() {
         #if DEBUG
@@ -588,12 +655,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installStatusItem()
         installMainMenu()
         configureCaptureControllers()
+        // Script stdin writes must surface a closed pipe as an error instead of killing the app.
+        signal(SIGPIPE, SIG_IGN)
 
-        let manager = NativeWindowManager()
         let permissionClient = AccessibilityPermissionClient()
-        configurationBootstrap = try? configurationStore.bootstrap()
+        var bootstrapError: Error?
+        do {
+            configurationBootstrap = try configurationStore.bootstrap()
+        } catch {
+            bootstrapError = error
+        }
         runtime = AutomationRuntime(
-            windowManager: manager,
+            windowManager: nativeWindowManager,
             permissionChecker: permissionClient
         )
         if let runtime, let configuration = configurationBootstrap?.configuration {
@@ -603,6 +676,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let permissions = runtime?.permissionSnapshot()
         if permissions?.accessibility != .granted {
             runtime?.requestAccessibilityPermissionPrompt()
+        }
+        if let bootstrapError {
+            showStatusWindow(
+                title: "Configuration Error",
+                body: "\(bootstrapError.localizedDescription) Fix the configuration file and choose Reload Configuration."
+            )
         }
     }
 
@@ -616,11 +695,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         var replied = false
+        // Fan restoration and recording finalization share one 1.5-second cap.
+        var pending = 2
         let finish: @MainActor @Sendable () -> Void = {
             guard !replied else { return }; replied = true
             sender.reply(toApplicationShouldTerminate: true)
         }
-        fanRuntime.shutdown { DispatchQueue.main.async { finish() } }
+        let completeOne: @MainActor @Sendable () -> Void = {
+            pending -= 1
+            if pending <= 0 { finish() }
+        }
+        fanRuntime.shutdown { DispatchQueue.main.async { completeOne() } }
+        screenRecordingController.stop { completeOne() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { finish() }
         return .terminateLater
     }
@@ -685,31 +771,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Pause mouse-wheel smoothing while the screenshot overlay is adjusting sizes.
+    /// Pause mouse-wheel smoothing while the screenshot overlay is adjusting sizes. Suspension
+    /// only disables the existing event tap; it does not tear down and rebuild it.
     private func setSmoothScrollSuspendedForCapture(_ suspended: Bool) {
-        guard let smoothScrollController else { return }
-        guard let scroll = configurationBootstrap?.configuration.scroll else { return }
-        if suspended {
-            guard !smoothScrollSuspendedForCapture else { return }
-            smoothScrollSuspendedForCapture = true
-            var paused = scroll
-            paused.enabled = false
-            smoothScrollController.apply(paused)
-        } else if smoothScrollSuspendedForCapture {
-            smoothScrollSuspendedForCapture = false
-            smoothScrollController.apply(scroll)
-        }
-    }
-
-    private func applyScrollSettingsRespectingCaptureSuspension(_ settings: ScrollSettings) {
-        guard let smoothScrollController else { return }
-        if smoothScrollSuspendedForCapture {
-            var paused = settings
-            paused.enabled = false
-            smoothScrollController.apply(paused)
-        } else {
-            smoothScrollController.apply(settings)
-        }
+        guard smoothScrollSuspendedForCapture != suspended else { return }
+        smoothScrollSuspendedForCapture = suspended
+        smoothScrollController?.setSuspended(suspended)
     }
 
     @objc private func captureScreenshot() {
@@ -780,6 +847,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startAutomation(runtime: AutomationRuntime, configuration: UserConfiguration) {
+        nativeWindowManager.updateTranslationWindowSettings(configuration.translation.nativeWindow)
         fanRuntime.apply(configuration.fans)
         fanRuntime.start()
         let windowSwitcherController: WindowSwitcherController
@@ -817,17 +885,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hotkeyController = controller
         }
 
-        if smoothScrollController != nil {
-            applyScrollSettingsRespectingCaptureSuspension(configuration.scroll)
+        if let smoothScrollController {
+            smoothScrollController.apply(configuration.scroll)
         } else {
-            let initial = smoothScrollSuspendedForCapture
-                ? {
-                    var paused = configuration.scroll
-                    paused.enabled = false
-                    return paused
-                }()
-                : configuration.scroll
-            let controller = SmoothScrollController(settings: initial)
+            let controller = SmoothScrollController(settings: configuration.scroll)
+            if smoothScrollSuspendedForCapture {
+                controller.setSuspended(true)
+            }
             controller.start()
             smoothScrollController = controller
         }
@@ -933,6 +997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyAutomationChange(from previous: UserConfiguration, to configuration: UserConfiguration) {
+        nativeWindowManager.updateTranslationWindowSettings(configuration.translation.nativeWindow)
         fanRuntime.apply(configuration.fans)
 
         guard previous != configuration, let runtime else {

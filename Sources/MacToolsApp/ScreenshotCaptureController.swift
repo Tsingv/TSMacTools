@@ -299,9 +299,15 @@ private final class ScreenshotOverlaySession: NSObject {
                 self?.onCancel()
             }
         )
-        view.frame = CGRect(origin: .zero, size: screen.frame.size)
+        let container = NSView(frame: CGRect(origin: .zero, size: screen.frame.size))
+        container.wantsLayer = true
+        container.layer?.contents = freezeImage
+        container.layer?.contentsGravity = .resize
+        container.layer?.contentsScale = scale
+        view.frame = container.bounds
         view.autoresizingMask = [.width, .height]
-        window.contentView = view
+        container.addSubview(view)
+        window.contentView = container
         window.isReleasedWhenClosed = false
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -369,6 +375,10 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
     private var textEditor: ScreenshotTextEditor?
     private var textOrigin: CGPoint?
     private var scrollAccumulator: CGFloat = 0
+    /// Area painted by the previous draw pass, so the next invalidation also erases it.
+    private var lastDamage = CGRect.null
+    /// Blurred previews keyed by annotation; recomputed only when bounds or radius change.
+    private var mosaicCache: [UUID: (bounds: CGRect, radius: CGFloat, image: NSImage, drawRect: CGRect)] = [:]
 
     private enum Phase {
         case selecting
@@ -427,22 +437,74 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
         cursorTracking = area
     }
 
+    /// Marks only the union of the previous and current selection/annotation areas dirty.
+    private func invalidateOverlay() {
+        let current = overlayDamageRect()
+        setNeedsDisplay(current.union(lastDamage))
+        lastDamage = current
+    }
+
+    private func overlayDamageRect() -> CGRect {
+        guard selection.width > 1, selection.height > 1 else { return bounds }
+        var rect = selection.insetBy(dx: -8, dy: -8)
+        for annotation in annotations {
+            rect = rect.union(damageRect(for: annotation))
+        }
+        if let draft {
+            rect = rect.union(damageRect(for: draft))
+        }
+        return rect.intersection(bounds)
+    }
+
+    private func damageRect(for annotation: CaptureAnnotationItem) -> CGRect {
+        switch annotation.tool {
+        case .text:
+            let label = (annotation.text.isEmpty ? "Text" : annotation.text) as NSString
+            let size = label.size(withAttributes: [.font: NSFont.boldSystemFont(ofSize: annotation.fontSize)])
+            return CGRect(origin: annotation.end, size: size).insetBy(dx: -4, dy: -4)
+        case .sequence:
+            let radius = max(10, annotation.lineWidth * 4) + 2
+            return CGRect(x: annotation.end.x - radius, y: annotation.end.y - radius, width: radius * 2, height: radius * 2)
+        default:
+            let outset = annotation.lineWidth * 4 + 4
+            return annotation.bounds.insetBy(dx: -outset, dy: -outset)
+        }
+    }
+
+    private func mosaicPreview(for annotation: CaptureAnnotationItem) -> (image: NSImage, drawRect: CGRect)? {
+        if let cached = mosaicCache[annotation.id],
+           cached.bounds == annotation.bounds,
+           cached.radius == annotation.blurRadius {
+            return (cached.image, cached.drawRect)
+        }
+        guard let blurred = CaptureAnnotationRenderer.blurredRegion(
+            of: freezeImage,
+            rect: annotation.bounds,
+            radius: annotation.blurRadius,
+            overlaySize: bounds.size
+        ) else {
+            mosaicCache[annotation.id] = nil
+            return nil
+        }
+        // NSImage respects isFlipped; raw CGContext.draw would vertically offset the blur.
+        let image = NSImage(cgImage: blurred.cgImage, size: blurred.drawRect.size)
+        mosaicCache[annotation.id] = (annotation.bounds, annotation.blurRadius, image, blurred.drawRect)
+        return (image, blurred.drawRect)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         context.saveGState()
         context.interpolationQuality = .high
-        // NSImage respects isFlipped; raw CGImage draws would appear upside-down.
-        let freeze = NSImage(cgImage: freezeImage, size: bounds.size)
-        freeze.draw(in: bounds)
-
+        // The frozen image is the container layer's contents; this view draws only the dimming
+        // outside the selection plus chrome and annotations over a transparent backing store.
+        context.clear(dirtyRect)
         context.setFillColor(NSColor.black.withAlphaComponent(0.45).cgColor)
-        context.fill(bounds)
 
         if selection.width > 1, selection.height > 1 {
-            context.saveGState()
-            context.clip(to: selection)
-            freeze.draw(in: bounds)
-            context.restoreGState()
+            context.addRect(bounds)
+            context.addRect(selection)
+            context.fillPath(using: .evenOdd)
 
             for annotation in annotations {
                 drawAnnotation(annotation, in: context)
@@ -464,6 +526,8 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
                     context.stroke(handleRect)
                 }
             }
+        } else {
+            context.fill(bounds)
         }
         context.restoreGState()
     }
@@ -507,15 +571,8 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
         case .ellipse:
             context.strokeEllipse(in: annotation.bounds)
         case .mosaic:
-            if let blurred = CaptureAnnotationRenderer.blurredRegion(
-                of: freezeImage,
-                rect: annotation.bounds,
-                radius: annotation.blurRadius,
-                overlaySize: bounds.size
-            ) {
-                // NSImage respects isFlipped; raw CGContext.draw would vertically offset the blur.
-                let preview = NSImage(cgImage: blurred.cgImage, size: blurred.drawRect.size)
-                preview.draw(in: blurred.drawRect)
+            if let preview = mosaicPreview(for: annotation) {
+                preview.image.draw(in: preview.drawRect)
             } else {
                 context.setFillColor(NSColor.black.withAlphaComponent(0.25).cgColor)
                 context.fill(annotation.bounds)
@@ -563,7 +620,7 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
                     activeHandle = handle
                     handleStartSelection = selection
                     dragStart = point
-                    needsDisplay = true
+                    invalidateOverlay()
                     return
                 }
                 return
@@ -574,7 +631,7 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
                 activeHandle = handle
                 handleStartSelection = selection
                 dragStart = point
-                needsDisplay = true
+                invalidateOverlay()
                 return
             }
 
@@ -596,7 +653,7 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
             )
             dragStart = point
         }
-        needsDisplay = true
+        invalidateOverlay()
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -620,14 +677,14 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
                 self.draft = draft
             }
         }
-        needsDisplay = true
+        invalidateOverlay()
     }
 
     override func mouseUp(with event: NSEvent) {
         defer {
             dragStart = nil
             activeHandle = nil
-            needsDisplay = true
+            invalidateOverlay()
         }
         switch phase {
         case .selecting:
@@ -710,7 +767,7 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
             }
         }
         toolbar?.updateAdjustmentSummary(tool: tool, lineWidth: lineWidth, fontSize: fontSize, blurRadius: blurRadius)
-        needsDisplay = true
+        invalidateOverlay()
     }
 
     override func keyDown(with event: NSEvent) {
@@ -748,8 +805,9 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
 
     private func undoLastAnnotation() {
         guard !annotations.isEmpty else { return }
-        annotations.removeLast()
-        needsDisplay = true
+        let removed = annotations.removeLast()
+        mosaicCache[removed.id] = nil
+        invalidateOverlay()
     }
 
     private func commit(copyOnly: Bool) {
@@ -846,7 +904,7 @@ private final class ScreenshotOverlayView: NSView, NSTextViewDelegate {
                 blurRadius: blurRadius
             )
         )
-        needsDisplay = true
+        invalidateOverlay()
     }
 
     func textDidEndEditing(_ notification: Notification) {

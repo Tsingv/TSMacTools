@@ -57,6 +57,74 @@ final class SmoothScrollControllerTests: XCTestCase {
         controller.shutdown()
     }
 
+    func testOffMainUnreadyDisplayPassesThroughAndStartsAsynchronouslyOnMain() throws {
+        let fixture = Fixture()
+        fixture.frame.hasDeliveredFrame = false
+        let controller = fixture.makeController()
+        controller.start()
+        let event = try makeScrollEvent(targetPID: 101)
+        let startsBefore = fixture.frame.startCount
+
+        // The main thread is blocked on a semaphore, so any synchronous main hop would deadlock
+        // and the semaphore would time out.
+        let finished = DispatchSemaphore(value: 0)
+        var disposition: ScrollTapDisposition?
+        DispatchQueue.global(qos: .userInteractive).async {
+            disposition = fixture.tap.trigger(.scroll(event))
+            _ = fixture.tap.trigger(.disabled)
+            finished.signal()
+        }
+        XCTAssertEqual(finished.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(disposition, .passThrough)
+        XCTAssertEqual(fixture.frame.startCount, startsBefore)
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertEqual(fixture.frame.startCount, startsBefore + 1)
+        XCTAssertTrue(fixture.posts.values.isEmpty)
+        controller.shutdown()
+    }
+
+    func testSuspendDisablesExistingTapWithoutRebuildAndResumeReenablesIt() throws {
+        let fixture = Fixture()
+        let controller = fixture.makeController()
+        controller.start()
+        XCTAssertEqual(fixture.tap.installCount, 1)
+
+        controller.setSuspended(true)
+        XCTAssertTrue(fixture.tap.isInstalled)
+        XCTAssertFalse(fixture.tap.isEnabled)
+        XCTAssertEqual(fixture.tap.trigger(.scroll(try makeScrollEvent(targetPID: 101))), .passThrough)
+        fixture.scheduler.advance(by: 3)
+        XCTAssertFalse(fixture.tap.isEnabled, "health checks must not re-enable a suspended tap")
+
+        controller.setSuspended(false)
+        XCTAssertTrue(fixture.tap.isEnabled)
+        XCTAssertEqual(fixture.tap.installCount, 1)
+        XCTAssertEqual(fixture.tap.removeCount, 0)
+        XCTAssertEqual(fixture.tap.trigger(.scroll(try makeScrollEvent(targetPID: 101))), .consume)
+        controller.shutdown()
+    }
+
+    func testDisableRemovesTapAfterReleasingOperationLock() {
+        let fixture = Fixture()
+        let controller = fixture.makeController()
+        controller.start()
+        let callbackFinished = DispatchSemaphore(value: 0)
+        fixture.tap.onRemove = {
+            // Simulates the tap thread entering a controller callback during teardown.
+            DispatchQueue.global(qos: .userInteractive).async {
+                _ = fixture.tap.trigger(.cancelMotion)
+                callbackFinished.signal()
+            }
+            XCTAssertEqual(callbackFinished.wait(timeout: .now() + 1), .success)
+        }
+
+        controller.apply(ScrollSettings(enabled: false))
+
+        XCTAssertEqual(fixture.tap.removeCount, 1)
+        controller.shutdown()
+    }
+
     func testDisplayStartWithoutFirstCallbackPassesThroughUntilReady() throws {
         let fixture = Fixture()
         fixture.frame.hasDeliveredFrame = false
@@ -896,10 +964,13 @@ private final class FakeEventTap: ScrollEventTapDriving, @unchecked Sendable {
         if setEnabledSucceeds { isEnabled = enabled }
     }
 
+    var onRemove: (() -> Void)?
+
     func remove() {
         removeCount += 1
         isInstalled = false
         isEnabled = false
+        onRemove?()
     }
 
     func invalidate() {
