@@ -113,6 +113,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case outputTokenLimit
         case requestTokenLimit
         case apiKey
+        case thinkingLevel
         case googleAPIKey
         case screenshotSaveDirectory
         case recordingSaveDirectory
@@ -164,6 +165,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private var saveGeneration = 0
     private var applicationIcons: [String: NSImage] = [:]
     private var providerPopup: NSPopUpButton?
+    private var modelPopup: NSPopUpButton?
+    private var thinkingLevelPopup: NSPopUpButton?
+    private var modelsStatusLabel: NSTextField?
+    private var modelLimitsLabel: NSTextField?
+    private var llmModels: [LLMModelDescriptor] = []
+    private var modelsFetchGeneration = 0
 
     private var presetPopup: NSPopUpButton?
     private var presetSummary: NSTextField?
@@ -602,17 +609,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                      hint: "Root adds /v1/chat/completions; a path adds /chat/completions. Complete chat/completions URLs and queries are preserved.",
                      control: editableField(TranslationEndpoint.baseURL(configuration.translation.endpoint), field: .endpoint, width: 320)), translationProviders(["llm"])),
             (formRow(title: "LLM model",
-                     hint: "Provider model identifier.",
-                     control: editableField(configuration.translation.model, field: .model, width: 320)), translationProviders(["llm"])),
-            (formRow(title: "Context tokens",
-                     hint: "Total context-window budget.",
-                     control: editableField(String(configuration.translation.contextWindowTokens), field: .contextWindowTokens, width: 110)), translationProviders(["llm"])),
-            (formRow(title: "Output tokens",
-                     hint: "Maximum completion budget.",
-                     control: editableField(String(configuration.translation.outputTokenLimit), field: .outputTokenLimit, width: 110)), translationProviders(["llm"])),
-            (formRow(title: "Request tokens",
-                     hint: "On-demand request budget; 0 disables the clamp.",
-                     control: editableField(String(configuration.translation.requestTokenLimit), field: .requestTokenLimit, width: 110)), translationProviders(["llm"])),
+                     hint: "Discovered from /v1/models when Base URL and API key are reachable.",
+                     control: makeModelPicker()), translationProviders(["llm"])),
+            (formRow(title: "Thinking level",
+                     hint: "reasoning.effort values advertised by the selected model.",
+                     control: makeThinkingLevelPicker()), translationProviders(["llm"])),
+            (formRow(title: "Model catalog",
+                     hint: "Refresh after changing Base URL or API key.",
+                     control: makeModelsRefreshControl()), translationProviders(["llm"])),
+            (formRow(title: "Model limits",
+                     hint: "Filled from /v1/models for the selected model. Not edited manually.",
+                     control: makeModelLimitsLabel()), translationProviders(["llm"])),
             (formRow(title: "LLM API key",
                      hint: "Stored in your local JSONC file and masked here.",
                      control: editableField(configuration.translation.apiKey, field: .apiKey, width: 320, secure: true)), translationProviders(["llm"])),
@@ -1521,6 +1528,299 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         configuration.translation.provider = provider
         persist { $0.translation.provider = provider }
         applyConditionalVisibility(for: selectedPage)
+        if provider == "llm" {
+            refreshLLMModels(userInitiated: false)
+        }
+    }
+
+    private func makeModelPicker() -> NSPopUpButton {
+        let popup = NSPopUpButton()
+        popup.target = self
+        popup.action = #selector(modelChanged(_:))
+        // Match Base URL / API key width so long model IDs cannot stretch the card.
+        popup.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        popup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        popup.setContentHuggingPriority(.required, for: .horizontal)
+        if let cell = popup.cell as? NSPopUpButtonCell {
+            cell.lineBreakMode = .byTruncatingTail
+            cell.usesItemFromMenu = true
+        }
+        modelPopup = popup
+        rebuildModelPopup()
+        refreshLLMModels(userInitiated: false)
+        return popup
+    }
+
+    private func makeThinkingLevelPicker() -> NSPopUpButton {
+        let popup = NSPopUpButton()
+        popup.target = self
+        popup.action = #selector(thinkingLevelChanged(_:))
+        thinkingLevelPopup = popup
+        rebuildThinkingLevelPopup()
+        return popup
+    }
+
+    private func makeModelsRefreshControl() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 8
+
+        let button = NSButton(title: "Refresh models", target: self, action: #selector(refreshModelsClicked(_:)))
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+
+        let status = NSTextField(labelWithString: "")
+        status.font = .systemFont(ofSize: 11)
+        status.textColor = .secondaryLabelColor
+        status.lineBreakMode = .byTruncatingTail
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        status.widthAnchor.constraint(lessThanOrEqualToConstant: 220).isActive = true
+        modelsStatusLabel = status
+
+        stack.addArrangedSubview(button)
+        stack.addArrangedSubview(status)
+        return stack
+    }
+
+    private func makeModelLimitsLabel() -> NSTextField {
+        let label = NSTextField(labelWithString: "")
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.widthAnchor.constraint(lessThanOrEqualToConstant: 320).isActive = true
+        modelLimitsLabel = label
+        refreshModelLimitsLabel()
+        return label
+    }
+
+    private func refreshModelLimitsLabel() {
+        guard let label = modelLimitsLabel else { return }
+        if let model = llmModels.first(where: { $0.id == configuration.translation.model }),
+           let budget = TranslationTokenBudget.derived(from: model) {
+            label.stringValue = budget.summary
+            label.toolTip = "Synced from /v1/models for \(model.id)"
+            return
+        }
+        if configuration.translation.contextWindowTokens > 0 {
+            label.stringValue = TranslationTokenBudget.Values(
+                contextWindowTokens: configuration.translation.contextWindowTokens,
+                outputTokenLimit: configuration.translation.outputTokenLimit,
+                requestTokenLimit: configuration.translation.requestTokenLimit
+            ).summary + " (saved)"
+            label.toolTip = "Waiting for /v1/models; showing the last saved values."
+            return
+        }
+        label.stringValue = "Unavailable until /v1/models loads"
+        label.toolTip = "Select a reachable Base URL and refresh the model catalog."
+    }
+
+    @objc private func refreshModelsClicked(_ sender: NSButton) {
+        refreshLLMModels(userInitiated: true)
+    }
+
+    @objc private func modelChanged(_ sender: NSPopUpButton) {
+        guard sender.indexOfSelectedItem >= 0,
+              let modelID = sender.selectedItem?.representedObject as? String,
+              !modelID.isEmpty else { return }
+        applySelectedModel(modelID, updateBudgets: true)
+    }
+
+    @objc private func thinkingLevelChanged(_ sender: NSPopUpButton) {
+        guard sender.indexOfSelectedItem >= 0,
+              let level = sender.selectedItem?.representedObject as? String else { return }
+        applyThinkingLevel(level)
+    }
+
+    private func applySelectedModel(_ modelID: String, updateBudgets: Bool) {
+        configuration.translation.model = modelID
+        if let model = llmModels.first(where: { $0.id == modelID }) {
+            if model.supportsReasoningParameter {
+                configuration.translation.thinkingParameter = "reasoning"
+            }
+            if updateBudgets, let budget = TranslationTokenBudget.derived(from: model) {
+                configuration.translation.contextWindowTokens = budget.contextWindowTokens
+                configuration.translation.outputTokenLimit = budget.outputTokenLimit
+                configuration.translation.requestTokenLimit = budget.requestTokenLimit
+            }
+            let levels = model.reasoningLevels
+            let current = TranslationThinking.normalizedLevel(
+                thinkingLevel: configuration.translation.thinkingLevel,
+                thinkingEnabled: configuration.translation.thinkingEnabled,
+                availableLevels: levels
+            )
+            let resolved: String
+            if levels.isEmpty {
+                resolved = configuration.translation.thinkingEnabled ? "high" : "none"
+            } else if levels.contains(current) {
+                resolved = current
+            } else {
+                resolved = levels.contains("none") ? "none" : (levels.first ?? current)
+            }
+            configuration.translation.thinkingLevel = resolved
+            configuration.translation.thinkingEnabled = TranslationThinking.isEnabled(level: resolved)
+        }
+        persist { latest in
+            latest.translation.model = modelID
+            latest.translation.thinkingParameter = self.configuration.translation.thinkingParameter
+            latest.translation.thinkingLevel = self.configuration.translation.thinkingLevel
+            latest.translation.thinkingEnabled = self.configuration.translation.thinkingEnabled
+            if updateBudgets {
+                latest.translation.contextWindowTokens = self.configuration.translation.contextWindowTokens
+                latest.translation.outputTokenLimit = self.configuration.translation.outputTokenLimit
+                latest.translation.requestTokenLimit = self.configuration.translation.requestTokenLimit
+            }
+        }
+        rebuildThinkingLevelPopup()
+        refreshModelLimitsLabel()
+    }
+
+    private func applyThinkingLevel(_ level: String) {
+        let normalized = TranslationThinking.normalizedLevel(
+            thinkingLevel: level,
+            thinkingEnabled: TranslationThinking.isEnabled(level: level)
+        )
+        configuration.translation.thinkingLevel = normalized
+        configuration.translation.thinkingEnabled = TranslationThinking.isEnabled(level: normalized)
+        if configuration.translation.thinkingParameter == "include_reasoning"
+            || configuration.translation.thinkingParameter.isEmpty {
+            configuration.translation.thinkingParameter = "reasoning"
+        }
+        persist { latest in
+            latest.translation.thinkingLevel = normalized
+            latest.translation.thinkingEnabled = TranslationThinking.isEnabled(level: normalized)
+            latest.translation.thinkingParameter = self.configuration.translation.thinkingParameter
+        }
+    }
+
+    private func rebuildModelPopup() {
+        guard let popup = modelPopup else { return }
+        let current = configuration.translation.model
+        popup.removeAllItems()
+        let models = LLMModelCatalog.chatCompletionModels(in: llmModels)
+        if models.isEmpty {
+            let title = current.isEmpty ? "No models loaded" : current
+            popup.addItem(withTitle: title)
+            popup.lastItem?.representedObject = current
+            popup.lastItem?.toolTip = title
+            popup.selectItem(at: 0)
+            popup.toolTip = title
+            popup.isEnabled = !current.isEmpty
+            return
+        }
+        for model in models {
+            // Menu items keep the full title; only the closed button truncates via fixed width.
+            popup.addItem(withTitle: model.menuTitle)
+            popup.lastItem?.representedObject = model.id
+            popup.lastItem?.toolTip = model.menuTitle
+        }
+        if !models.contains(where: { $0.id == current }), !current.isEmpty {
+            let customTitle = "\(current) (custom)"
+            popup.insertItem(withTitle: customTitle, at: 0)
+            popup.item(at: 0)?.representedObject = current
+            popup.item(at: 0)?.toolTip = customTitle
+        }
+        if let index = popup.itemArray.firstIndex(where: { ($0.representedObject as? String) == current }) {
+            popup.selectItem(at: index)
+        } else if popup.numberOfItems > 0 {
+            popup.selectItem(at: 0)
+        }
+        popup.toolTip = popup.selectedItem?.title
+        popup.isEnabled = true
+    }
+
+    private func rebuildThinkingLevelPopup() {
+        guard let popup = thinkingLevelPopup else { return }
+        let model = llmModels.first(where: { $0.id == configuration.translation.model })
+        var levels = model?.reasoningLevels ?? []
+        if levels.isEmpty {
+            levels = configuration.translation.thinkingEnabled ? ["high"] : ["none"]
+            if model?.supportsReasoningParameter == true, !levels.contains("none") {
+                levels.insert("none", at: 0)
+            }
+        }
+        let current = TranslationThinking.normalizedLevel(
+            thinkingLevel: configuration.translation.thinkingLevel,
+            thinkingEnabled: configuration.translation.thinkingEnabled,
+            availableLevels: levels
+        )
+        popup.removeAllItems()
+        for level in levels {
+            let title: String
+            switch level {
+            case "none", "off": title = "Off (\(level))"
+            default: title = level
+            }
+            popup.addItem(withTitle: title)
+            popup.lastItem?.representedObject = level
+        }
+        if !levels.contains(current) {
+            popup.insertItem(withTitle: "\(current) (saved)", at: 0)
+            popup.item(at: 0)?.representedObject = current
+        }
+        if let index = popup.itemArray.firstIndex(where: { ($0.representedObject as? String) == current }) {
+            popup.selectItem(at: index)
+        } else if popup.numberOfItems > 0 {
+            popup.selectItem(at: 0)
+        }
+        popup.isEnabled = model?.supportsReasoningParameter != false || !(model?.reasoningLevels.isEmpty ?? true)
+    }
+
+    private func refreshLLMModels(userInitiated: Bool) {
+        guard configuration.translation.provider == "llm" else { return }
+        guard let modelsURLString = TranslationEndpoint.modelsURL(from: configuration.translation.endpoint),
+              let modelsURL = URL(string: modelsURLString) else {
+            modelsStatusLabel?.stringValue = "Invalid Base URL"
+            return
+        }
+        modelsFetchGeneration += 1
+        let generation = modelsFetchGeneration
+        if userInitiated {
+            modelsStatusLabel?.stringValue = "Loading…"
+        }
+        let apiKey = configuration.translation.apiKey
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var request = URLRequest(url: modelsURL)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 15
+            if !apiKey.isEmpty {
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            }
+            let result: Result<[LLMModelDescriptor], Error>
+            do {
+                let (data, response) = try Self.fetchData(for: request)
+                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                    let body = String(data: data, encoding: .utf8) ?? ""
+                    throw MutationError.invalidValue("HTTP \(http.statusCode) from /v1/models\(body.isEmpty ? "" : ": \(body.prefix(180))")")
+                }
+                result = .success(try LLMModelCatalog.parse(data))
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                guard let self, generation == self.modelsFetchGeneration else { return }
+                switch result {
+                case .success(let models):
+                    self.llmModels = models
+                    let chatModels = LLMModelCatalog.chatCompletionModels(in: models)
+                    self.modelsStatusLabel?.stringValue = "\(chatModels.count) chat models"
+                    self.rebuildModelPopup()
+                    if chatModels.contains(where: { $0.id == self.configuration.translation.model }) {
+                        // Always rewrite token budgets from /v1/models so Settings never keeps a stale manual value.
+                        self.applySelectedModel(self.configuration.translation.model, updateBudgets: true)
+                    } else {
+                        self.rebuildThinkingLevelPopup()
+                        self.refreshModelLimitsLabel()
+                    }
+                case .failure(let error):
+                    self.modelsStatusLabel?.stringValue = userInitiated ? error.localizedDescription : "Models unavailable"
+                    self.rebuildModelPopup()
+                    self.rebuildThinkingLevelPopup()
+                    self.refreshModelLimitsLabel()
+                }
+            }
+        }
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
@@ -1599,10 +1899,15 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             let value = try TranslationEndpoint.requestURL(rawValue)
             configuration.translation.endpoint = value
             persist { $0.translation.endpoint = value }
+            refreshLLMModels(userInitiated: true)
         case .model:
             let value = try requiredText(rawValue, name: "LLM model")
             configuration.translation.model = value
             persist { $0.translation.model = value }
+            rebuildModelPopup()
+            rebuildThinkingLevelPopup()
+        case .thinkingLevel:
+            applyThinkingLevel(rawValue)
         case .contextWindowTokens:
             let value = try positiveInt(rawValue, name: "Context tokens")
             configuration.translation.contextWindowTokens = value
@@ -1620,6 +1925,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .apiKey:
             configuration.translation.apiKey = rawValue
             persist { $0.translation.apiKey = rawValue }
+            refreshLLMModels(userInitiated: true)
         case .googleAPIKey:
             configuration.translation.googleApiKey = rawValue
             persist { $0.translation.googleApiKey = rawValue }
@@ -1672,6 +1978,30 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         return value
     }
 
+    private static func fetchData(for request: URLRequest) throws -> (Data, URLResponse) {
+        let box = FetchBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            box.data = data
+            box.response = response
+            box.error = error
+            semaphore.signal()
+        }
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + request.timeoutInterval + 1)
+        if let error = box.error { throw error }
+        guard let data = box.data, let response = box.response else {
+            throw MutationError.invalidValue("No response from /v1/models.")
+        }
+        return (data, response)
+    }
+
+    private final class FetchBox: @unchecked Sendable {
+        var data: Data?
+        var response: URLResponse?
+        var error: Error?
+    }
+
     private func displayedValue(for field: ConfigurationField) -> String {
         switch field {
         case .switcherWidth: String(configuration.windowSwitcher.width)
@@ -1688,6 +2018,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .copyKeystrokeDelay: String(format: "%.2f", configuration.translation.copyKeystrokeDelay)
         case .endpoint: TranslationEndpoint.baseURL(configuration.translation.endpoint)
         case .model: configuration.translation.model
+        case .thinkingLevel: TranslationThinking.normalizedLevel(
+            thinkingLevel: configuration.translation.thinkingLevel,
+            thinkingEnabled: configuration.translation.thinkingEnabled
+        )
         case .contextWindowTokens: String(configuration.translation.contextWindowTokens)
         case .outputTokenLimit: String(configuration.translation.outputTokenLimit)
         case .requestTokenLimit: String(configuration.translation.requestTokenLimit)

@@ -471,6 +471,9 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
     public var googleWebClient: String
     public var model: String
     public var thinkingEnabled: Bool
+    /// Selected reasoning effort from `/v1/models` (`none`, `low`, `high`, …). Empty means derive from `thinkingEnabled`.
+    public var thinkingLevel: String
+    /// Request-shape adapter: `reasoning` (OpenAI-compatible effort object), `include_reasoning`, `enable_thinking`, `reasoning_format`, or `none`.
     public var thinkingParameter: String
     public var contextWindowTokens: Int
     public var outputTokenLimit: Int
@@ -496,10 +499,11 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         googleWebClient: String = "gtx",
         model: String,
         thinkingEnabled: Bool = false,
-        thinkingParameter: String = "include_reasoning",
+        thinkingLevel: String = "",
+        thinkingParameter: String = "reasoning",
         contextWindowTokens: Int = 262144,
         outputTokenLimit: Int = 2048,
-        requestTokenLimit: Int = 8000,
+        requestTokenLimit: Int = 0,
         temperature: Double,
         promptTemplate: String,
         systemPrompt: String,
@@ -520,6 +524,7 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         self.googleWebClient = googleWebClient
         self.model = model
         self.thinkingEnabled = thinkingEnabled
+        self.thinkingLevel = thinkingLevel
         self.thinkingParameter = thinkingParameter
         self.contextWindowTokens = contextWindowTokens
         self.outputTokenLimit = outputTokenLimit
@@ -546,6 +551,7 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         case googleWebClient
         case model
         case thinkingEnabled
+        case thinkingLevel
         case thinkingParameter
         case contextWindowTokens
         case outputTokenLimit
@@ -573,10 +579,11 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         self.googleWebClient = try container.decodeIfPresent(String.self, forKey: .googleWebClient) ?? "gtx"
         self.model = try container.decode(String.self, forKey: .model)
         self.thinkingEnabled = try container.decodeIfPresent(Bool.self, forKey: .thinkingEnabled) ?? false
-        self.thinkingParameter = try container.decodeIfPresent(String.self, forKey: .thinkingParameter) ?? "include_reasoning"
+        self.thinkingLevel = try container.decodeIfPresent(String.self, forKey: .thinkingLevel) ?? ""
+        self.thinkingParameter = try container.decodeIfPresent(String.self, forKey: .thinkingParameter) ?? "reasoning"
         self.contextWindowTokens = try container.decodeIfPresent(Int.self, forKey: .contextWindowTokens) ?? 262144
         self.outputTokenLimit = try container.decodeIfPresent(Int.self, forKey: .outputTokenLimit) ?? 2048
-        self.requestTokenLimit = try container.decodeIfPresent(Int.self, forKey: .requestTokenLimit) ?? 8000
+        self.requestTokenLimit = try container.decodeIfPresent(Int.self, forKey: .requestTokenLimit) ?? 0
         self.temperature = try container.decode(Double.self, forKey: .temperature)
         self.promptTemplate = try container.decode(String.self, forKey: .promptTemplate)
         self.systemPrompt = try container.decode(String.self, forKey: .systemPrompt)
@@ -606,6 +613,7 @@ public struct TranslationSettings: Equatable, Codable, Sendable {
         }
         try container.encode(model, forKey: .model)
         try container.encode(thinkingEnabled, forKey: .thinkingEnabled)
+        try container.encode(thinkingLevel, forKey: .thinkingLevel)
         try container.encode(thinkingParameter, forKey: .thinkingParameter)
         try container.encode(contextWindowTokens, forKey: .contextWindowTokens)
         try container.encode(outputTokenLimit, forKey: .outputTokenLimit)
@@ -705,10 +713,11 @@ public extension UserConfiguration {
                 googleWebClient: "gtx",
                 model: "qwen/qwen3.6-27b",
                 thinkingEnabled: false,
-                thinkingParameter: "include_reasoning",
+                thinkingLevel: "none",
+                thinkingParameter: "reasoning",
                 contextWindowTokens: 262144,
                 outputTokenLimit: 2048,
-                requestTokenLimit: 8000,
+                requestTokenLimit: 0,
                 temperature: 0.2,
                 promptTemplate: """
                 You are a professional English translator with strong knowledge of computing terms.
@@ -871,5 +880,244 @@ public enum TranslationEndpoint {
         // A root-level custom endpoint would otherwise acquire an unwanted /v1 on save.
         guard !parts.percentEncodedPath.isEmpty else { return endpoint }
         return parts.string ?? endpoint
+    }
+
+    /// Derives the OpenAI-compatible `/models` discovery URL from a chat-completions endpoint.
+    public static func modelsURL(from endpoint: String) -> String? {
+        guard var parts = URLComponents(string: endpoint),
+              ["http", "https"].contains(parts.scheme?.lowercased() ?? ""),
+              let host = parts.host, !host.isEmpty else { return nil }
+        let path = parts.percentEncodedPath.replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
+        if path.hasSuffix("/chat/completions") {
+            parts.percentEncodedPath = String(path.dropLast("/chat/completions".count)) + "/models"
+        } else if path.hasSuffix("/v1") || path.hasSuffix("/openai/v1") {
+            parts.percentEncodedPath = path + "/models"
+        } else if path.isEmpty {
+            parts.percentEncodedPath = "/v1/models"
+        } else if path.hasSuffix("/models") {
+            parts.percentEncodedPath = path
+        } else {
+            parts.percentEncodedPath = path + "/models"
+        }
+        parts.percentEncodedQuery = nil
+        parts.fragment = nil
+        return parts.string
+    }
+}
+
+public struct LLMModelDescriptor: Equatable, Sendable {
+    public var id: String
+    public var displayName: String
+    public var reasoning: Bool
+    public var reasoningLevels: [String]
+    public var supportedParameters: [String]
+    public var nativeEndpoints: [String]
+    public var contextWindowTokens: Int?
+    public var maxOutputTokens: Int?
+
+    public init(
+        id: String,
+        displayName: String,
+        reasoning: Bool,
+        reasoningLevels: [String],
+        supportedParameters: [String] = [],
+        nativeEndpoints: [String] = [],
+        contextWindowTokens: Int? = nil,
+        maxOutputTokens: Int? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.reasoning = reasoning
+        self.reasoningLevels = reasoningLevels
+        self.supportedParameters = supportedParameters
+        self.nativeEndpoints = nativeEndpoints
+        self.contextWindowTokens = contextWindowTokens
+        self.maxOutputTokens = maxOutputTokens
+    }
+
+    public var supportsChatCompletions: Bool {
+        guard !nativeEndpoints.isEmpty else { return true }
+        return nativeEndpoints.contains { endpoint in
+            endpoint == "/v1/chat/completions" || endpoint.hasSuffix("/chat/completions")
+        }
+    }
+
+    public var supportsReasoningParameter: Bool {
+        supportedParameters.contains("reasoning") || reasoning
+    }
+
+    public var menuTitle: String {
+        if displayName.isEmpty || displayName == id { return id }
+        return "\(displayName) · \(id)"
+    }
+}
+
+public enum LLMModelCatalog {
+    public enum ParseError: LocalizedError {
+        case invalidPayload
+        public var errorDescription: String? { "The /v1/models response was not a recognizable model list." }
+    }
+
+    public static func parse(_ data: Data) throws -> [LLMModelDescriptor] {
+        let object = try JSONSerialization.jsonObject(with: data)
+        let items: [[String: Any]]
+        if let root = object as? [String: Any] {
+            if let dataItems = root["data"] as? [[String: Any]] {
+                items = dataItems
+            } else if let models = root["models"] as? [[String: Any]] {
+                items = models
+            } else {
+                throw ParseError.invalidPayload
+            }
+        } else if let array = object as? [[String: Any]] {
+            items = array
+        } else {
+            throw ParseError.invalidPayload
+        }
+
+        return items.compactMap { item in
+            guard let id = stringValue(item["id"])?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else {
+                return nil
+            }
+            let displayName = stringValue(item["display_name"])
+                ?? stringValue(item["name"])
+                ?? stringValue(item["magpie_label"])
+                ?? id
+            let levels = reasoningLevels(from: item)
+            let parameters = stringArray(item["supported_parameters"])
+            let endpoints = stringArray(item["native_endpoints"])
+            let reasoning = boolValue(item["reasoning"]) ?? (!levels.isEmpty || parameters.contains("reasoning"))
+            return LLMModelDescriptor(
+                id: id,
+                displayName: displayName,
+                reasoning: reasoning,
+                reasoningLevels: levels,
+                supportedParameters: parameters,
+                nativeEndpoints: endpoints,
+                contextWindowTokens: intValue(item["context_window"]) ?? intValue(item["context_length"]) ?? intValue(item["max_input_tokens"]),
+                maxOutputTokens: intValue(item["max_output_tokens"])
+            )
+        }
+    }
+
+    public static func chatCompletionModels(in models: [LLMModelDescriptor]) -> [LLMModelDescriptor] {
+        models.filter(\.supportsChatCompletions)
+    }
+
+    private static func reasoningLevels(from item: [String: Any]) -> [String] {
+        var levels: [String] = []
+        if let values = item["reasoning_levels"] as? [Any] {
+            levels.append(contentsOf: values.compactMap(stringValue).map { $0.lowercased() })
+        }
+        if let values = item["supported_reasoning_levels"] as? [[String: Any]] {
+            for value in values {
+                if let effort = stringValue(value["effort"]) {
+                    levels.append(effort.lowercased())
+                }
+            }
+        }
+        var seen = Set<String>()
+        return levels.filter { seen.insert($0).inserted }
+    }
+
+    private static func stringValue(_ value: Any?) -> String? {
+        switch value {
+        case let string as String:
+            return string
+        case let number as NSNumber:
+            return number.stringValue
+        default:
+            return nil
+        }
+    }
+
+    private static func stringArray(_ value: Any?) -> [String] {
+        guard let values = value as? [Any] else { return [] }
+        return values.compactMap(stringValue)
+    }
+
+    private static func boolValue(_ value: Any?) -> Bool? {
+        switch value {
+        case let flag as Bool:
+            return flag
+        case let number as NSNumber:
+            return number.boolValue
+        default:
+            return nil
+        }
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        switch value {
+        case let number as Int:
+            return number
+        case let number as NSNumber:
+            return number.intValue
+        case let string as String:
+            return Int(string)
+        default:
+            return nil
+        }
+    }
+}
+
+public enum TranslationThinking {
+    public static func normalizedLevel(
+        thinkingLevel: String,
+        thinkingEnabled: Bool,
+        availableLevels: [String] = []
+    ) -> String {
+        let trimmed = thinkingLevel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !trimmed.isEmpty {
+            return trimmed == "off" ? "none" : trimmed
+        }
+        if thinkingEnabled {
+            let preferred = availableLevels.first { $0 != "none" && $0 != "off" } ?? "high"
+            return preferred
+        }
+        if availableLevels.contains("none") { return "none" }
+        return "none"
+    }
+
+    public static func isEnabled(level: String) -> Bool {
+        let normalized = level.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !(normalized.isEmpty || normalized == "none" || normalized == "off")
+    }
+}
+
+public enum TranslationTokenBudget {
+    public struct Values: Equatable, Sendable {
+        public var contextWindowTokens: Int
+        public var outputTokenLimit: Int
+        /// Service-tier request clamp. `0` disables the clamp once budgets come from `/v1/models`.
+        public var requestTokenLimit: Int
+
+        public init(contextWindowTokens: Int, outputTokenLimit: Int, requestTokenLimit: Int) {
+            self.contextWindowTokens = contextWindowTokens
+            self.outputTokenLimit = outputTokenLimit
+            self.requestTokenLimit = requestTokenLimit
+        }
+
+        public var summary: String {
+            let output = outputTokenLimit > 0 ? "\(outputTokenLimit)" : "unknown"
+            let request = requestTokenLimit > 0 ? "\(requestTokenLimit)" : "off"
+            return "context \(contextWindowTokens) · output \(output) · request \(request)"
+        }
+    }
+
+    /// Derives translation budgets exclusively from `/v1/models` metadata.
+    public static func derived(from model: LLMModelDescriptor) -> Values? {
+        guard let context = model.contextWindowTokens, context > 0 else { return nil }
+        let output: Int
+        if let advertised = model.maxOutputTokens, advertised > 0 {
+            output = advertised
+        } else {
+            output = min(8192, max(2048, context / 32))
+        }
+        return Values(
+            contextWindowTokens: context,
+            outputTokenLimit: output,
+            requestTokenLimit: 0
+        )
     }
 }

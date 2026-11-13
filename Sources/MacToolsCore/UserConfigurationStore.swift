@@ -636,8 +636,8 @@ public final class UserConfigurationStore {
         if saw_reasoning:
             return (
                 "The provider returned reasoning data but no final translation text. "
-                "Try setting translation.thinkingParameter to \\"reasoning_format\\", \\"enable_thinking\\", or \\"none\\" "
-                "for your endpoint."
+                "Increase translation.outputTokenLimit so final content can follow reasoning, "
+                "or set translation.thinkingLevel to \"none\" when the model allows it."
             )
         return "The provider response did not contain translation text."
 
@@ -880,41 +880,47 @@ public final class UserConfigurationStore {
 
 
     def resolve_output_token_limit(translation, messages, output_token_limit):
-        context_window = int(translation.get("contextWindowTokens", 262144) or 0)
-        request_token_limit = int(translation.get("requestTokenLimit", 8000) or 0)
+        # Budgets are advisory only. Never reject locally; post the request and let the provider respond.
         prompt_tokens = estimate_message_tokens(messages)
-
-        if context_window > 0 and output_token_limit > 0 and prompt_tokens + output_token_limit > context_window:
-            available_input = max(context_window - output_token_limit, 0)
-            raise TranslationBudgetError(
-                "Selected text is too long for the configured model budget.\\n\\n"
-                f"Estimated prompt tokens: {prompt_tokens}\\n"
-                f"Configured output tokens: {output_token_limit}\\n"
-                f"Context window: {context_window}\\n"
-                f"Estimated prompt budget available: {available_input}"
-            )
-
-        if request_token_limit > 0 and output_token_limit > 0 and prompt_tokens + output_token_limit > request_token_limit:
-            adjusted_limit = max(request_token_limit - prompt_tokens, 0)
-            if adjusted_limit <= 0:
-                raise TranslationBudgetError(
-                    "Selected text is too long for the configured request token budget.\\n\\n"
-                    f"Estimated prompt tokens: {prompt_tokens}\\n"
-                    f"Request token limit: {request_token_limit}\\n"
-                    "Increase translation.requestTokenLimit for a higher service tier or select less text."
-                )
-            print(
-                "[translate] "
-                f"clamped max_completion_tokens={adjusted_limit} "
-                f"from configured={output_token_limit} "
-                f"requestTokenLimit={request_token_limit} "
-                f"prompt_estimate={prompt_tokens}",
-                file=sys.stderr,
-                flush=True,
-            )
-            return adjusted_limit
-
+        print(
+            "[translate] "
+            f"prompt_estimate={prompt_tokens} "
+            f"contextWindowTokens={translation.get('contextWindowTokens')} "
+            f"outputTokenLimit={output_token_limit} "
+            f"requestTokenLimit={translation.get('requestTokenLimit')}",
+            file=sys.stderr,
+            flush=True,
+        )
         return output_token_limit
+
+    def resolve_thinking_level(translation):
+        level = str(translation.get("thinkingLevel") or "").strip().lower()
+        if level in {"off", "disabled"}:
+            return "none"
+        if level:
+            return level
+        return "high" if translation.get("thinkingEnabled", False) else "none"
+
+
+    def apply_thinking_parameters(body, translation):
+        parameter = str(translation.get("thinkingParameter") or "reasoning").strip().lower()
+        level = resolve_thinking_level(translation)
+        enabled = level not in {"", "none", "off"}
+
+        # Modern OpenAI-compatible gateways advertise `reasoning` on /v1/models.
+        # Legacy include_reasoning is mapped to the same effort object so older configs keep working.
+        if parameter in {"", "reasoning", "auto", "include_reasoning"}:
+            body["reasoning"] = {"effort": level if level else "none"}
+            return
+        if parameter == "enable_thinking":
+            body["enable_thinking"] = enabled
+            return
+        if parameter == "reasoning_format":
+            body["reasoning_format"] = "raw" if enabled else "hidden"
+            return
+        if parameter == "none":
+            return
+        body["reasoning"] = {"effort": level if level else "none"}
 
 
     def request_llm_translation(source_text):
@@ -934,12 +940,16 @@ public final class UserConfigurationStore {
         output_token_limit = resolve_output_token_limit(translation, messages, output_token_limit)
         if output_token_limit > 0:
             body["max_completion_tokens"] = output_token_limit
-        if translation.get("thinkingParameter") == "enable_thinking":
-            body["enable_thinking"] = bool(translation.get("thinkingEnabled", False))
-        elif translation.get("thinkingParameter") == "include_reasoning":
-            body["include_reasoning"] = bool(translation.get("thinkingEnabled", False))
-        elif translation.get("thinkingParameter") == "reasoning_format":
-            body["reasoning_format"] = "raw" if translation.get("thinkingEnabled", False) else "hidden"
+        apply_thinking_parameters(body, translation)
+        print(
+            "[translate] "
+            f"model={translation.get('model')} "
+            f"thinkingParameter={translation.get('thinkingParameter', 'reasoning')} "
+            f"thinkingLevel={resolve_thinking_level(translation)} "
+            f"max_completion_tokens={body.get('max_completion_tokens')}",
+            file=sys.stderr,
+            flush=True,
+        )
         body = json.dumps(body).encode("utf-8")
 
         request = urllib.request.Request(

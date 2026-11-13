@@ -285,11 +285,12 @@
     "endpoint": "http://127.0.0.1:8787/v1/chat/completions", // Full chat-completions request URL. General → Base URL accepts a root (adds /v1/chat/completions), a prefix (adds /chat/completions), or this complete URL; query parameters are retained.
     "model": "qwen/qwen3.6-27b", // Model name sent to the endpoint.
     "normalizePDFLineBreaks": true, // Joins common PDF hard-wrapped lines before translation while preserving blank paragraphs and lists.
-    "contextWindowTokens": 262144, // Model context window. Used for a preflight selected-text budget warning.
-    "outputTokenLimit": 2048, // Desired output budget sent as max_completion_tokens after request-limit clamping.
-    "requestTokenLimit": 8000, // Service-tier request budget for prompt plus max_completion_tokens. Set 0 to disable.
-    "thinkingEnabled": false, // Sends enable_thinking to disable or enable model reasoning when supported.
-    "thinkingParameter": "include_reasoning", // For Groq/CLIProxyAPI, false hides reasoning output; use "enable_thinking" for Qwen-compatible endpoints.
+    "contextWindowTokens": 262144, // Auto-filled from /v1/models (context_window / context_length / max_input_tokens). Do not edit in Settings.
+    "outputTokenLimit": 2048, // Auto-filled from /v1/models max_output_tokens when present; otherwise a safe fraction of the context window.
+    "requestTokenLimit": 0, // Auto-cleared when model metadata is available (0 disables the old service-tier clamp).
+    "thinkingEnabled": false, // Legacy boolean mirror of thinkingLevel; prefer thinkingLevel from Settings.
+    "thinkingLevel": "none", // Reasoning effort from /v1/models (none/low/medium/high/max/…). Sent as reasoning.effort when thinkingParameter is reasoning.
+    "thinkingParameter": "reasoning", // Request adapter: reasoning (OpenAI-compatible), include_reasoning, enable_thinking, reasoning_format, or none.
     "nativeWindow": {
       "format": "markdown",
       "height": 620,

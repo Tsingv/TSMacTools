@@ -75,9 +75,76 @@ final class UserConfigurationStoreTests: XCTestCase {
             XCTAssertEqual(try TranslationEndpoint.requestURL(TranslationEndpoint.baseURL(expected)), expected)
         }
         XCTAssertEqual(TranslationEndpoint.baseURL("https://example.com/custom/chat/completions"), "https://example.com/custom")
+        XCTAssertEqual(
+            TranslationEndpoint.modelsURL(from: "http://127.0.0.1:3425/v1/chat/completions"),
+            "http://127.0.0.1:3425/v1/models"
+        )
+        XCTAssertEqual(
+            TranslationEndpoint.modelsURL(from: "https://example.com/custom/chat/completions?key=a"),
+            "https://example.com/custom/models"
+        )
         for invalid in ["", "example.com", "/v1", "ftp://example.com", "https://"] {
             XCTAssertThrowsError(try TranslationEndpoint.requestURL(invalid))
         }
+    }
+
+    func testLLMModelCatalogParsesReasoningLevelsAndChatCompletionsSupport() throws {
+        let payload = """
+        {
+          "data": [
+            {
+              "id": "workbuddy-ai/hy4free",
+              "display_name": "Hy4",
+              "reasoning": true,
+              "reasoning_levels": ["high"],
+              "supported_parameters": ["tools", "reasoning"],
+              "native_endpoints": ["/v1/chat/completions"],
+              "context_window": 1000000,
+              "max_output_tokens": 64000
+            },
+            {
+              "id": "codex/gpt-6-luna",
+              "display_name": "GPT-6-Luna",
+              "reasoning": true,
+              "reasoning_levels": ["low", "high"],
+              "supported_parameters": ["reasoning"],
+              "native_endpoints": ["/v1/responses"]
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let models = try LLMModelCatalog.parse(payload)
+        XCTAssertEqual(models.map(\.id), ["workbuddy-ai/hy4free", "codex/gpt-6-luna"])
+        XCTAssertEqual(models[0].reasoningLevels, ["high"])
+        XCTAssertEqual(LLMModelCatalog.chatCompletionModels(in: models).map(\.id), ["workbuddy-ai/hy4free"])
+        XCTAssertEqual(
+            TranslationThinking.normalizedLevel(thinkingLevel: "", thinkingEnabled: false, availableLevels: ["none", "high"]),
+            "none"
+        )
+        XCTAssertEqual(
+            TranslationThinking.normalizedLevel(thinkingLevel: "", thinkingEnabled: true, availableLevels: ["none", "high"]),
+            "high"
+        )
+        let budget = TranslationTokenBudget.derived(from: models[0])
+        XCTAssertEqual(budget?.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(budget?.outputTokenLimit, 64_000)
+        XCTAssertEqual(budget?.requestTokenLimit, 0)
+        let inferred = TranslationTokenBudget.derived(
+            from: LLMModelDescriptor(
+                id: "cursor/auto",
+                displayName: "Auto",
+                reasoning: true,
+                reasoningLevels: ["none", "low", "high"],
+                supportedParameters: ["reasoning"],
+                nativeEndpoints: ["/v1/chat/completions"],
+                contextWindowTokens: 200_000,
+                maxOutputTokens: nil
+            )
+        )
+        XCTAssertEqual(inferred?.contextWindowTokens, 200_000)
+        XCTAssertEqual(inferred?.outputTokenLimit, 6_250)
+        XCTAssertEqual(inferred?.requestTokenLimit, 0)
     }
 
     func testHotkeyShortcutNormalizesModifierAliasesOrderAndKeyCase() {
@@ -324,10 +391,11 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(result.configuration.translation.googleWebClient, "gtx")
         XCTAssertEqual(result.configuration.translation.model, "qwen/qwen3.6-27b")
         XCTAssertFalse(result.configuration.translation.thinkingEnabled)
-        XCTAssertEqual(result.configuration.translation.thinkingParameter, "include_reasoning")
+        XCTAssertEqual(result.configuration.translation.thinkingLevel, "none")
+        XCTAssertEqual(result.configuration.translation.thinkingParameter, "reasoning")
         XCTAssertEqual(result.configuration.translation.contextWindowTokens, 262144)
         XCTAssertEqual(result.configuration.translation.outputTokenLimit, 2048)
-        XCTAssertEqual(result.configuration.translation.requestTokenLimit, 8000)
+        XCTAssertEqual(result.configuration.translation.requestTokenLimit, 0)
         XCTAssertTrue(result.configuration.translation.normalizePDFLineBreaks)
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.configURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.scriptsDirectoryURL.path))
@@ -356,10 +424,11 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertFalse(configText.contains(#""googleWebEndpoint""#))
         XCTAssertFalse(configText.contains(#""googleWebClient""#))
         XCTAssertTrue(configText.contains(#""thinkingEnabled" : false"#))
-        XCTAssertTrue(configText.contains(#""thinkingParameter" : "include_reasoning""#))
+        XCTAssertTrue(configText.contains(#""thinkingLevel" : "none""#))
+        XCTAssertTrue(configText.contains(#""thinkingParameter" : "reasoning""#))
         XCTAssertTrue(configText.contains(#""contextWindowTokens" : 262144"#))
         XCTAssertTrue(configText.contains(#""outputTokenLimit" : 2048"#))
-        XCTAssertTrue(configText.contains(#""requestTokenLimit" : 8000"#))
+        XCTAssertTrue(configText.contains(#""requestTokenLimit" : 0"#))
         XCTAssertTrue(configText.contains(#""normalizePDFLineBreaks" : true"#))
         XCTAssertTrue(configText.contains(#""preset" : "balanced""#))
         XCTAssertTrue(configText.contains(#""smoothVertical" : true"#))
@@ -381,12 +450,16 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertTrue(scriptText.contains(#"def normalize_source_text(source_text):"#))
         XCTAssertTrue(scriptText.contains(#"def join_wrapped_lines(lines):"#))
         XCTAssertTrue(scriptText.contains(#"normalizePDFLineBreaks"#))
-        XCTAssertTrue(scriptText.contains(#"translation.get("thinkingParameter") == "enable_thinking""#))
-        XCTAssertTrue(scriptText.contains(#"translation.get("thinkingParameter") == "include_reasoning""#))
-        XCTAssertTrue(scriptText.contains(#"body["include_reasoning"]"#))
+        XCTAssertTrue(scriptText.contains(#"def apply_thinking_parameters(body, translation):"#))
+        XCTAssertTrue(scriptText.contains(#"def resolve_thinking_level(translation):"#))
+        XCTAssertTrue(scriptText.contains(#"body["reasoning"]"#))
+        XCTAssertTrue(scriptText.contains(#"include_reasoning"#))
         XCTAssertTrue(scriptText.contains(#"def collect_text(value):"#))
         XCTAssertTrue(scriptText.contains(#"def resolve_output_token_limit(translation, messages, output_token_limit):"#))
+        XCTAssertTrue(scriptText.contains(#"Budgets are advisory only"#))
         XCTAssertTrue(scriptText.contains(#"requestTokenLimit"#))
+        XCTAssertFalse(scriptText.contains(#"Selected text is too long for the configured model budget."#))
+        XCTAssertFalse(scriptText.contains(#"Selected text is too long for the configured request token budget."#))
         XCTAssertTrue(scriptText.contains(#"def format_http_error(error):"#))
         XCTAssertTrue(scriptText.contains(#"max_completion_tokens"#))
         XCTAssertTrue(scriptText.contains(#"def log_response_summary(response):"#))
@@ -454,6 +527,7 @@ final class UserConfigurationStoreTests: XCTestCase {
             .replacingOccurrences(of: #"    "googleWebClient" : "gtx","# + "\n", with: "")
             .replacingOccurrences(of: #"    "normalizePDFLineBreaks" : true,"# + "\n", with: "")
             .replacingOccurrences(of: #"    "thinkingEnabled" : false,"# + "\n", with: "")
+            .replacingOccurrences(of: #"    "thinkingLevel" : "none","# + "\n", with: "")
 
         let configuration = try store.decodeConfiguration(from: Data(legacyText.utf8))
 
@@ -466,10 +540,11 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(configuration.translation.googleWebEndpoint, "https://translate.googleapis.com/translate_a/single")
         XCTAssertEqual(configuration.translation.googleWebClient, "gtx")
         XCTAssertFalse(configuration.translation.thinkingEnabled)
-        XCTAssertEqual(configuration.translation.thinkingParameter, "include_reasoning")
+        XCTAssertEqual(configuration.translation.thinkingLevel, "")
+        XCTAssertEqual(configuration.translation.thinkingParameter, "reasoning")
         XCTAssertEqual(configuration.translation.contextWindowTokens, 262144)
         XCTAssertEqual(configuration.translation.outputTokenLimit, 2048)
-        XCTAssertEqual(configuration.translation.requestTokenLimit, 8000)
+        XCTAssertEqual(configuration.translation.requestTokenLimit, 0)
         XCTAssertTrue(configuration.translation.normalizePDFLineBreaks)
         XCTAssertEqual(configuration.scroll, .default)
     }
