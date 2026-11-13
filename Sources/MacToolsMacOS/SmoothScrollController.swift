@@ -94,8 +94,10 @@ struct SmoothScrollEnvironment: @unchecked Sendable {
             resolveTargetPID: { event in
                 let eventPID = pid_t(event.getIntegerValueField(.eventTargetUnixProcessID))
                 if eventPID > 1 { return eventPID }
-                guard Thread.isMainThread else { return 0 }
-                return NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+                // The tap callback runs off main. Resolve the owner of the front-most normal
+                // window through the thread-safe CoreGraphics window list instead of NSWorkspace
+                // so the legacy Dock bypass still receives a usable PID.
+                return frontmostWindowOwnerPID(at: event.location)
             },
             classifyEventSource: { event in
                 sourceResolver.classify(event)
@@ -155,6 +157,8 @@ public final class SmoothScrollController: @unchecked Sendable {
         var pendingLineDelta = PendingLineDelta()
         var restartLimiter = EventTapRestartLimiter()
         var lifecycle: Lifecycle = .stopped
+        var suspended = false
+        var displayStartRequested = false
     }
 
     private let lock = NSLock()
@@ -213,7 +217,13 @@ public final class SmoothScrollController: @unchecked Sendable {
     public func apply(_ settings: ScrollSettings) {
         precondition(Thread.isMainThread)
         operationLock.lock()
-        defer { operationLock.unlock() }
+        var removesEventTap = false
+        defer {
+            operationLock.unlock()
+            // Tap teardown waits for the tap thread, which may itself be waiting for
+            // `operationLock` inside an in-flight callback. Never wait while holding that lock.
+            if removesEventTap { eventTapDriver.remove() }
+        }
         let sanitized = Self.sanitized(settings)
         let previous: ScrollSettings? = withState { state in
             guard state.lifecycle != .shutdown else { return nil }
@@ -236,6 +246,38 @@ public final class SmoothScrollController: @unchecked Sendable {
             start()
         } else {
             stopListening()
+            removesEventTap = true
+        }
+    }
+
+    /// Temporarily stops smoothing without destroying the event tap, for example while a
+    /// screenshot overlay owns the pointer. Resuming re-enables the same installed tap.
+    public func setSuspended(_ suspended: Bool) {
+        precondition(Thread.isMainThread)
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        let changed = withState { state -> Bool in
+            guard state.lifecycle != .shutdown, state.suspended != suspended else { return false }
+            state.suspended = suspended
+            clearSessionState(&state)
+            return true
+        }
+        guard changed else { return }
+        if suspended {
+            cancelIdleDisplayStop()
+            displayDriver.stop()
+            if eventTapDriver.isInstalled { eventTapDriver.setEnabled(false) }
+            return
+        }
+        guard withState({ $0.lifecycle == .running && $0.settings.enabled }),
+              environment.isAccessibilityTrusted() else {
+            return
+        }
+        if eventTapDriver.isInstalled {
+            eventTapDriver.setEnabled(true)
+            if !eventTapDriver.isEnabled { recoverEventTapIfPermitted() }
+        } else {
+            installEventTap()
         }
     }
 
@@ -252,7 +294,7 @@ public final class SmoothScrollController: @unchecked Sendable {
         scheduleEventTapHealthCheck()
         guard environment.isAccessibilityTrusted() else { return }
         if eventTapDriver.isInstalled {
-            if !eventTapDriver.isEnabled { recoverEventTapIfPermitted() }
+            if !eventTapDriver.isEnabled, !withState({ $0.suspended }) { recoverEventTapIfPermitted() }
             return
         }
         installEventTap()
@@ -297,6 +339,7 @@ public final class SmoothScrollController: @unchecked Sendable {
             eventTapDriver.remove()
             return
         }
+        if withState({ $0.suspended }) { eventTapDriver.setEnabled(false) }
     }
 
     private func stopListening() {
@@ -312,7 +355,6 @@ public final class SmoothScrollController: @unchecked Sendable {
             state.restartLimiter.reset()
         }
         displayDriver.stop()
-        eventTapDriver.remove()
     }
 
     private func handleTapInput(_ input: ScrollTapInput) -> ScrollTapDisposition {
@@ -328,48 +370,69 @@ public final class SmoothScrollController: @unchecked Sendable {
             displayDriver.stop()
             return .passThrough
         case .disabled:
-            if Thread.isMainThread {
-                operationLock.lock()
-                defer { operationLock.unlock() }
-                guard withState({ $0.lifecycle == .running }) else { return .passThrough }
-                resetSession()
-                cancelIdleDisplayStop()
-                displayDriver.stop()
-                scheduleEventTapHealthCheck()
-                recoverEventTapIfPermitted()
+            // Recovery is main-thread lifecycle work. The disabled notification always passes
+            // through, so never block the tap thread waiting for a busy main thread.
+            guard Thread.isMainThread else {
+                DispatchQueue.main.async { [weak self] in
+                    _ = self?.handleTapInput(.disabled)
+                }
                 return .passThrough
             }
-            var disposition: ScrollTapDisposition = .passThrough
-            DispatchQueue.main.sync {
-                disposition = self.handleTapInput(.disabled)
-            }
-            return disposition
+            operationLock.lock()
+            defer { operationLock.unlock() }
+            guard withState({ $0.lifecycle == .running && !$0.suspended }) else { return .passThrough }
+            resetSession()
+            cancelIdleDisplayStop()
+            displayDriver.stop()
+            scheduleEventTapHealthCheck()
+            recoverEventTapIfPermitted()
+            return .passThrough
         case let .scroll(event):
             return handleScrollEvent(event) ? .consume : .passThrough
         }
     }
 
-    /// Display-link prepare/start remain main-thread-only. Never call this while already
-    /// holding `operationLock` from a non-main thread: hopping to main under that lock deadlocks.
+    /// Called with `operationLock` held. A callback delivered by the current display-link run is
+    /// the only readiness proof and is cleared by every stop/restart, so a ready link lets the tap
+    /// thread consume input without hopping to main. Otherwise display-link start (main-only) is
+    /// performed directly on main or requested asynchronously from the tap thread, and this input
+    /// stays raw until a later event observes the current run's first callback.
     private func ensureDisplayReadyForSmoothing() -> Bool {
         if Thread.isMainThread {
-            operationLock.lock()
-            defer { operationLock.unlock() }
             return displayDriver.start() && displayDriver.hasDeliveredFrame
         }
-        var ready = false
-        DispatchQueue.main.sync {
+        // Off-main fast path: the driver clears readiness on every stop/restart, so a delivered
+        // frame proves the current run is live. Otherwise pass through and start on main
+        // asynchronously instead of blocking the tap thread on the main queue.
+        if displayDriver.hasDeliveredFrame { return true }
+        requestDisplayStartOnMain()
+        return false
+    }
+
+    private func requestDisplayStartOnMain() {
+        let shouldSchedule = withState { state -> Bool in
+            guard !state.displayStartRequested else { return false }
+            state.displayStartRequested = true
+            return true
+        }
+        guard shouldSchedule else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
             self.operationLock.lock()
             defer { self.operationLock.unlock() }
-            ready = self.displayDriver.start() && self.displayDriver.hasDeliveredFrame
+            let shouldStart = self.withState { state -> Bool in
+                state.displayStartRequested = false
+                return state.lifecycle == .running && !state.suspended && state.settings.enabled
+            }
+            guard shouldStart else { return }
+            _ = self.displayDriver.start()
         }
-        return ready
     }
 
     private func recoverEventTapIfPermitted() {
         precondition(Thread.isMainThread)
         guard environment.isAccessibilityTrusted(),
-              withState({ $0.lifecycle == .running && $0.settings.enabled }) else {
+              withState({ $0.lifecycle == .running && $0.settings.enabled && !$0.suspended }) else {
             return
         }
         let timestamp = environment.now()
@@ -412,7 +475,7 @@ public final class SmoothScrollController: @unchecked Sendable {
             }
             return
         }
-        guard !eventTapDriver.isEnabled else { return }
+        guard !eventTapDriver.isEnabled, !withState({ $0.suspended }) else { return }
         recoverEventTapIfPermitted()
     }
 
@@ -429,7 +492,7 @@ public final class SmoothScrollController: @unchecked Sendable {
         }
 
         let settings: ScrollSettings? = withState { state in
-            guard state.lifecycle == .running else { return nil }
+            guard state.lifecycle == .running, !state.suspended else { return nil }
             return state.settings
         }
         guard let settings, settings.enabled else { return false }
@@ -488,13 +551,10 @@ public final class SmoothScrollController: @unchecked Sendable {
             )
             return false
         }
-        // Cancel idle-stop under the controller lock, then drop it before hopping to main for
-        // display-link start so a busy main thread cannot deadlock against this tap callback.
+        // Readiness is checked under the controller lock without any main-thread hop, so a busy
+        // main thread cannot stall this tap callback.
         cancelIdleDisplayStop()
-        operationLock.unlock()
-        let displayReady = ensureDisplayReadyForSmoothing()
-        operationLock.lock()
-        guard displayReady else {
+        guard ensureDisplayReadyForSmoothing() else {
             resetSession()
             logPhysicalEvent(
                 event,
@@ -977,6 +1037,55 @@ private final class ScrollEventSourceResolver: @unchecked Sendable {
     }
 }
 
+/// Returns the PID that owns the front-most on-screen layer-0 window, or the window under the
+/// pointer when it belongs to a higher layer such as the Dock. CoreGraphics window-list reads are
+/// safe off the main thread and require no Screen Recording permission for owner PIDs.
+private final class FrontmostWindowOwnerCache: @unchecked Sendable {
+    static let shared = FrontmostWindowOwnerCache()
+    private let lock = NSLock()
+    private var cachedPID: pid_t = 0
+    private var cachedAt: TimeInterval = -.infinity
+
+    func value(at location: CGPoint, now: TimeInterval) -> pid_t {
+        if let cached = lock.withLock({ now - cachedAt < 0.2 ? cachedPID : nil }) {
+            return cached
+        }
+        let pid = resolveFrontmostWindowOwnerPID(at: location)
+        lock.withLock {
+            cachedPID = pid
+            cachedAt = now
+        }
+        return pid
+    }
+}
+
+private func frontmostWindowOwnerPID(at location: CGPoint) -> pid_t {
+    FrontmostWindowOwnerCache.shared.value(at: location, now: ProcessInfo.processInfo.systemUptime)
+}
+
+private func resolveFrontmostWindowOwnerPID(at pointer: CGPoint?) -> pid_t {
+    guard let windows = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements],
+        kCGNullWindowID
+    ) as? [[String: Any]] else {
+        return 0
+    }
+    var frontmostNormal: pid_t = 0
+    for window in windows {
+        guard let pid = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+              pid > 1 else { continue }
+        let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
+        if let pointer,
+           let boundsDictionary = window[kCGWindowBounds as String] as? NSDictionary,
+           let bounds = CGRect(dictionaryRepresentation: boundsDictionary),
+           bounds.contains(pointer) {
+            return pid
+        }
+        if layer == 0, frontmostNormal == 0 { frontmostNormal = pid }
+    }
+    return frontmostNormal
+}
+
 private final class DispatchSmoothScrollTask: SmoothScrollScheduledTask, @unchecked Sendable {
     private let lock = NSLock()
     private var source: DispatchSourceTimer?
@@ -1261,18 +1370,26 @@ private final class CGScrollEventTapDriver: ScrollEventTapDriving, @unchecked Se
     }
 
     private func tearDown(tap: CFMachPort?, source: CFRunLoopSource?, context: RunLoopContext?) {
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let context {
+            // The tap thread may be inside a callback waiting for the controller's operation
+            // lock, which the caller can hold. Signal stop and finish teardown off-thread instead
+            // of blocking here; this driver already ignores callbacks once its handles are cleared.
             context.stop()
-            _ = context.stopped.wait(timeout: .now() + 1)
+            let releaseTap = tap
+            DispatchQueue.global(qos: .utility).async {
+                _ = context.stopped.wait(timeout: .now() + 2)
+                if let releaseTap { CFMachPortInvalidate(releaseTap) }
+            }
             return
         }
-        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let source {
             let mainLoop = CFRunLoopGetMain()
             if CFRunLoopContainsSource(mainLoop, source, .commonModes) {
                 CFRunLoopRemoveSource(mainLoop, source, .commonModes)
             }
         }
+        if let tap { CFMachPortInvalidate(tap) }
     }
 }
 

@@ -13,6 +13,10 @@ final class ScreenRecordingController: NSObject {
     private var outputURL: URL?
     private var startedAt: Date?
     private var isStopping = false
+    /// True from `start()` until `begin()` either publishes a stream or fails. A second toggle
+    /// while permission prompts or `startCapture()` are pending must not start another stream.
+    private var isStarting = false
+    private var stopCompletions: [@MainActor () -> Void] = []
     private let writerBox = RecordingWriterBox()
 
     var onStatus: ((String, String) -> Void)?
@@ -25,6 +29,7 @@ final class ScreenRecordingController: NSObject {
     }
 
     func toggle() {
+        guard !isStarting else { return }
         if isRecording {
             stop()
         } else {
@@ -33,13 +38,31 @@ final class ScreenRecordingController: NSObject {
     }
 
     func start() {
-        guard !isRecording, !isStopping else { return }
-        Task { await begin() }
+        guard !isRecording, !isStopping, !isStarting else { return }
+        isStarting = true
+        Task {
+            await begin()
+            isStarting = false
+        }
     }
 
     func stop() {
-        guard isRecording, !isStopping else { return }
+        stop(completion: nil)
+    }
+
+    /// Stops capture and finalizes the MP4. `completion` runs after `finishWriting` returns (or
+    /// immediately when nothing is recording) so termination can wait for a playable file.
+    func stop(completion: (@MainActor () -> Void)?) {
+        if isStopping {
+            if let completion { stopCompletions.append(completion) }
+            return
+        }
+        guard isRecording else {
+            completion?()
+            return
+        }
         isStopping = true
+        if let completion { stopCompletions.append(completion) }
         let activeStream = stream
         stream = nil
         Task {
@@ -55,6 +78,9 @@ final class ScreenRecordingController: NSObject {
             if let savedURL {
                 onStatus?("Recording Saved", savedURL.path)
             }
+            let completions = stopCompletions
+            stopCompletions.removeAll()
+            completions.forEach { $0() }
         }
     }
 
@@ -170,6 +196,11 @@ final class ScreenRecordingController: NSObject {
                 try stream.addStreamOutput(writerBox, type: .audio, sampleHandlerQueue: writerBox.queue)
             }
             try await stream.startCapture()
+            guard self.stream == nil else {
+                // Never overwrite a live stream; discard this duplicate.
+                try? await stream.stopCapture()
+                return
+            }
             self.stream = stream
             startedAt = Date()
             onRecordingStateChange?(true, 0)
