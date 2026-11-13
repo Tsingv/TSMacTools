@@ -123,6 +123,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     private enum Page: Int, CaseIterable {
         case general
+        case translation
         case hotkeys
         case scrolling
         case capture
@@ -131,6 +132,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         var title: String {
             switch self {
             case .general: "General"
+            case .translation: "Translation"
             case .hotkeys: "Hotkeys"
             case .scrolling: "Scrolling"
             case .capture: "Capture"
@@ -141,6 +143,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         var symbol: String {
             switch self {
             case .general: "gearshape"
+            case .translation: "character.bubble"
             case .hotkeys: "keyboard"
             case .scrolling: "scroll"
             case .capture: "camera.viewfinder"
@@ -164,6 +167,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private let savingQueue = DispatchQueue(label: "TSMacTools.settings-save", qos: .utility)
     private var saveGeneration = 0
     private var applicationIcons: [String: NSImage] = [:]
+    private var applicationURLs: [String: URL?] = [:]
     private var providerPopup: NSPopUpButton?
     private var modelPopup: NSPopUpButton?
     private var thinkingLevelPopup: NSPopUpButton?
@@ -204,9 +208,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private weak var activeHotkeyRecorder: HotkeyRecorderButton?
     private weak var hotkeyTableView: NSTableView?
     private weak var hotkeyCountLabel: NSTextField?
-    private var hotkeyTableHeightConstraint: NSLayoutConstraint?
     private var isHotkeyRecordingActive = false
     private var pendingHotkeyFocusID: String?
+    private static let hotkeyColumnSpacing: CGFloat = 10
+    private static let hotkeyRowInsets = NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12)
     private static let tuningSaveDelay: TimeInterval = 0.12
     private static let reconciliationDelay: TimeInterval = 0.05
 
@@ -246,8 +251,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         nil
     }
 
+    /// True while the window is on screen or minimized to the Dock.
+    var isPresented: Bool { window?.isVisible == true || window?.isMiniaturized == true }
+
     func present(configuration: UserConfiguration, configURL: URL) {
         refresh(configuration: configuration, configURL: configURL)
+        bringToFront()
+    }
+
+    /// Brings an already open window forward without reloading configuration or rebuilding pages.
+    func bringToFront() {
         NSApp.setActivationPolicy(.regular)
         if window?.isMiniaturized == true { window?.deminiaturize(nil) }
         NSApp.activate(ignoringOtherApps: true)
@@ -263,7 +276,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             selector: #selector(persistPendingTuning),
             object: nil
         )
-        pendingTuningChanges.removeAll(keepingCapacity: true)
+        // Queue unsaved slider moves before the page is rebuilt; the FIFO save queue applies
+        // them after the reload instead of silently dropping them.
+        persistPendingTuning()
         NSObject.cancelPreviousPerformRequests(
             withTarget: self,
             selector: #selector(reconcileVisiblePageWhenIdle),
@@ -405,32 +420,75 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     }
     private func filePicker(_ value: String, field: ConfigurationField) -> NSButton {
         let button = NSButton(title: value, target: self, action: #selector(chooseConfigurationFile(_:)))
-        button.tag = field.rawValue; button.toolTip = value
-        button.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        button.tag = field.rawValue
+        button.bezelStyle = .rounded
+        button.imagePosition = .imageLeading
+        button.imageScaling = .scaleProportionallyDown
+        button.lineBreakMode = .byTruncatingMiddle
+        button.widthAnchor.constraint(equalToConstant: 240).isActive = true
+        updateFilePickerTitle(button, value: value, field: field)
         return button
     }
+
+    /// Application fields persist a bundle ID but display the application's name and icon.
+    private func updateFilePickerTitle(_ button: NSButton, value: String, field: ConfigurationField?) {
+        if field == .pythonPath {
+            button.title = value
+            button.image = nil
+        } else if let url = applicationURL(bundleIdentifier: value) {
+            button.title = url.deletingPathExtension().lastPathComponent
+            let icon = applicationIcon(at: url).copy() as? NSImage
+            icon?.size = NSSize(width: 16, height: 16)
+            button.image = icon
+        } else {
+            button.title = value
+            button.image = NSImage(systemSymbolName: "questionmark.app", accessibilityDescription: nil)
+        }
+        button.toolTip = value
+    }
+
     @objc private func chooseConfigurationFile(_ sender: NSButton) {
+        guard let window else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         let field = ConfigurationField(rawValue: sender.tag)
-        if field != .pythonPath { panel.allowedContentTypes = [.applicationBundle] }
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let value = field == .pythonPath ? url.path : Bundle(url: url)?.bundleIdentifier
-        guard let value else { return }
-        persist { latest in
-            switch field {
-            case .pythonPath: latest.scripting.pythonPath = value
-            case .finderBundleIdentifier: latest.application.finderBundleIdentifier = value
-            case .terminalBundleIdentifier: latest.application.terminalBundleIdentifier = value
-            default: break
-            }
+        if field != .pythonPath {
+            panel.allowedContentTypes = [.applicationBundle]
+            panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
         }
-        sender.title = value; sender.toolTip = value
+        panel.beginSheetModal(for: window) { [weak self, weak sender] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            let bundleIdentifier = Bundle(url: url)?.bundleIdentifier
+            let value = field == .pythonPath ? url.path : bundleIdentifier
+            guard let value else { return }
+            if let bundleIdentifier { self.applicationURLs[bundleIdentifier] = .some(url) }
+            let result = self.persist { latest in
+                switch field {
+                case .pythonPath: latest.scripting.pythonPath = value
+                case .finderBundleIdentifier: latest.application.finderBundleIdentifier = value
+                case .terminalBundleIdentifier: latest.application.terminalBundleIdentifier = value
+                default: break
+                }
+            }
+            if case .success = result, let sender { self.updateFilePickerTitle(sender, value: value, field: field) }
+        }
     }
 
     private var fanEditorCount = 0
     var fanRuntime: FanRuntime?
     private var fanLivePanel: FanRuntime?
+    private func fanRuleCard(_ editor: FanCurveEditor) -> NSView {
+        let card = SettingsCardView(cornerRadius: 10)
+        card.addSubview(editor)
+        NSLayoutConstraint.activate([
+            editor.topAnchor.constraint(equalTo: card.topAnchor, constant: 6),
+            editor.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 6),
+            editor.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
+            editor.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -6)
+        ])
+        return card
+    }
+
     private func makeFansPage() -> NSView {
         fanEditorCount = configuration.fans.rules.count
         let stack = pageStack()
@@ -456,7 +514,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                 }
                 expected = changed
             }
-            stack.addArrangedSubview(editor)
+            stack.addArrangedSubview(fanRuleCard(editor))
         }
         let chooser = NSPopUpButton()
         chooser.setAccessibilityLabel("Fan for new rule")
@@ -472,8 +530,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         add.target = creation; add.action = #selector(FanRuleCreationAction.invoke)
         // Retain the action for exactly as long as its button.
         objc_setAssociatedObject(add, &fanCreationActionKey, creation, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-        let refresh: (FanSnapshot?) -> Void = { [weak self] snapshot in
-            editors.forEach { $0.update(snapshot: snapshot) }
+        // The runtime outlives this page, so its snapshot callback holds the page's views weakly.
+        let editorRefs = editors.map(WeakReference.init)
+        let refresh: (FanSnapshot?) -> Void = { [weak self, weak chooser, weak add] snapshot in
+            guard let chooser, let add else { return }
+            editorRefs.forEach { $0.value?.update(snapshot: snapshot) }
             let selection = chooser.selectedItem?.representedObject as? Int
             chooser.removeAllItems()
             let assigned = Set(self?.configuration.fans.rules.map(\.fan) ?? [])
@@ -484,11 +545,20 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             if let selection, let item = chooser.itemArray.first(where: { ($0.representedObject as? Int) == selection }) { chooser.select(item) }
             add.isEnabled = chooser.numberOfItems > 0
             chooser.isEnabled = add.isEnabled
-            if !add.isEnabled { chooser.addItem(withTitle: "No unassigned detected fans") }
+            if !add.isEnabled {
+                chooser.addItem(withTitle: snapshot?.fans.isEmpty == false ? "No unassigned detected fans" : "Waiting for fans…")
+            }
         }
         live.onSnapshot = refresh
         live.apply(configuration.fans)
         live.refreshEditors()
+        if chooser.numberOfItems == 0 {
+            chooser.addItem(withTitle: "Waiting for fans…")
+            chooser.isEnabled = false
+            add.isEnabled = false
+        }
+        chooser.controlSize = .small; chooser.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small))
+        add.controlSize = .small; add.font = chooser.font; add.bezelStyle = .rounded
         stack.addArrangedSubview(NSStackView(views: [chooser, add]))
         if !configuration.fans.duplicateFanIDs.isEmpty {
             stack.addArrangedSubview(note("Duplicate fan assignments: \(configuration.fans.duplicateFanIDs). Control is suspended. Delete duplicate rules so each fan has one rule, including disabled rules."))
@@ -500,6 +570,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     private func makePage(_ page: Page) -> NSView {
         switch page {
         case .general: makeGeneralPage()
+        case .translation: makeTranslationPage()
         case .hotkeys: makeHotkeysPage()
         case .scrolling: makeScrollingPage()
         case .capture: makeCapturePage()
@@ -516,6 +587,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     func windowWillClose(_ notification: Notification) {
         (fanRuntime ?? fanLivePanel)?.setMonitoringVisible(false)
+        // Detach the closed page's editors; reopening rebuilds the page and reattaches.
+        (fanRuntime ?? fanLivePanel)?.onSnapshot = nil
         NSApp.setActivationPolicy(.accessory)
         endActiveHotkeyRecording()
     }
@@ -557,19 +630,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         var deps: [ConditionalRow] = []
 
         let switcherOn: (UserConfiguration) -> Bool = { $0.windowSwitcher.enabled }
-        let translationOn: (UserConfiguration) -> Bool = { $0.translation.enabled }
-        func translationProviders(_ names: [String]) -> (UserConfiguration) -> Bool {
-            { $0.translation.enabled && names.contains($0.translation.provider) }
-        }
-
-        let provider = NSPopUpButton()
-        provider.addItems(withTitles: ["Google Web", "Google Cloud", "LLM"])
-        provider.selectItem(at: ["google_web", "google", "llm"].firstIndex(of: configuration.translation.provider) ?? 0)
-        provider.target = self
-        provider.action = #selector(providerChanged(_:))
-        provider.controlSize = .small
-        provider.widthAnchor.constraint(equalToConstant: 170).isActive = true
-        providerPopup = provider
 
         let openConfig = NSButton(title: "Open…", target: self, action: #selector(openConfigFile))
         openConfig.bezelStyle = .rounded
@@ -601,6 +661,39 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                      control: editableField(configuration.application.ignoredWindowApplicationNames.joined(separator: ", "), field: .ignoredApplicationNames, width: 320)), switcherOn)
         ], into: &deps))
 
+        stack.addArrangedSubview(section(header: "Diagnostics", rows: [
+            (formRow(title: "Timing and event diagnostics",
+                     hint: "Writes compact hotkey and window timing logs.",
+                     control: boolSwitch(tag: 3, on: configuration.windowSwitcher.debug)), nil)
+        ], into: &deps))
+
+        stack.addArrangedSubview(section(header: "Advanced", rows: [
+            (formRow(title: "Configuration file",
+                     hint: "Prompts, native windows, and switcher strategies are JSONC-only.",
+                     control: openConfig), nil)
+        ], into: &deps))
+
+        stack.addArrangedSubview(note("Accessibility permission is shared by window, hotkey, and mouse automation. TSMacTools never enables a disabled event tap after permission is revoked."))
+        conditionalRows[.general] = deps
+        return scrollable(stack)
+    }
+
+    private func makeTranslationPage() -> NSView {
+        let stack = pageStack()
+        var deps: [ConditionalRow] = []
+        let translationOn: (UserConfiguration) -> Bool = { $0.translation.enabled }
+        func translationProviders(_ names: [String]) -> (UserConfiguration) -> Bool {
+            { $0.translation.enabled && names.contains($0.translation.provider) }
+        }
+
+        let provider = NSPopUpButton()
+        provider.addItems(withTitles: ["Google Web", "Google Cloud", "LLM"])
+        provider.selectItem(at: ["google_web", "google", "llm"].firstIndex(of: configuration.translation.provider) ?? 0)
+        provider.target = self
+        provider.action = #selector(providerChanged(_:))
+        provider.widthAnchor.constraint(equalToConstant: 170).isActive = true
+        providerPopup = provider
+
         stack.addArrangedSubview(section(header: "Translation", rows: [
             (formRow(title: "Enable selected-text translation",
                      control: boolSwitch(tag: 2, on: configuration.translation.enabled)), nil),
@@ -608,10 +701,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                      hint: "Selects the translation backend.",
                      control: provider), translationOn),
             (formRow(title: "Base URL",
-                     hint: "Root adds /v1/chat/completions; a path adds /chat/completions. Complete chat/completions URLs and queries are preserved.",
+                     hint: "Roots get /v1/chat/completions; full URLs are kept.",
                      control: editableField(TranslationEndpoint.baseURL(configuration.translation.endpoint), field: .endpoint, width: 320)), translationProviders(["llm"])),
             (formRow(title: "LLM model",
-                     hint: "Discovered from /v1/models when Base URL and API key are reachable.",
+                     hint: "Listed from /v1/models at the Base URL.",
                      control: makeModelPicker()), translationProviders(["llm"])),
             (formRow(title: "Thinking level",
                      hint: "reasoning.effort values advertised by the selected model.",
@@ -620,7 +713,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                      hint: "Refresh after changing Base URL or API key.",
                      control: makeModelsRefreshControl()), translationProviders(["llm"])),
             (formRow(title: "Model limits",
-                     hint: "Filled from /v1/models for the selected model. Not edited manually.",
+                     hint: "Read from /v1/models; not editable.",
                      control: makeModelLimitsLabel()), translationProviders(["llm"])),
             (formRow(title: "LLM API key",
                      hint: "Stored in your local JSONC file and masked here.",
@@ -645,35 +738,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                      control: editableField(String(format: "%.2f", configuration.translation.copyKeystrokeDelay), field: .copyKeystrokeDelay, width: 90)), translationOn)
         ], into: &deps))
 
-        stack.addArrangedSubview(section(header: "Scripting & applications", rows: [
-            (formRow(title: "Python executable",
-                     hint: "Runs script-backed hotkey actions.",
-                     control: filePicker(configuration.scripting.pythonPath, field: .pythonPath)), nil),
-            (formRow(title: "Finder bundle ID",
-                     control: filePicker(configuration.application.finderBundleIdentifier, field: .finderBundleIdentifier)), nil),
-            (formRow(title: "Terminal bundle ID",
-                     control: filePicker(configuration.application.terminalBundleIdentifier, field: .terminalBundleIdentifier)), nil)
-        ], into: &deps))
-
-        stack.addArrangedSubview(section(header: "Diagnostics", rows: [
-            (formRow(title: "Timing and event diagnostics",
-                     hint: "Writes compact hotkey and window timing logs.",
-                     control: boolSwitch(tag: 3, on: configuration.windowSwitcher.debug)), nil)
-        ], into: &deps))
-
-        stack.addArrangedSubview(section(header: "Advanced", rows: [
-            (formRow(title: "Configuration file",
-                     hint: "Endpoints, prompts, native windows, and switcher strategies stay JSONC-only.",
-                     control: openConfig), nil)
-        ], into: &deps))
-
-        stack.addArrangedSubview(note("Accessibility permission is shared by window, hotkey, and mouse automation. TSMacTools never enables a disabled event tap after permission is revoked."))
-        conditionalRows[.general] = deps
+        stack.addArrangedSubview(note("Provider endpoints other than the LLM Base URL, and prompts, remain JSONC-only."))
+        conditionalRows[.translation] = deps
         return scrollable(stack)
     }
 
     private func makeHotkeysPage() -> NSView {
         let stack = pageStack()
+        var deps: [ConditionalRow] = []
         let focusID = pendingHotkeyFocusID
         pendingHotkeyFocusID = nil
 
@@ -681,7 +753,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         toolbar.orientation = .horizontal
         toolbar.alignment = .centerY
         toolbar.spacing = 10
-        toolbar.widthAnchor.constraint(equalToConstant: 680).isActive = true
         let countLabel = NSTextField(labelWithString: "\(configuration.hotkeys.count) bindings")
         countLabel.font = .systemFont(ofSize: 12, weight: .medium)
         countLabel.textColor = .secondaryLabelColor
@@ -690,6 +761,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         toolbarSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let add = NSButton(title: "Add", target: self, action: #selector(addHotkey))
         add.bezelStyle = .rounded
+        add.controlSize = .small
         add.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
         add.imagePosition = .imageLeading
         toolbar.addArrangedSubview(countLabel)
@@ -698,18 +770,23 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         stack.addArrangedSubview(toolbar)
 
         let list = SettingsCardView(cornerRadius: 10)
-        list.widthAnchor.constraint(equalToConstant: 680).isActive = true
+        // The binding table is the page's only scroller and absorbs all vertical slack.
+        list.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .vertical)
+        list.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
 
+        // Header and cells share insets, spacing, and fixed column widths; Target is the
+        // single flexible column in both, so header titles stay over their cells.
         let header = NSStackView()
         header.orientation = .horizontal
         header.alignment = .centerY
-        header.spacing = 10
-        header.edgeInsets = NSEdgeInsets(top: 7, left: 12, bottom: 5, right: 12)
+        header.spacing = Self.hotkeyColumnSpacing
+        header.edgeInsets = Self.hotkeyRowInsets
+        header.distribution = .fill
         let iconHeader = NSTextField(labelWithString: "")
         iconHeader.widthAnchor.constraint(equalToConstant: 38).isActive = true
         let triggerHeader = compactColumnHeader("Trigger", width: 120)
         let actionHeader = compactColumnHeader("Action", width: 160)
-        let targetHeader = compactColumnHeader("Target", width: 205)
+        let targetHeader = compactColumnHeader("Target", width: nil)
         let deleteHeader = NSTextField(labelWithString: "")
         deleteHeader.widthAnchor.constraint(equalToConstant: 28).isActive = true
         [iconHeader, triggerHeader, actionHeader, targetHeader, deleteHeader].forEach(header.addArrangedSubview)
@@ -718,13 +795,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
         let table = NSTableView()
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("HotkeyBinding"))
-        column.width = 680
-        column.resizingMask = []
+        column.resizingMask = .autoresizingMask
         table.addTableColumn(column)
+        table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         table.headerView = nil
         table.delegate = self
         table.dataSource = self
-        table.rowHeight = 60
+        table.rowHeight = 48
         table.intercellSpacing = .zero
         table.selectionHighlightStyle = .none
         table.allowsEmptySelection = true
@@ -732,34 +809,55 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         table.backgroundColor = .clear
         table.focusRingType = .none
         table.gridStyleMask = []
-        table.translatesAutoresizingMaskIntoConstraints = false
+        // Plain style removes the automatic inset so cells line up with the column header.
+        table.style = .plain
         let viewport = NSScrollView()
         viewport.hasVerticalScroller = true
+        viewport.autohidesScrollers = true
         viewport.drawsBackground = false
         viewport.documentView = table
         viewport.translatesAutoresizingMaskIntoConstraints = false
         list.addSubview(viewport)
         hotkeyTableView = table
 
-        let tableHeight = viewport.heightAnchor.constraint(
-            equalToConstant: min(360, max(60, CGFloat(configuration.hotkeys.count) * table.rowHeight))
-        )
-        hotkeyTableHeightConstraint = tableHeight
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: list.topAnchor),
             header.leadingAnchor.constraint(equalTo: list.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: list.trailingAnchor),
-            header.heightAnchor.constraint(equalToConstant: 32),
+            header.heightAnchor.constraint(equalToConstant: 28),
             viewport.topAnchor.constraint(equalTo: header.bottomAnchor),
             viewport.leadingAnchor.constraint(equalTo: list.leadingAnchor),
             viewport.trailingAnchor.constraint(equalTo: list.trailingAnchor),
             viewport.bottomAnchor.constraint(equalTo: list.bottomAnchor),
-            tableHeight
+            viewport.heightAnchor.constraint(greaterThanOrEqualToConstant: 96)
         ])
-
         stack.addArrangedSubview(list)
-        stack.addArrangedSubview(note("Select a trigger to record a keyboard shortcut or mouse side button (optionally with modifiers). Simulated shortcuts post one key-down/key-up pair, and duplicate triggers are rejected."))
-        let page = scrollable(stack)
+
+        stack.addArrangedSubview(section(header: "Scripting & applications", rows: [
+            (formRow(title: "Python executable",
+                     hint: "Runs script-backed hotkey actions.",
+                     control: filePicker(configuration.scripting.pythonPath, field: .pythonPath)), nil),
+            (formRow(title: "Finder",
+                     hint: "Application used by Toggle Finder.",
+                     control: filePicker(configuration.application.finderBundleIdentifier, field: .finderBundleIdentifier)), nil),
+            (formRow(title: "Terminal",
+                     hint: "Application used by Toggle Terminal.",
+                     control: filePicker(configuration.application.terminalBundleIdentifier, field: .terminalBundleIdentifier)), nil)
+        ], into: &deps))
+        conditionalRows[.hotkeys] = deps
+
+        // No page-level scroll view: the table is the single scroller and fills the height.
+        fillPageWidth(stack)
+        stack.setHuggingPriority(.defaultLow, for: .vertical)
+        let page = NSView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        page.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: page.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: page.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: page.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: page.bottomAnchor)
+        ])
         if let focusID {
             focusHotkeyRow(id: focusID)
         }
@@ -771,8 +869,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 10
-        row.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+        row.spacing = Self.hotkeyColumnSpacing
+        row.edgeInsets = Self.hotkeyRowInsets
+        row.distribution = .fill
         row.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(row)
         NSLayoutConstraint.activate([
@@ -793,7 +892,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             guard let self, let recorder else { return }
             self.endHotkeyRecording(recorder)
         }
-        recorder.onRecordAsync = { [weak self] modifiers, key, mouseButton, finish in
+        recorder.onRecordAsync = { [weak self] modifiers, key, mouseButton, isCancelled, finish in
             guard let self, self.configuration.hotkeys.indices.contains(index) else {
                 finish(.rejected(MutationError.hotkeyChangedExternally.localizedDescription)); return
             }
@@ -801,7 +900,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                 HotkeyTrigger.mouseButton($0, modifiers: modifiers)
             }
                 ?? .keyboard(HotkeyShortcut(modifiers: modifiers, key: key))
-            let result = self.persist(reportFailure: false, completion: { result in
+            let result = self.persist(reportFailure: false, isCancelled: isCancelled, completion: { result in
                 switch result {
                 case .success: finish(.accepted)
                 case let .failure(error): finish(.rejected(error.localizedDescription))
@@ -845,6 +944,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
         let target = hotkeyTargetControl(for: binding, index: index)
         target.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        target.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         row.addArrangedSubview(target)
 
         let delete = NSButton(
@@ -864,11 +964,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     private func reloadHotkeyTable(focusID: String? = nil) {
         hotkeyCountLabel?.stringValue = "\(configuration.hotkeys.count) bindings"
-        if let table = hotkeyTableView {
-            hotkeyTableHeightConstraint?.constant = min(360, max(60, CGFloat(configuration.hotkeys.count) * table.rowHeight))
-            table.reloadData()
-        }
+        hotkeyTableView?.reloadData()
         if let focusID { focusHotkeyRow(id: focusID) }
+    }
+
+    /// Replaces one row's cell when only that binding changed; index shifts need a full reload.
+    private func reloadHotkeyRow(_ index: Int) {
+        guard let table = hotkeyTableView, table.numberOfRows == configuration.hotkeys.count,
+              index < table.numberOfRows else {
+            reloadHotkeyTable(); return
+        }
+        table.reloadData(forRowIndexes: IndexSet(integer: index), columnIndexes: IndexSet(integer: 0))
     }
 
     private func focusHotkeyRow(id: String) {
@@ -900,11 +1006,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         ]
     }
 
-    private func compactColumnHeader(_ title: String, width: CGFloat) -> NSTextField {
+    private func compactColumnHeader(_ title: String, width: CGFloat?) -> NSTextField {
         let label = NSTextField(labelWithString: title.uppercased())
         label.font = .systemFont(ofSize: 10, weight: .semibold)
         label.textColor = .tertiaryLabelColor
-        label.widthAnchor.constraint(equalToConstant: width).isActive = true
+        if let width {
+            label.widthAnchor.constraint(equalToConstant: width).isActive = true
+        } else {
+            label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
         return label
     }
 
@@ -952,7 +1063,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             button.imageScaling = .scaleProportionallyDown
             button.toolTip = binding.action.path
             button.controlSize = .small
-            button.widthAnchor.constraint(equalToConstant: 205).isActive = true
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
             return button
         case .runScript:
             let name = binding.action.path.map { URL(fileURLWithPath: $0).lastPathComponent }
@@ -964,7 +1075,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             button.imagePosition = .imageLeading
             button.toolTip = binding.action.path
             button.controlSize = .small
-            button.widthAnchor.constraint(equalToConstant: 205).isActive = true
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
             return button
         case .simulateKeystroke:
             let syntheticBinding = HotkeyBinding(
@@ -981,12 +1092,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                 guard let self, let recorder else { return }
                 self.endHotkeyRecording(recorder)
             }
-            recorder.onRecord = { [weak self] modifiers, key, _ in
+            recorder.onRecordAsync = { [weak self] modifiers, key, _, isCancelled, finish in
                 guard let self, self.configuration.hotkeys.indices.contains(index) else {
-                    return .rejected(MutationError.hotkeyChangedExternally.localizedDescription)
+                    finish(.rejected(MutationError.hotkeyChangedExternally.localizedDescription)); return
                 }
                 let original = self.configuration.hotkeys[index]
-                let result = self.persist(reportFailure: false) { latest in
+                let result = self.persist(reportFailure: false, isCancelled: isCancelled, completion: { result in
+                    switch result {
+                    case .success: finish(.accepted)
+                    case let .failure(error): finish(.rejected(error.localizedDescription))
+                    }
+                }) { latest in
                     guard let latestIndex = self.resolveHotkeyIndex(
                         for: original,
                         preferredIndex: index,
@@ -995,22 +1111,19 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                     latest.hotkeys[latestIndex].action.modifiers = modifiers
                     latest.hotkeys[latestIndex].action.key = key
                 }
-                switch result {
-                case .success: return .accepted
-                case let .failure(error):
-                    self.didFail(error)
-                    return .rejected(error.localizedDescription)
+                if case let .failure(error) = result {
+                    finish(.rejected(error.localizedDescription))
                 }
             }
             recorder.controlSize = .small
-            recorder.widthAnchor.constraint(equalToConstant: 205).isActive = true
+            recorder.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
             return recorder
         default:
             let label = NSTextField(labelWithString: hotkeyActionDescription(binding.action))
             label.font = .systemFont(ofSize: 12)
             label.textColor = .secondaryLabelColor
             label.lineBreakMode = .byTruncatingMiddle
-            label.widthAnchor.constraint(equalToConstant: 205).isActive = true
+            label.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
             return label
         }
     }
@@ -1052,11 +1165,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         }
     }
 
-    private func applicationIcon(for action: HotkeyAction) -> NSImage? {
-        guard action.kind == .focusApplication else { return nil }
-        let url = action.path.map(URL.init(fileURLWithPath:))
-            ?? action.bundleIdentifier.flatMap(NSWorkspace.shared.urlForApplication(withBundleIdentifier:))
-        guard let url else { return nil }
+    /// Launch Services lookups are cached per bundle ID (misses included) for the controller
+    /// lifetime, so table reloads never repeat them.
+    private func applicationURL(bundleIdentifier: String) -> URL? {
+        if let cached = applicationURLs[bundleIdentifier] { return cached }
+        let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
+        applicationURLs[bundleIdentifier] = .some(url)
+        return url
+    }
+
+    private func applicationIcon(at url: URL) -> NSImage {
         if let cached = applicationIcons[url.path] { return cached }
         let icon = NSWorkspace.shared.icon(forFile: url.path)
         icon.size = NSSize(width: 32, height: 32)
@@ -1064,12 +1182,19 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         return icon
     }
 
+    private func applicationIcon(for action: HotkeyAction) -> NSImage? {
+        guard action.kind == .focusApplication else { return nil }
+        let url = action.path.map(URL.init(fileURLWithPath:))
+            ?? action.bundleIdentifier.flatMap(applicationURL(bundleIdentifier:))
+        return url.map(applicationIcon(at:))
+    }
+
     private func selectedApplicationName(for action: HotkeyAction) -> String? {
         if let path = action.path {
             return URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
         }
         if let bundleIdentifier = action.bundleIdentifier,
-           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
+           let url = applicationURL(bundleIdentifier: bundleIdentifier) {
             return url.deletingPathExtension().lastPathComponent
         }
         return nil
@@ -1091,7 +1216,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             ) else { throw MutationError.hotkeyChangedExternally }
             latest.hotkeys[latestIndex].action = action
         }) {
-            reloadHotkeyTable()
+            reloadHotkeyRow(index)
         }
     }
 
@@ -1135,7 +1260,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                     latest.hotkeys[latestIndex].action.function = "main"
                 }
             }
-            if case .success = result { self.reloadHotkeyTable() }
+            if case .success = result { self.reloadHotkeyRow(index) }
         }
     }
 
@@ -1163,11 +1288,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
         stack.addArrangedSubview(section(header: "Screenshot", rows: [
             (formRow(
-                title: "Save directory",
-                hint: "PNG files are written here when Save is used.",
-                control: directoryPicker(capture.screenshotSaveDirectory, field: .screenshotSaveDirectory)
-            ), nil),
-            (formRow(
                 title: "Copy by default",
                 hint: "Return and ⌘C still copy even when this is off.",
                 control: boolSwitch(tag: 30, on: capture.copyScreenshotToClipboard, action: #selector(toggleCopyScreenshot))
@@ -1176,7 +1296,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                 title: "Save to disk",
                 hint: "Used by the Save button after annotation.",
                 control: boolSwitch(tag: 31, on: capture.saveScreenshotToDisk, action: #selector(toggleSaveScreenshot))
-            ), nil)
+            ), nil),
+            (formRow(
+                title: "Save directory",
+                hint: "PNG files are written here when Save is used.",
+                control: directoryPicker(capture.screenshotSaveDirectory, field: .screenshotSaveDirectory)
+            ), { $0.capture.saveScreenshotToDisk })
         ], into: &deps))
 
         let resolution = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -1218,7 +1343,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             ), nil),
             (formRow(
                 title: "Microphone",
-                hint: "Turning this on shows the system Allow dialog. TSMacTools only appears in System Settings after that prompt; it cannot be added manually.",
+                hint: "Turning this on shows the system Allow dialog.",
                 control: microphoneControls(on: capture.captureMicrophone)
             ), nil),
             (formRow(
@@ -1235,19 +1360,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     @objc private func toggleCopyScreenshot(_ sender: NSSwitch) {
         let value = sender.state == .on
-        configuration.capture.copyScreenshotToClipboard = value
         persist { $0.capture.copyScreenshotToClipboard = value }
     }
 
     @objc private func toggleSaveScreenshot(_ sender: NSSwitch) {
         let value = sender.state == .on
-        configuration.capture.saveScreenshotToDisk = value
         persist { $0.capture.saveScreenshotToDisk = value }
+        applyConditionalVisibility(for: selectedPage)
     }
 
     @objc private func toggleSystemAudio(_ sender: NSSwitch) {
         let value = sender.state == .on
-        configuration.capture.captureSystemAudio = value
         persist { $0.capture.captureSystemAudio = value }
     }
 
@@ -1267,7 +1390,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     @objc private func toggleMicrophone(_ sender: NSSwitch) {
         let value = sender.state == .on
-        configuration.capture.captureMicrophone = value
         persist { $0.capture.captureMicrophone = value }
         if value {
             Task { @MainActor in
@@ -1316,7 +1438,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         let after = MicrophonePermission.authorizationState()
         if granted || after == .authorized {
             if !configuration.capture.captureMicrophone {
-                configuration.capture.captureMicrophone = true
                 persist { $0.capture.captureMicrophone = true }
                 showPage(.capture, rebuild: true, animated: false)
             }
@@ -1361,14 +1482,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     @objc private func toggleRecordingCursor(_ sender: NSSwitch) {
         let value = sender.state == .on
-        configuration.capture.showMouseCursorInRecording = value
         persist { $0.capture.showMouseCursorInRecording = value }
     }
 
     @objc private func changeRecordingResolution(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let value = CaptureMediaSettings.RecordingResolution(rawValue: raw) else { return }
-        configuration.capture.recordingResolution = value
         persist { $0.capture.recordingResolution = value }
     }
 
@@ -1386,20 +1505,22 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
     }
 
     @objc private func chooseDirectory(_ sender: NSButton) {
-        guard let field = ConfigurationField(rawValue: sender.tag) else { return }
+        guard let field = ConfigurationField(rawValue: sender.tag), let window else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.directoryURL = URL(fileURLWithPath: displayedValue(for: field), isDirectory: true)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try persistTextValue(url.path, for: field)
-            sender.title = url.path
-            sender.toolTip = url.path
-        } catch {
-            didFail(error)
+        panel.beginSheetModal(for: window) { [weak self, weak sender] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            do {
+                try self.persistTextValue(url.path, for: field)
+                sender?.title = url.path
+                sender?.toolTip = url.path
+            } catch {
+                self.didFail(error)
+            }
         }
     }
 
@@ -1503,22 +1624,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         let value = sender.state == .on
         switch sender.tag {
         case 1:
-            configuration.windowSwitcher.enabled = value
             persist { $0.windowSwitcher.enabled = value }
         case 2:
-            configuration.translation.enabled = value
             persist { $0.translation.enabled = value }
         case 3:
-            configuration.windowSwitcher.debug = value
             persist { $0.windowSwitcher.debug = value }
         case 4:
-            configuration.windowSwitcher.followFocusedScreen = value
             persist { $0.windowSwitcher.followFocusedScreen = value }
         case 5:
-            configuration.translation.normalizePDFLineBreaks = value
             persist { $0.translation.normalizePDFLineBreaks = value }
         case 6:
-            configuration.windowSwitcher.restorePreviousApplicationWhenNoWindows = value
             persist { $0.windowSwitcher.restorePreviousApplicationWhenNoWindows = value }
         default: return
         }
@@ -1527,7 +1642,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
 
     @objc private func providerChanged(_ sender: NSPopUpButton) {
         let provider = ["google_web", "google", "llm"][sender.indexOfSelectedItem.clamped(to: 0 ... 2)]
-        configuration.translation.provider = provider
         persist { $0.translation.provider = provider }
         applyConditionalVisibility(for: selectedPage)
     }
@@ -1633,57 +1747,48 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         applyThinkingLevel(level)
     }
 
-        private func applySelectedModel(_ modelID: String, updateBudgets: Bool) {
-        let previous = configuration.translation
-        configuration.translation.model = modelID
-        var budgetsChanged = false
+    private func applySelectedModel(_ modelID: String, updateBudgets: Bool) {
+        // Build the candidate locally; `persist` commits it to `configuration` only once the
+        // patch is valid, and an unchanged candidate produces an empty patch with no write
+        // or page reconciliation.
+        var translation = configuration.translation
+        translation.model = modelID
         if let model = llmModels.first(where: { $0.id == modelID }) {
             if model.supportsReasoningParameter {
-                configuration.translation.thinkingParameter = "reasoning"
+                translation.thinkingParameter = "reasoning"
             }
             if updateBudgets, let budget = TranslationTokenBudget.derived(from: model) {
-                budgetsChanged =
-                    previous.contextWindowTokens != budget.contextWindowTokens
-                    || previous.outputTokenLimit != budget.outputTokenLimit
-                    || previous.requestTokenLimit != budget.requestTokenLimit
-                configuration.translation.contextWindowTokens = budget.contextWindowTokens
-                configuration.translation.outputTokenLimit = budget.outputTokenLimit
-                configuration.translation.requestTokenLimit = budget.requestTokenLimit
+                translation.contextWindowTokens = budget.contextWindowTokens
+                translation.outputTokenLimit = budget.outputTokenLimit
+                translation.requestTokenLimit = budget.requestTokenLimit
             }
             let levels = model.reasoningLevels
             let current = TranslationThinking.normalizedLevel(
-                thinkingLevel: configuration.translation.thinkingLevel,
-                thinkingEnabled: configuration.translation.thinkingEnabled,
+                thinkingLevel: translation.thinkingLevel,
+                thinkingEnabled: translation.thinkingEnabled,
                 availableLevels: levels
             )
             let resolved: String
             if levels.isEmpty {
-                resolved = configuration.translation.thinkingEnabled ? "high" : "none"
+                resolved = translation.thinkingEnabled ? "high" : "none"
             } else if levels.contains(current) {
                 resolved = current
             } else {
                 resolved = levels.contains("none") ? "none" : (levels.last ?? "none")
             }
-            configuration.translation.thinkingLevel = resolved
-            configuration.translation.thinkingEnabled = TranslationThinking.isEnabled(level: resolved)
+            translation.thinkingLevel = resolved
+            translation.thinkingEnabled = TranslationThinking.isEnabled(level: resolved)
         }
-
-        let translationChanged =
-            previous.model != configuration.translation.model
-            || previous.thinkingParameter != configuration.translation.thinkingParameter
-            || previous.thinkingLevel != configuration.translation.thinkingLevel
-            || previous.thinkingEnabled != configuration.translation.thinkingEnabled
-            || budgetsChanged
-        if translationChanged {
+        if translation != configuration.translation {
             persist { latest in
-                latest.translation.model = self.configuration.translation.model
-                latest.translation.thinkingParameter = self.configuration.translation.thinkingParameter
-                latest.translation.thinkingLevel = self.configuration.translation.thinkingLevel
-                latest.translation.thinkingEnabled = self.configuration.translation.thinkingEnabled
+                latest.translation.model = translation.model
+                latest.translation.thinkingParameter = translation.thinkingParameter
+                latest.translation.thinkingLevel = translation.thinkingLevel
+                latest.translation.thinkingEnabled = translation.thinkingEnabled
                 if updateBudgets {
-                    latest.translation.contextWindowTokens = self.configuration.translation.contextWindowTokens
-                    latest.translation.outputTokenLimit = self.configuration.translation.outputTokenLimit
-                    latest.translation.requestTokenLimit = self.configuration.translation.requestTokenLimit
+                    latest.translation.contextWindowTokens = translation.contextWindowTokens
+                    latest.translation.outputTokenLimit = translation.outputTokenLimit
+                    latest.translation.requestTokenLimit = translation.requestTokenLimit
                 }
             }
         }
@@ -1691,21 +1796,22 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         refreshModelLimitsLabel()
     }
 
-private func applyThinkingLevel(_ level: String) {
+    private func applyThinkingLevel(_ level: String) {
         let normalized = TranslationThinking.normalizedLevel(
             thinkingLevel: level,
             thinkingEnabled: TranslationThinking.isEnabled(level: level)
         )
-        configuration.translation.thinkingLevel = normalized
-        configuration.translation.thinkingEnabled = TranslationThinking.isEnabled(level: normalized)
-        if configuration.translation.thinkingParameter == "include_reasoning"
-            || configuration.translation.thinkingParameter.isEmpty {
-            configuration.translation.thinkingParameter = "reasoning"
+        var translation = configuration.translation
+        translation.thinkingLevel = normalized
+        translation.thinkingEnabled = TranslationThinking.isEnabled(level: normalized)
+        if translation.thinkingParameter == "include_reasoning"
+            || translation.thinkingParameter.isEmpty {
+            translation.thinkingParameter = "reasoning"
         }
         persist { latest in
             latest.translation.thinkingLevel = normalized
             latest.translation.thinkingEnabled = TranslationThinking.isEnabled(level: normalized)
-            latest.translation.thinkingParameter = self.configuration.translation.thinkingParameter
+            latest.translation.thinkingParameter = translation.thinkingParameter
         }
     }
 
@@ -1850,6 +1956,8 @@ private func applyThinkingLevel(_ level: String) {
     func controlTextDidEndEditing(_ notification: Notification) {
         guard let sender = notification.object as? NSTextField,
               let field = ConfigurationField(rawValue: sender.tag) else { return }
+        // Leaving a field without changing it must not issue a save.
+        guard sender.stringValue != displayedValue(for: field) else { return }
         do {
             try persistTextValue(sender.stringValue, for: field)
         } catch {
@@ -1866,66 +1974,59 @@ private func applyThinkingLevel(_ level: String) {
         switch field {
         case .switcherWidth:
             let value = try boundedInt(rawValue, name: "Switcher width", range: 320 ... 1600)
-            configuration.windowSwitcher.width = value
             persist { $0.windowSwitcher.width = value }
         case .switcherHeight:
             let value = try boundedInt(rawValue, name: "Switcher height", range: 120 ... 1200)
-            configuration.windowSwitcher.height = value
             persist { $0.windowSwitcher.height = value }
         case .switcherMaxRows:
             let value = try boundedInt(rawValue, name: "Maximum rows", range: 1 ... 50)
-            configuration.windowSwitcher.maxVisibleRows = value
             persist { $0.windowSwitcher.maxVisibleRows = value }
         case .switcherDisplayDelay:
             guard let value = TimeInterval(rawValue), WindowSwitcherSettings.displayDelayRange.contains(value) else {
                 throw MutationError.invalidValue("Display delay must be between 0 and 2 seconds.")
             }
-            configuration.windowSwitcher.displayDelay = value
             persist { $0.windowSwitcher.displayDelay = value }
         case .pythonPath:
             let value = try requiredText(rawValue, name: "Python path")
-            configuration.scripting.pythonPath = value
             persist { $0.scripting.pythonPath = value }
         case .finderBundleIdentifier:
             let value = try requiredText(rawValue, name: "Finder bundle identifier")
-            configuration.application.finderBundleIdentifier = value
             persist { $0.application.finderBundleIdentifier = value }
         case .terminalBundleIdentifier:
             let value = try requiredText(rawValue, name: "Terminal bundle identifier")
-            configuration.application.terminalBundleIdentifier = value
             persist { $0.application.terminalBundleIdentifier = value }
         case .ignoredApplicationNames:
             let value = rawValue
                 .components(separatedBy: CharacterSet(charactersIn: ",\n"))
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
-            configuration.application.ignoredWindowApplicationNames = value
             persist { $0.application.ignoredWindowApplicationNames = value }
         case .googleSourceLanguage:
             let value = try requiredText(rawValue, name: "Source language")
-            configuration.translation.googleSourceLanguage = value
             persist { $0.translation.googleSourceLanguage = value }
         case .googleTargetLanguage:
             let value = try requiredText(rawValue, name: "Target language")
-            configuration.translation.googleTargetLanguage = value
             persist { $0.translation.googleTargetLanguage = value }
         case .googleTargetLanguageForChinese:
             let value = try requiredText(rawValue, name: "Chinese target language")
-            configuration.translation.googleTargetLanguageForChinese = value
             persist { $0.translation.googleTargetLanguageForChinese = value }
         case .copyKeystrokeDelay:
             guard let value = Double(rawValue), value >= 0 else {
                 throw MutationError.invalidValue("Copy delay must be a non-negative number.")
             }
-            configuration.translation.copyKeystrokeDelay = value
             persist { $0.translation.copyKeystrokeDelay = value }
         case .endpoint:
             let value = try TranslationEndpoint.requestURL(rawValue)
-            configuration.translation.endpoint = value
-            persist { $0.translation.endpoint = value }
+            guard value != configuration.translation.endpoint else { return }
+            // Refresh only the model popup after the endpoint is durably saved; the save itself
+            // does not rebuild General because the persisted value already matches the display.
+            persist(completion: { [weak self] result in
+                guard let self, case let .success(saved) = result,
+                      saved.translation.endpoint == value else { return }
+                self.refreshLLMModels(userInitiated: true)
+            }) { $0.translation.endpoint = value }
         case .model:
             let value = try requiredText(rawValue, name: "LLM model")
-            configuration.translation.model = value
             persist { $0.translation.model = value }
             rebuildModelPopup()
             rebuildThinkingLevelPopup()
@@ -1933,31 +2034,24 @@ private func applyThinkingLevel(_ level: String) {
             applyThinkingLevel(rawValue)
         case .contextWindowTokens:
             let value = try positiveInt(rawValue, name: "Context tokens")
-            configuration.translation.contextWindowTokens = value
             persist { $0.translation.contextWindowTokens = value }
         case .outputTokenLimit:
             let value = try positiveInt(rawValue, name: "Output tokens")
-            configuration.translation.outputTokenLimit = value
             persist { $0.translation.outputTokenLimit = value }
         case .requestTokenLimit:
             guard let value = Int(rawValue), value >= 0 else {
                 throw MutationError.invalidValue("Request tokens must be zero or a positive integer.")
             }
-            configuration.translation.requestTokenLimit = value
             persist { $0.translation.requestTokenLimit = value }
         case .apiKey:
-            configuration.translation.apiKey = rawValue
             persist { $0.translation.apiKey = rawValue }
         case .googleAPIKey:
-            configuration.translation.googleApiKey = rawValue
             persist { $0.translation.googleApiKey = rawValue }
         case .screenshotSaveDirectory:
             let value = try requiredText(rawValue, name: "Screenshot save directory")
-            configuration.capture.screenshotSaveDirectory = value
             persist { $0.capture.screenshotSaveDirectory = value }
         case .recordingSaveDirectory:
             let value = try requiredText(rawValue, name: "Recording save directory")
-            configuration.capture.recordingSaveDirectory = value
             persist { $0.capture.recordingSaveDirectory = value }
         case .recordingFrameRate:
             let value = try boundedInt(
@@ -1965,7 +2059,6 @@ private func applyThinkingLevel(_ level: String) {
                 name: "Frame rate",
                 range: CaptureMediaSettings.frameRateRange
             )
-            configuration.capture.recordingFrameRate = value
             persist { $0.capture.recordingFrameRate = value }
         case .recordingBitrateKbps:
             let value = try boundedInt(
@@ -1973,7 +2066,6 @@ private func applyThinkingLevel(_ level: String) {
                 name: "Bitrate",
                 range: CaptureMediaSettings.bitrateRange
             )
-            configuration.capture.recordingBitrateKbps = value
             persist { $0.capture.recordingBitrateKbps = value }
         }
     }
@@ -2060,22 +2152,16 @@ private func applyThinkingLevel(_ level: String) {
         let value = sender.state == .on
         switch sender.tag {
         case 10:
-            configuration.scroll.enabled = value
             persist { $0.scroll.enabled = value }
         case 11:
-            configuration.scroll.smoothVertical = value
             persist { $0.scroll.smoothVertical = value }
         case 12:
-            configuration.scroll.smoothHorizontal = value
             persist { $0.scroll.smoothHorizontal = value }
         case 13:
-            configuration.scroll.reverseVertical = value
             persist { $0.scroll.reverseVertical = value }
         case 14:
-            configuration.scroll.reverseHorizontal = value
             persist { $0.scroll.reverseHorizontal = value }
         case 15:
-            configuration.scroll.excludeTrackpad = value
             persist { $0.scroll.excludeTrackpad = value }
         default: return
         }
@@ -2092,8 +2178,6 @@ private func applyThinkingLevel(_ level: String) {
             object: nil
         )
         pendingTuningChanges.removeAll(keepingCapacity: true)
-        configuration.scroll.applyPreset(preset)
-        syncTuningControls()
         persist { $0.scroll.applyPreset(preset) }
         syncTuningControls()
         applyConditionalVisibility(for: selectedPage)
@@ -2129,47 +2213,64 @@ private func applyThinkingLevel(_ level: String) {
     @discardableResult
     private func persist(
         reportFailure: Bool = true,
+        isCancelled: (@Sendable () -> Bool)? = nil,
         completion: (@MainActor @Sendable (Result<UserConfiguration, Error>) -> Void)? = nil,
         _ mutation: (inout UserConfiguration) throws -> Void
     ) -> Result<UserConfiguration, Error> {
         do {
             let baseline = lastKnownGoodConfiguration
+            let previous = configuration
             var proposed = configuration
             try mutation(&proposed)
             let patch = try ConfigurationPatch(before: baseline, after: proposed)
             configuration = proposed
-            (fanRuntime ?? fanLivePanel)?.apply(proposed.fans)
+            if proposed.fans != previous.fans {
+                (fanRuntime ?? fanLivePanel)?.apply(proposed.fans)
+            }
+            if patch.isEmpty {
+                completion?(.success(proposed))
+                return .success(proposed)
+            }
             lastKnownGoodConfiguration = proposed
             saveGeneration += 1
             let generation = saveGeneration
             let url = configURL
+            let store = SettingsStoreBox(configurationStore)
             savingQueue.async { [weak self] in
-                let store = UserConfigurationStore()
-                let result = Result { try store.update(at: url) { try patch.apply(to: &$0) } }
-                let recovery = (try? result.get()) ?? (try? store.load(from: url))
+                let result = Result {
+                    try store.store.update(at: url) { latest in
+                        if isCancelled?() == true { throw SettingsSaveCancelled() }
+                        try patch.apply(to: &latest)
+                    }
+                }
+                let recovery = (try? result.get()) ?? (try? store.store.load(from: url))
                 DispatchQueue.main.async {
                     guard let self else { return }
                     switch result {
                     case let .success(saved):
                         self.didSave(saved)
                         if self.saveGeneration == generation {
-                            self.configuration = saved
+                            let displayed = self.configuration
                             self.lastKnownGoodConfiguration = saved
-                            (self.fanRuntime ?? self.fanLivePanel)?.apply(saved.fans)
-                            self.cachedPageViews = self.cachedPageViews.filter { $0.key == self.selectedPage }
-                            if self.selectedPage != .fans || saved.fans.rules.count != self.fanEditorCount { self.scheduleVisiblePageReconciliation() }
-                        }
-                    case let .failure(error):
-                        if self.saveGeneration == generation {
-                            if let latest = recovery {
-                                self.configuration = latest
-                                self.lastKnownGoodConfiguration = latest
-                                (self.fanRuntime ?? self.fanLivePanel)?.apply(latest.fans)
+                            self.configuration = saved
+                            if saved.fans != displayed.fans {
+                                (self.fanRuntime ?? self.fanLivePanel)?.apply(saved.fans)
                             }
                             self.cachedPageViews = self.cachedPageViews.filter { $0.key == self.selectedPage }
+                            if saved != displayed { self.scheduleVisiblePageReconciliation() }
                         }
+                    case let .failure(error):
+                        if let latest = recovery {
+                            let displayed = self.configuration
+                            self.configuration = latest
+                            self.lastKnownGoodConfiguration = latest
+                            if latest.fans != displayed.fans {
+                                (self.fanRuntime ?? self.fanLivePanel)?.apply(latest.fans)
+                            }
+                        }
+                        self.cachedPageViews = self.cachedPageViews.filter { $0.key == self.selectedPage }
                         self.scheduleVisiblePageReconciliation()
-                        if reportFailure { self.didFail(error) }
+                        if reportFailure, !(error is SettingsSaveCancelled) { self.didFail(error) }
                     }
                     completion?(result)
                 }
@@ -2301,6 +2402,7 @@ private func applyThinkingLevel(_ level: String) {
         headerLabel.textColor = .secondaryLabelColor
         grid.addRow(with: [headerLabel, NSView()])
 
+        var textStacks: [NSStackView] = []
         for (spec, condition) in rows {
             let titleLabel = NSTextField(labelWithString: spec.title)
             titleLabel.font = .systemFont(ofSize: 13)
@@ -2318,16 +2420,19 @@ private func applyThinkingLevel(_ level: String) {
                 hintField.font = .systemFont(ofSize: 11)
                 hintField.textColor = .secondaryLabelColor
                 hintField.maximumNumberOfLines = 2
+                hintField.lineBreakMode = .byTruncatingTail
                 hintField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-                hintField.widthAnchor.constraint(lessThanOrEqualToConstant: 244).isActive = true
                 textStack.addArrangedSubview(hintField)
+                hintField.widthAnchor.constraint(equalTo: textStack.widthAnchor).isActive = true
                 titleLabel.toolTip = hint
                 spec.hintLabel?(hintField)
             }
 
             if let control = spec.control {
                 control.toolTip = control.toolTip ?? spec.hint
+                applySmallControlSize(control)
             }
+            textStacks.append(textStack)
             let gridRow = grid.addRow(with: [textStack, trailingCell(spec.control)])
             if let condition {
                 deps.append(ConditionalRow(condition: condition, setHidden: { hidden in
@@ -2335,7 +2440,10 @@ private func applyThinkingLevel(_ level: String) {
                 }))
             }
         }
-        grid.column(at: 0).width = 260
+        // The control column is sized to its widest control; the label/hint column takes the
+        // remaining card width, so hints get more room as the window widens.
+        let controlWidth = rows.compactMap { $0.view.control?.fittingSize.width }.max() ?? 0
+        grid.column(at: 1).width = controlWidth
 
         let card = SettingsCardView(cornerRadius: 10)
         grid.translatesAutoresizingMaskIntoConstraints = false
@@ -2344,10 +2452,30 @@ private func applyThinkingLevel(_ level: String) {
             grid.topAnchor.constraint(equalTo: card.topAnchor, constant: 13),
             grid.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
             grid.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            grid.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -13),
-            card.widthAnchor.constraint(equalToConstant: 680)
+            grid.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -13)
         ])
+        for textStack in textStacks {
+            let width = textStack.widthAnchor.constraint(
+                equalTo: grid.widthAnchor,
+                constant: -(controlWidth + grid.columnSpacing)
+            )
+            width.priority = .defaultHigh
+            width.isActive = true
+        }
         return card
+    }
+
+    /// Applies the compact `.small` size used by every settings row control.
+    private func applySmallControlSize(_ view: NSView) {
+        if let control = view as? NSControl {
+            control.controlSize = .small
+            if control is NSPopUpButton || (control is NSTextField && (control as? NSTextField)?.isEditable == true) {
+                control.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small))
+            } else if let button = control as? NSButton, !(control is NSSwitch), button.bezelStyle == .rounded || button.bezelStyle == .push {
+                button.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small))
+            }
+        }
+        view.subviews.forEach(applySmallControlSize)
     }
 
     /// Wraps a trailing-aligned control so the grid's fill placement never stretches switches,
@@ -2380,7 +2508,7 @@ private func applyThinkingLevel(_ level: String) {
         action: Selector = #selector(generalControlChanged(_:))
     ) -> NSSwitch {
         let toggle = NSSwitch()
-        toggle.controlSize = .mini
+        toggle.controlSize = .small
         toggle.state = on ? .on : .off
         toggle.tag = tag
         toggle.target = self
@@ -2398,7 +2526,8 @@ private func applyThinkingLevel(_ level: String) {
         textField.stringValue = value
         textField.tag = field.rawValue
         textField.delegate = self
-        textField.font = .systemFont(ofSize: 13)
+        textField.controlSize = .small
+        textField.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small))
         textField.isEditable = true
         textField.isSelectable = true
         textField.isBezeled = true
@@ -2414,7 +2543,7 @@ private func applyThinkingLevel(_ level: String) {
         field.font = .systemFont(ofSize: 11)
         field.textColor = .secondaryLabelColor
         field.maximumNumberOfLines = 0
-        field.widthAnchor.constraint(equalToConstant: 680).isActive = true
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return field
     }
 
@@ -2434,10 +2563,20 @@ private func applyThinkingLevel(_ level: String) {
         return (row, slider, valueLabel)
     }
 
+    /// Pins every arranged card, note, and toolbar to the page width (minus the page insets) so
+    /// cards follow the window width instead of a fixed 680-point column.
+    private func fillPageWidth(_ stack: NSStackView) {
+        let insets = stack.edgeInsets.left + stack.edgeInsets.right
+        for view in stack.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -insets).isActive = true
+        }
+    }
+
     private func scrollable(_ stack: NSStackView) -> NSView {
         // The document view is pinned to at least the viewport height, so a short page must
         // not stretch cards or grid cells to absorb the difference. This trailing filler
         // offers zero vertical resistance and takes all leftover space instead.
+        fillPageWidth(stack)
         let filler = NSView()
         filler.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .vertical)
         filler.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .vertical)
@@ -2547,7 +2686,7 @@ private func applyThinkingLevel(_ level: String) {
         // provider-dependent translation rows, collapsed master switches, and the custom-only
         // tuning card. Light appearance only; the toggles are orthogonal to colors.
         let variants: [(name: String, page: Page, mutate: (inout UserConfiguration) -> Void)] = [
-            ("llm-light", .general, { config in
+            ("llm-light", .translation, { config in
                 config.translation.enabled = true
                 config.translation.provider = "llm"
             }),
@@ -2706,16 +2845,25 @@ private final class HotkeyRecorderButton: NSButton {
 
     var onRecordingBegan: (() -> Void)?
     var onRecordingEnded: (() -> Void)?
-    var onRecord: (([String], String, Int?) -> CommitResult)?
-    var onRecordAsync: (([String], String, Int?, @escaping @MainActor @Sendable (CommitResult) -> Void) -> Void)?
+    /// Receives the candidate, a probe that reports whether recording ended before the
+    /// save landed, and a completion that must be called exactly once.
+    var onRecordAsync: (
+        [String], String, Int?,
+        @escaping @Sendable () -> Bool,
+        @escaping @MainActor @Sendable (CommitResult) -> Void
+    ) -> Void = { _, _, _, _, finish in finish(.rejected("Unable to save this shortcut.")) }
     private var commitPending = false
     private var commitToken = UUID()
+    private var pendingCancellation: RecorderCommitCancellation?
     private func commit(modifiers: [String], key: String, mouse: Int?) {
         guard !commitPending else { return }
         let token = UUID(); commitToken = token; commitPending = true
+        let cancellation = RecorderCommitCancellation()
+        pendingCancellation = cancellation
         let finish: @MainActor @Sendable (CommitResult) -> Void = { [weak self] result in
             guard let self, self.recording, self.commitToken == token else { return }
             self.commitPending = false
+            self.pendingCancellation = nil
             switch result {
             case .accepted:
                 self.binding.modifiers = modifiers; self.binding.key = key; self.binding.mouseButton = mouse
@@ -2723,8 +2871,8 @@ private final class HotkeyRecorderButton: NSButton {
             case let .rejected(message): self.title = message; self.toolTip = message; NSSound.beep()
             }
         }
-        if let onRecordAsync { title = "Saving…"; onRecordAsync(modifiers, key, mouse, finish) }
-        else { finish(onRecord?(modifiers, key, mouse) ?? .rejected("Unable to save this shortcut.")) }
+        title = "Saving…"
+        onRecordAsync(modifiers, key, mouse, { cancellation.isCancelled }, finish)
     }
     private var binding: HotkeyBinding
     private let allowsMouseButton: Bool
@@ -2823,6 +2971,9 @@ private final class HotkeyRecorderButton: NSButton {
     private func endRecordingIfNeeded() {
         guard recording else { return }
         recording = false
+        commitPending = false
+        pendingCancellation?.cancel()
+        pendingCancellation = nil
         removeEventMonitors()
         updateTitle()
         onRecordingEnded?()
@@ -3052,6 +3203,11 @@ private final class FlippedSettingsDocumentView: NSView {
 }
 
 @MainActor
+private final class WeakReference<Value: AnyObject> {
+    weak var value: Value?
+    init(_ value: Value) { self.value = value }
+}
+
 private class SettingsCardView: NSView {
     init(cornerRadius: CGFloat) {
         super.init(frame: .zero)
@@ -3272,19 +3428,22 @@ private final class FanCurveEditor: NSView {
         let requested = snapshot?.ruleReadings[rule.sensor].flatMap { rule.demand(at: $0) }
         let effective = snapshot?.acceptedDemands[rule.fan]
         let status: String
-        if !rule.enabled { status = "Disabled · 规则已禁用" }
-        else if requested == nil { status = "Awaiting sensor · 等待读数" }
+        if !rule.enabled { status = "Disabled" }
+        else if requested == nil { status = "Awaiting sensor" }
         else if snapshot?.controlEnabled != true { status = snapshot?.controlStatus ?? "Awaiting helper" }
-        else if let effective, let requested { status = effective > requested ? "Shadowed · 更高规则优先" : "Active · 已接受批次" }
+        else if let effective, let requested { status = effective > requested ? "Shadowed by a higher rule" : "Active" }
         else { status = snapshot?.controlStatus ?? "Awaiting batch" }
-        let captionText = "\(status) · 请求 \(requested.map { String(format: "%.0f%%", $0) } ?? "—") · 有效 \(effective.map { String(format: "%.0f%%", $0) } ?? "—")"
-        if caption.stringValue != captionText { caption.stringValue = captionText }
+        statusCaption = "\(status) · Requested \(requested.map { String(format: "%.0f%%", $0) } ?? "—") · Effective \(effective.map { String(format: "%.0f%%", $0) } ?? "—")"
+        // A drag shows the dragged point; the status caption returns on mouseUp.
+        if !isDragging, caption.stringValue != statusCaption { caption.stringValue = statusCaption }
         caption.toolTip = "Effective demand is the maximum across enabled rules for this fan. Accepted batch does not prove exclusive firmware ownership."
         let currentFan = snapshot?.fans.first { $0.id == rule.fan }
         if previousTemperature != snapshot?.ruleReadings[rule.sensor] || previousFan?.minimum != currentFan?.minimum || previousFan?.maximum != currentFan?.maximum { needsDisplay = true }
     }
     private var selected: Int?
     private var selectedHandle: (Int, Bool)?
+    private var statusCaption = ""
+    private var isDragging = false
     private let sensor = NSPopUpButton()
     private let fan = NSPopUpButton()
     private let caption = NSTextField(labelWithString: "")
@@ -3293,7 +3452,7 @@ private final class FanCurveEditor: NSView {
         self.rule = rule
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        widthAnchor.constraint(greaterThanOrEqualToConstant: 680).isActive = true
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 600).isActive = true
         heightAnchor.constraint(equalToConstant: 280).isActive = true
         update(snapshot: nil)
         for popup in [sensor, fan] { popup.target = self; popup.action = #selector(selectionChanged); addSubview(popup) }
@@ -3427,7 +3586,8 @@ private final class FanCurveEditor: NSView {
             let percent = geometry.reading(at: p).percent
             let ordinate = ((percent - a.percent) / (b.percent - a.percent)).clamped(to: 0...1)
             if outgoing { rule.points[index].outgoing = ordinate } else { rule.points[index + 1].incoming = ordinate }
-            onChange?(rule); needsDisplay = true; return
+            // Drag updates only the local model; the rule is committed once on mouseUp.
+            isDragging = true; needsDisplay = true; return
         }
         guard let selected else { return }
         let lower = selected > 0 ? rule.points[selected - 1].temperature + 1 : 20
@@ -3437,11 +3597,16 @@ private final class FanCurveEditor: NSView {
         let minimum = selected > 0 ? rule.points[selected - 1].percent : 0
         let maximum = selected + 1 < rule.points.count ? rule.points[selected + 1].percent : 100
         rule.points[selected].percent = (geometry.reading(at: p).percent).clamped(to: minimum...maximum)
-        onChange?(rule)
+        isDragging = true
         caption.stringValue = String(format: "%.1f °C · %.0f%%", rule.points[selected].temperature, rule.points[selected].percent)
         needsDisplay = true
     }
-    override func mouseUp(with event: NSEvent) { if selected != nil || selectedHandle != nil { onChange?(rule) }; selected = nil; selectedHandle = nil }
+    override func mouseUp(with event: NSEvent) {
+        let committed = isDragging
+        isDragging = false; selected = nil; selectedHandle = nil
+        if !statusCaption.isEmpty { caption.stringValue = statusCaption }
+        if committed { onChange?(rule) }
+    }
 }
 
 /// Serial I/O owner; UI gets immutable snapshots. No privileged writes occur without a verified XPC peer.
@@ -3557,7 +3722,7 @@ final class FanRuntime: NSObject {
     private var readingCards: [String: NSTextField] = [:]
     private let readings = NSTextField(wrappingLabelWithString: "Reading AppleSMC…")
     private let state = NSTextField(wrappingLabelWithString: "Helper unavailable. macOS automatic control.")
-    private let toggle = NSButton(checkboxWithTitle: "Enable Rules", target: nil, action: nil)
+    private let toggle = NSSwitch()
     private let serviceStatus = NSTextField(wrappingLabelWithString: "Installed: checking · Running: checking · Authenticated: no")
     private var helperUpdateRequired = false
     private let helperVersions = NSTextField(wrappingLabelWithString: "Bundled protocol v2 · Checking helper fingerprints…")
@@ -3591,7 +3756,6 @@ final class FanRuntime: NSObject {
     override init() {
         super.init()
         monitoringView.translatesAutoresizingMaskIntoConstraints = false
-        monitoringView.widthAnchor.constraint(equalToConstant: 680).isActive = true
         fanCards.translatesAutoresizingMaskIntoConstraints = false
         sensorSections.orientation = .vertical; sensorSections.alignment = .leading
         sensorSections.translatesAutoresizingMaskIntoConstraints = false
@@ -3631,16 +3795,60 @@ final class FanRuntime: NSObject {
         controlIntervalPicker.toolTip = "Used while enabled rules run. Visible monitoring may require faster sampling."
         let controlRow = NSStackView(views: [NSTextField(labelWithString: "Background control sampling"), controlIntervalPicker])
         let filters = NSStackView(views: [showOther, sensorSearch])
-        let stack = NSStackView(views: [refreshRow, controlRow, readings, fanCards, filters, sensorSections, serviceStatus, helperVersions, state, permissions, actions, toggle])
-        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
+        toggle.controlSize = .small
+        toggle.setAccessibilityLabel("Enable Rules")
+        let enableLabel = NSTextField(labelWithString: "Enable Rules")
+        enableLabel.font = .systemFont(ofSize: 13)
+        let enableSpacer = NSView()
+        enableSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let enableRow = NSStackView(views: [enableLabel, enableSpacer, toggle])
+        enableRow.orientation = .horizontal; enableRow.alignment = .centerY
+        for label in [serviceStatus, helperVersions, state, readings] {
+            label.font = .systemFont(ofSize: 11)
+            label.textColor = .secondaryLabelColor
+        }
+        readings.textColor = .labelColor
+        for control in [setup, reinstall, uninstall, retry] { control.controlSize = .small; control.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small)) }
+        for popup in [refreshIntervalPicker, controlIntervalPicker] { popup.controlSize = .small; popup.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small)) }
+
+        let helperCard = Self.card(header: "Helper", views: [serviceStatus, helperVersions, actions, permissions], fullWidth: [serviceStatus, helperVersions, permissions])
+        let controlCard = Self.card(header: "Automatic control", views: [enableRow, controlRow, state], fullWidth: [enableRow, state])
+        let monitoringCard = Self.card(header: "Monitoring", views: [refreshRow, readings, fanCards, filters, sensorSections], fullWidth: [readings, fanCards, sensorSections])
+        let stack = NSStackView(views: [helperCard, controlCard, monitoringCard])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         stack.translatesAutoresizingMaskIntoConstraints = false; monitoringView.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: monitoringView.leadingAnchor), stack.trailingAnchor.constraint(equalTo: monitoringView.trailingAnchor), stack.topAnchor.constraint(equalTo: monitoringView.topAnchor), stack.bottomAnchor.constraint(equalTo: monitoringView.bottomAnchor)])
-        fanCards.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        sensorSections.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        for card in [helperCard, controlCard, monitoringCard] {
+            card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
         toggle.target = self; toggle.action = #selector(change); toggle.isEnabled = true
     }
     @objc private func change() {
         onEnabledChange?(toggle.state == .on)
+    }
+
+    /// One Settings card: a section header followed by vertically stacked content.
+    private static func card(header: String, views: [NSView], fullWidth: [NSView]) -> NSView {
+        let title = NSTextField(labelWithString: header)
+        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        title.textColor = .secondaryLabelColor
+        let content = NSStackView(views: [title] + views)
+        content.orientation = .vertical; content.alignment = .leading; content.spacing = 8
+        content.translatesAutoresizingMaskIntoConstraints = false
+        let card = SettingsCardView(cornerRadius: 10)
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 13),
+            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -13)
+        ])
+        for view in fullWidth {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            view.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        }
+        return card
     }
     private func restore() {
         acceptedDemands = [:]; batchStatus = "Automatic restoration requested"
@@ -4036,4 +4244,22 @@ private enum FanHelperInstallation {
         }
         return nil
     }
+}
+
+private struct SettingsSaveCancelled: LocalizedError {
+    var errorDescription: String? { "The settings change was cancelled before it was saved." }
+}
+
+/// The store is only used from the serial settings-save queue after handoff.
+private final class SettingsStoreBox: @unchecked Sendable {
+    let store: UserConfigurationStore
+    init(_ store: UserConfigurationStore) { self.store = store }
+}
+
+/// Set on the main actor when recording ends; read by the background save mutation.
+private final class RecorderCommitCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    var isCancelled: Bool { lock.withLock { cancelled } }
+    func cancel() { lock.withLock { cancelled = true } }
 }

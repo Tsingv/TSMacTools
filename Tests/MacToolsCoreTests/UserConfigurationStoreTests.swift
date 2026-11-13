@@ -886,6 +886,38 @@ final class FanSafetyTests: XCTestCase {
         latest.hotkeys.removeFirst()
         XCTAssertThrowsError(try arrayPatch.apply(to: &latest))
     }
+
+    func testPatchIsEmptyOnlyWithoutLeafDifferences() throws {
+        let original = UserConfiguration.migratedHammerspoonDefault()
+        XCTAssertTrue(try ConfigurationPatch(before: original, after: original).isEmpty)
+        var proposed = original
+        proposed.scroll.reverseVertical.toggle()
+        XCTAssertFalse(try ConfigurationPatch(before: original, after: proposed).isEmpty)
+    }
+
+    func testUpdateSkipsWriteWhenMergedBytesAreIdentical() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = UserConfigurationStore()
+        let configURL = root.appendingPathComponent("config.jsonc")
+        let text = "// keep\n" + String(decoding: try store.encodeConfigurationAsJSONC(.migratedHammerspoonDefault()), as: UTF8.self)
+        try text.write(to: configURL, atomically: true, encoding: .utf8)
+        let old = Date(timeIntervalSince1970: 1_000_000)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: configURL.path)
+        let inode = try FileManager.default.attributesOfItem(atPath: configURL.path)[.systemFileNumber] as? Int
+
+        let unchanged = try store.update(at: configURL) { latest in
+            latest.scroll.reverseVertical = latest.scroll.reverseVertical
+        }
+
+        XCTAssertEqual(unchanged, try store.load(from: configURL))
+        let attributes = try FileManager.default.attributesOfItem(atPath: configURL.path)
+        XCTAssertEqual(attributes[.modificationDate] as? Date, old)
+        XCTAssertEqual(attributes[.systemFileNumber] as? Int, inode)
+        XCTAssertEqual(try String(contentsOf: configURL, encoding: .utf8), text)
+    }
 }
 
 final class SMCHardwareTests: XCTestCase {
