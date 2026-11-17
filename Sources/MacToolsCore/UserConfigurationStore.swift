@@ -790,7 +790,10 @@ public final class UserConfigurationStore {
                 api_key,
             ),
             data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": "TSMacTools-translate/1.0",
+            },
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -850,7 +853,7 @@ public final class UserConfigurationStore {
         target_language = target_language_for_text(translation, source_text)
         request = urllib.request.Request(
             google_web_translate_url(translation, source_text, target_language),
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={"User-Agent": "TSMacTools-translate/1.0"},
             method="GET",
         )
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -963,6 +966,9 @@ public final class UserConfigurationStore {
             headers={
                 "Authorization": f"Bearer {translation['apiKey']}",
                 "Content-Type": "application/json",
+                # Override urllib's default Python-urllib signature. CLIProxyAPI forwards
+                # User-Agent upstream; Cloudflare in front of Groq rejects Python-urllib with 403/1010.
+                "User-Agent": "TSMacTools-translate/1.0",
             },
             method="POST",
         )
