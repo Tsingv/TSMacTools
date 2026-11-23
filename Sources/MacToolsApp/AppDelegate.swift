@@ -572,6 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let fanRuntime = FanRuntime()
     private let screenshotController = ScreenshotCaptureController()
     private let screenRecordingController = ScreenRecordingController()
+    private lazy var clipboardHistoryController = ClipboardHistoryController(historyDirectory: configurationStore.defaultDirectoryURL())
     private var settingsWindowController: SettingsWindowController?
     private var statusItem: NSStatusItem?
     private var menuBarVisibilityMenuController: MenuBarVisibilityMenuController?
@@ -745,6 +746,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Capture Screenshot", action: #selector(captureScreenshot), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Toggle Screen Recording", action: #selector(toggleScreenRecording), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Clipboard History", action: #selector(showClipboardHistory), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Clear Clipboard History", action: #selector(clearClipboardHistory), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Reload Configuration", action: #selector(reloadConfiguration), keyEquivalent: "r"))
@@ -781,6 +784,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func captureScreenshot() {
         screenshotController.beginCapture()
+    }
+
+    @objc private func showClipboardHistory() {
+        clipboardHistoryController.togglePopup()
+    }
+
+    @objc private func clearClipboardHistory(_ sender: NSMenuItem) {
+        clipboardHistoryController.clearHistory(includingPinned: NSEvent.modifierFlags.contains(.option))
     }
 
     @objc private func toggleScreenRecording() {
@@ -879,6 +890,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 },
                 toggleScreenRecordingHandler: { [weak self] in
                     self?.toggleScreenRecording()
+                },
+                showClipboardHistoryHandler: { [weak self] in
+                    self?.clipboardHistoryController.togglePopup()
                 }
             )
             controller.start()
@@ -898,6 +912,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         screenshotController.apply(configuration.capture)
         screenRecordingController.apply(configuration.capture)
+        clipboardHistoryController.apply(settings: configuration.clipboard)
+        clipboardHistoryController.start()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

@@ -218,6 +218,16 @@
       "modifiers": [
         "alt"
       ]
+    },
+    {
+      "action": {
+        "kind": "showClipboardHistory"
+      },
+      "key": "C",
+      "modifiers": [
+        "cmd",
+        "shift"
+      ]
     }
   ],
 
@@ -235,6 +245,30 @@
     "captureSystemAudio": true,
     "captureMicrophone": false, // Requests mic permission; mixed mic tracks remain deferred for power.
     "showMouseCursorInRecording": true
+  },
+
+  // Clipboard history modeled on Maccy's user-facing behavior.
+  // Command-Shift-C opens the panel (also editable on the Hotkeys tab).
+  // Copies keep every persistable pasteboard type, not just plain text.
+  "clipboard": {
+    "enabled": true,
+    "historySize": 200,
+    "pasteAutomatically": true,
+    "showFooter": true,
+    "checkInterval": 0.5,
+    "ignoreEvents": false,
+    "ignoreOnlyNextEvent": false,
+    "ignoreAllAppsExceptListed": false,
+    "ignoredApps": [],
+    "ignoredPasteboardTypes": [
+      "com.agilebits.onepassword",
+      "com.typeit4me.clipping",
+      "de.petermaurer.TransientPasteboardType",
+      "Pasteboard generator type",
+      "net.antelle.keeweb"
+    ],
+    "ignoreRegex": [],
+    "clearSystemClipboard": false
   },
 
   // Mouse-wheel smoothing. Trackpad/Magic Mouse gestures and already-continuous remote-desktop

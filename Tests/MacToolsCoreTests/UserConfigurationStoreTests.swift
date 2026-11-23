@@ -469,6 +469,33 @@ final class UserConfigurationStoreTests: XCTestCase {
         XCTAssertFalse(scriptText.contains(#"strip_thinking_blocks"#))
     }
 
+    func testBootstrapAddsClipboardHotkeyToExistingConfig() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = UserConfigurationStore()
+        var configuration = UserConfiguration.migratedHammerspoonDefault()
+        configuration.hotkeys.removeAll { $0.action.kind == .showClipboardHistory }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let configURL = root.appendingPathComponent(UserConfiguration.defaultFileName)
+        var text = "// keep this comment\n" + String(decoding: try store.encodeConfigurationAsJSONC(configuration), as: UTF8.self)
+        try text.write(to: configURL, atomically: true, encoding: .utf8)
+
+        let result = try store.bootstrap(at: root)
+        let saved = String(decoding: try Data(contentsOf: configURL), as: UTF8.self)
+
+        XCTAssertTrue(result.configuration.hotkeys.contains {
+            $0.action.kind == .showClipboardHistory
+                && $0.shortcut == HotkeyShortcut(modifiers: ["cmd", "shift"], key: "C")
+        })
+        XCTAssertTrue(saved.contains("// keep this comment"))
+        XCTAssertTrue(saved.contains("showClipboardHistory"))
+        XCTAssertEqual(
+            result.configuration.hotkeys.filter { $0.action.kind != .showClipboardHistory }.count,
+            configuration.hotkeys.count
+        )
+    }
+
     func testBootstrapReadsExistingConfigurationWithoutOverwriting() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

@@ -208,6 +208,7 @@ final class GlobalHotkeyController {
     private let reloadConfigurationHandler: (() -> Void)?
     private let captureScreenshotHandler: (() -> Void)?
     private let toggleScreenRecordingHandler: (() -> Void)?
+    private let showClipboardHistoryHandler: (() -> Void)?
     private weak var windowSwitcherController: WindowSwitcherController?
     private var configuration: UserConfiguration
     private var eventHandler: EventHandlerRef?
@@ -225,7 +226,8 @@ final class GlobalHotkeyController {
         windowSwitcherController: WindowSwitcherController? = nil,
         reloadConfigurationHandler: (() -> Void)? = nil,
         captureScreenshotHandler: (() -> Void)? = nil,
-        toggleScreenRecordingHandler: (() -> Void)? = nil
+        toggleScreenRecordingHandler: (() -> Void)? = nil,
+        showClipboardHistoryHandler: (() -> Void)? = nil
     ) {
         self.runtime = runtime
         self.configuration = configuration
@@ -234,6 +236,7 @@ final class GlobalHotkeyController {
         self.reloadConfigurationHandler = reloadConfigurationHandler
         self.captureScreenshotHandler = captureScreenshotHandler
         self.toggleScreenRecordingHandler = toggleScreenRecordingHandler
+        self.showClipboardHistoryHandler = showClipboardHistoryHandler
         mouseHotkeyTap.onTrigger = { [weak self] trigger in
             DispatchQueue.main.async {
                 guard let self, case .active = self.lifecycle,
@@ -547,6 +550,8 @@ final class GlobalHotkeyController {
             captureScreenshotHandler?()
         case .toggleScreenRecording:
             toggleScreenRecordingHandler?()
+        case .showClipboardHistory:
+            showClipboardHistoryHandler?()
         }
     }
 

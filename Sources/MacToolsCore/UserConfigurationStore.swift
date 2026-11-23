@@ -392,7 +392,7 @@ public final class UserConfigurationStore {
         let configuration: UserConfiguration
         if fileManager.fileExists(atPath: configURL.path) {
             let data = try Data(contentsOf: configURL)
-            configuration = try decodeConfiguration(from: data)
+            configuration = try ensuringClipboardHistoryHotkey(decodeConfiguration(from: data), at: configURL)
             createdConfig = false
         } else {
             let data = try encodeConfigurationAsJSONC(defaultConfiguration)
@@ -435,6 +435,30 @@ public final class UserConfigurationStore {
 
     public func load(from configURL: URL) throws -> UserConfiguration {
         try decodeConfiguration(from: Data(contentsOf: configURL))
+    }
+
+    /// Older installs predate clipboard history, so Command+Shift+C was never registered.
+    /// Insert the default binding once, keeping comments and every existing hotkey.
+    private func ensuringClipboardHistoryHotkey(
+        _ configuration: UserConfiguration,
+        at configURL: URL
+    ) throws -> UserConfiguration {
+        guard !configuration.hotkeys.contains(where: { $0.action.kind == .showClipboardHistory }) else {
+            return configuration
+        }
+        let binding = HotkeyBinding(
+            modifiers: ["cmd", "shift"],
+            key: "C",
+            action: HotkeyAction(kind: .showClipboardHistory)
+        )
+        guard configuration.conflictingHotkey(for: binding.shortcut) == nil else {
+            return configuration
+        }
+        return try update(at: configURL) { latest in
+            guard !latest.hotkeys.contains(where: { $0.action.kind == .showClipboardHistory }),
+                  latest.conflictingHotkey(for: binding.shortcut) == nil else { return }
+            latest.hotkeys.append(binding)
+        }
     }
 
     public func encodeConfigurationAsJSONC(_ configuration: UserConfiguration) throws -> Data {

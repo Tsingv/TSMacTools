@@ -9,6 +9,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
     public var fans: FanSettings = .init()
     public var translation: TranslationSettings
     public var capture: CaptureMediaSettings = .default
+    public var clipboard: ClipboardSettings = .default
 
     public init(
         application: ApplicationSettings,
@@ -17,7 +18,8 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         windowSwitcher: WindowSwitcherSettings,
         scroll: ScrollSettings = .default,
         translation: TranslationSettings,
-        capture: CaptureMediaSettings = .default
+        capture: CaptureMediaSettings = .default,
+        clipboard: ClipboardSettings = .default
     ) {
         self.application = application
         self.scripting = scripting
@@ -26,6 +28,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         self.scroll = scroll
         self.translation = translation
         self.capture = capture
+        self.clipboard = clipboard
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -37,6 +40,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         case translation
         case fans
         case capture
+        case clipboard
     }
 
     public init(from decoder: Decoder) throws {
@@ -50,6 +54,7 @@ public struct UserConfiguration: Equatable, Codable, Sendable {
         self.translation = try container.decode(TranslationSettings.self, forKey: .translation)
         self.fans = try container.decodeIfPresent(FanSettings.self, forKey: .fans) ?? .init()
         self.capture = try container.decodeIfPresent(CaptureMediaSettings.self, forKey: .capture) ?? .default
+        self.clipboard = try container.decodeIfPresent(ClipboardSettings.self, forKey: .clipboard) ?? .default
     }
 }
 
@@ -304,6 +309,7 @@ public struct HotkeyAction: Equatable, Codable, Sendable {
         case simulateKeystroke
         case captureScreenshot
         case toggleScreenRecording
+        case showClipboardHistory
     }
 
     public var kind: Kind
@@ -682,7 +688,8 @@ public extension UserConfiguration {
                 HotkeyBinding(modifiers: ["cmd"], key: "D", action: HotkeyAction(kind: .toggleTerminal, bundleIdentifier: "net.kovidgoyal.kitty")),
                 HotkeyBinding(modifiers: ["cmd", "alt", "ctrl"], key: "R", action: HotkeyAction(kind: .callInterface, interfaceName: "reloadConfiguration")),
                 HotkeyBinding(modifiers: ["alt"], key: "P", action: HotkeyAction(kind: .captureScreenshot)),
-                HotkeyBinding(modifiers: ["alt"], key: "G", action: HotkeyAction(kind: .toggleScreenRecording))
+                HotkeyBinding(modifiers: ["alt"], key: "G", action: HotkeyAction(kind: .toggleScreenRecording)),
+                HotkeyBinding(modifiers: ["cmd", "shift"], key: "C", action: HotkeyAction(kind: .showClipboardHistory))
             ],
             windowSwitcher: WindowSwitcherSettings(
                 enabled: true,
@@ -738,7 +745,8 @@ public extension UserConfiguration {
                     pinByDefault: false
                 )
             ),
-            capture: .default
+            capture: .default,
+            clipboard: .default
         )
     }
 }

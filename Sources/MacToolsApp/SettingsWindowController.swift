@@ -119,6 +119,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case recordingSaveDirectory
         case recordingFrameRate
         case recordingBitrateKbps
+        case clipboardHistorySize
+        case clipboardCheckInterval
+        case clipboardIgnoredApps
+        case clipboardIgnoredTypes
+        case clipboardIgnoreRegex
     }
 
     private enum Page: Int, CaseIterable {
@@ -127,6 +132,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case hotkeys
         case scrolling
         case capture
+        case clipboard
         case fans
 
         var title: String {
@@ -136,6 +142,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             case .hotkeys: "Hotkeys"
             case .scrolling: "Scrolling"
             case .capture: "Capture"
+            case .clipboard: "Clipboard"
             case .fans: "Fans"
             }
         }
@@ -147,6 +154,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             case .hotkeys: "keyboard"
             case .scrolling: "scroll"
             case .capture: "camera.viewfinder"
+            case .clipboard: "list.clipboard"
             case .fans: "fan"
             }
         }
@@ -574,6 +582,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .hotkeys: makeHotkeysPage()
         case .scrolling: makeScrollingPage()
         case .capture: makeCapturePage()
+        case .clipboard: makeClipboardPage()
         case .fans: makeFansPage()
         }
     }
@@ -998,6 +1007,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
             .translateSelection,
             .captureScreenshot,
             .toggleScreenRecording,
+            .showClipboardHistory,
             .showFocusedWindowInfo,
             .reloadConfiguration,
             .toggleFinder,
@@ -1027,6 +1037,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .translateSelection: "Translate Selection"
         case .captureScreenshot: "Capture Screenshot"
         case .toggleScreenRecording: "Toggle Screen Recording"
+        case .showClipboardHistory: "Clipboard History"
         case .showFocusedWindowInfo: "Focused Window Info"
         case .reloadConfiguration: "Reload Configuration"
         case .toggleFinder: "Toggle Finder"
@@ -1157,6 +1168,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .translateSelection: "character.bubble"
         case .captureScreenshot: "camera.viewfinder"
         case .toggleScreenRecording: "record.circle"
+        case .showClipboardHistory: "list.clipboard"
         case .showFocusedWindowInfo: "info.window"
         case .reloadConfiguration: "arrow.clockwise"
         case .toggleFinder: "folder"
@@ -1356,6 +1368,116 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         stack.addArrangedSubview(note("Defaults: ⌥P screenshot, ⌥G toggle recording. Recording prefers low FPS, capped resolution, H.264 Baseline, and shallow capture queues."))
         conditionalRows[.capture] = deps
         return scrollable(stack)
+    }
+
+    private func makeClipboardPage() -> NSView {
+        let stack = pageStack()
+        let clipboard = configuration.clipboard.sanitized
+        var deps: [ConditionalRow] = []
+        stack.addArrangedSubview(section(header: "Clipboard History", rows: [
+            (formRow(
+                title: "Enable history",
+                hint: "Record copies until the history limit. Pinned items stay.",
+                control: boolSwitch(tag: 40, on: clipboard.enabled, action: #selector(toggleClipboardEnabled))
+            ), nil),
+            (formRow(
+                title: "Paste automatically",
+                hint: "Option-Return copies the item and sends Command-V.",
+                control: boolSwitch(tag: 41, on: clipboard.pasteAutomatically, action: #selector(toggleClipboardPaste))
+            ), nil),
+            (formRow(
+                title: "Show footer",
+                hint: "Keyboard hints at the bottom of the history panel.",
+                control: boolSwitch(tag: 42, on: clipboard.showFooter, action: #selector(toggleClipboardFooter))
+            ), nil),
+            (formRow(
+                title: "History size",
+                hint: "Unpinned items kept, 10...10000.",
+                control: editableField(String(clipboard.historySize), field: .clipboardHistorySize, width: 90)
+            ), nil),
+            (formRow(
+                title: "Check interval",
+                hint: "Seconds between pasteboard polls, 0.1...5.",
+                control: editableField(String(clipboard.checkInterval), field: .clipboardCheckInterval, width: 90)
+            ), nil),
+            (formRow(
+                title: "Clear system clipboard",
+                hint: "Reserved for a future clear-history action that also empties the pasteboard.",
+                control: boolSwitch(tag: 43, on: clipboard.clearSystemClipboard, action: #selector(toggleClipboardClearSystem))
+            ), nil)
+        ], into: &deps))
+
+        stack.addArrangedSubview(section(header: "Ignore", rows: [
+            (formRow(
+                title: "Ignore copies",
+                hint: "Pause recording. Option-click the status item ignores only the next copy.",
+                control: boolSwitch(tag: 44, on: clipboard.ignoreEvents, action: #selector(toggleClipboardIgnore))
+            ), nil),
+            (formRow(
+                title: "Only listed apps",
+                hint: "When on, ignored apps becomes an allow list of bundle identifiers.",
+                control: boolSwitch(tag: 45, on: clipboard.ignoreAllAppsExceptListed, action: #selector(toggleClipboardAllowList))
+            ), nil),
+            (formRow(
+                title: "Applications",
+                hint: "Bundle identifiers, one per line.",
+                control: multilineField(clipboard.ignoredApps.joined(separator: "\n"), field: .clipboardIgnoredApps)
+            ), nil),
+            (formRow(
+                title: "Pasteboard types",
+                hint: "Extra types to ignore. Transient, concealed, and auto-generated types are always ignored.",
+                control: multilineField(clipboard.ignoredPasteboardTypes.joined(separator: "\n"), field: .clipboardIgnoredTypes)
+            ), nil),
+            (formRow(
+                title: "Ignore regex",
+                hint: "One regular expression per line, matched against plain text.",
+                control: multilineField(clipboard.ignoreRegex.joined(separator: "\n"), field: .clipboardIgnoreRegex)
+            ), nil)
+        ], into: &deps))
+        stack.addArrangedSubview(note("Default shortcut is Command-Shift-C. Change it on the Hotkeys tab. Return copies, Option-Return pastes, Option-Shift-Return pastes plain text, Option-P pins, Option-Delete removes an item."))
+        return scrollable(stack)
+    }
+
+    @objc private func toggleClipboardEnabled(_ sender: NSSwitch) {
+        persist { $0.clipboard.enabled = sender.state == .on }
+    }
+
+    @objc private func toggleClipboardPaste(_ sender: NSSwitch) {
+        persist { $0.clipboard.pasteAutomatically = sender.state == .on }
+    }
+
+    @objc private func toggleClipboardFooter(_ sender: NSSwitch) {
+        persist { $0.clipboard.showFooter = sender.state == .on }
+    }
+
+    @objc private func toggleClipboardClearSystem(_ sender: NSSwitch) {
+        persist { $0.clipboard.clearSystemClipboard = sender.state == .on }
+    }
+
+    @objc private func toggleClipboardIgnore(_ sender: NSSwitch) {
+        persist { $0.clipboard.ignoreEvents = sender.state == .on }
+    }
+
+    @objc private func toggleClipboardAllowList(_ sender: NSSwitch) {
+        persist { $0.clipboard.ignoreAllAppsExceptListed = sender.state == .on }
+    }
+
+    private func multilineField(_ value: String, field: ConfigurationField) -> NSTextField {
+        let control = NSTextField(wrappingLabelWithString: "")
+        control.isEditable = true
+        control.isSelectable = true
+        control.isBezeled = true
+        control.drawsBackground = true
+        control.stringValue = value
+        control.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small))
+        control.delegate = self
+        control.tag = field.rawValue
+        control.translatesAutoresizingMaskIntoConstraints = false
+        control.widthAnchor.constraint(equalToConstant: 240).isActive = true
+        control.heightAnchor.constraint(equalToConstant: 64).isActive = true
+        control.cell?.wraps = true
+        control.cell?.isScrollable = false
+        return control
     }
 
     @objc private func toggleCopyScreenshot(_ sender: NSSwitch) {
@@ -2067,7 +2189,25 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
                 range: CaptureMediaSettings.bitrateRange
             )
             persist { $0.capture.recordingBitrateKbps = value }
+        case .clipboardHistorySize:
+            let value = try boundedInt(rawValue, name: "History size", range: ClipboardSettings.historySizeRange)
+            persist { $0.clipboard.historySize = value }
+        case .clipboardCheckInterval:
+            guard let value = Double(rawValue), ClipboardSettings.checkIntervalRange.contains(value) else {
+                throw MutationError.invalidValue("Check interval must be between 0.1 and 5 seconds.")
+            }
+            persist { $0.clipboard.checkInterval = value }
+        case .clipboardIgnoredApps:
+            persist { $0.clipboard.ignoredApps = lines(rawValue) }
+        case .clipboardIgnoredTypes:
+            persist { $0.clipboard.ignoredPasteboardTypes = lines(rawValue) }
+        case .clipboardIgnoreRegex:
+            persist { $0.clipboard.ignoreRegex = lines(rawValue) }
         }
+    }
+
+    private func lines(_ rawValue: String) -> [String] {
+        rawValue.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
     private func requiredText(_ rawValue: String, name: String) throws -> String {
@@ -2143,6 +2283,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .recordingSaveDirectory: configuration.capture.recordingSaveDirectory
         case .recordingFrameRate: String(configuration.capture.recordingFrameRate)
         case .recordingBitrateKbps: String(configuration.capture.recordingBitrateKbps)
+        case .clipboardHistorySize: String(configuration.clipboard.historySize)
+        case .clipboardCheckInterval: String(configuration.clipboard.checkInterval)
+        case .clipboardIgnoredApps: configuration.clipboard.ignoredApps.joined(separator: "\n")
+        case .clipboardIgnoredTypes: configuration.clipboard.ignoredPasteboardTypes.joined(separator: "\n")
+        case .clipboardIgnoreRegex: configuration.clipboard.ignoreRegex.joined(separator: "\n")
         case .apiKey: configuration.translation.apiKey
         case .googleAPIKey: configuration.translation.googleApiKey
         }
@@ -2790,6 +2935,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate, N
         case .translateSelection: "Translate selected text"
         case .captureScreenshot: "Capture annotated screenshot"
         case .toggleScreenRecording: "Start or stop screen recording"
+        case .showClipboardHistory: "Show clipboard history"
         case .toggleFinder: "Toggle Finder"
         case .toggleTerminal: "Toggle Terminal"
         case .reloadConfiguration: "Reload configuration"
